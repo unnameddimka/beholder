@@ -81,14 +81,15 @@ async function performAttempt({ apiKey, body, timeoutMs, fetchImpl, diagnostics,
 }
 
 // One logical chat completion with bounded transport retries. temperature === null leaves the provider default.
-export async function callOpenRouter({ apiKey, model, messages, maxTokens, temperature = null, timeoutMs = 180_000, fetchImpl = fetch, diagnostics = null, meta = {}, signal = null, backoffMs = 1000, attempts = TRANSPORT_ATTEMPTS }) {
+export async function callOpenRouter({ apiKey, model, messages, maxTokens, temperature = null, timeoutMs = 180_000, fetchImpl = fetch, diagnostics = null, meta = {}, signal = null, backoffMs = 1000, attempts = TRANSPORT_ATTEMPTS, responseFormat = null }) {
   if (!apiKey) throw coded("API_KEY_MISSING", "Enter the OpenRouter API key first.");
   const body = {
     model,
     stream: false,
     max_tokens: maxTokens,
     ...(typeof temperature === "number" ? { temperature } : {}),
-    provider: { allow_fallbacks: true, ignore: PROVIDER_IGNORE },
+    provider: { allow_fallbacks: true, ignore: PROVIDER_IGNORE, ...(responseFormat ? { require_parameters: true } : {}) },
+    ...(responseFormat ? { response_format: responseFormat } : {}),
     messages
   };
   let lastError = null;
