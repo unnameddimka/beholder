@@ -42,7 +42,7 @@ test("Emergency Dump works while work is in flight and contains useful sanitized
     const mira = app.createCharacter({ name: "Mira", description: "Keeper", useSharedMemory: false, useSharedInterpretations: false });
     app.contemplation.addExperiment(interpretationPoolOf(mira), "probe");
     app.dialogue.send(mira.id, "hello");
-    await waitFor(() => app.diagnostics.pendingExchanges().length >= 1);
+    await waitFor(() => app.diagnostics.pendingExchanges().some((entry) => entry.purpose === "dialogue_reply"));
     const { zip, manifest } = buildEmergencyDump(app);
     assert.ok(zip.length > 1000);
     for (const name of ["messages.json", "experiments.json", "memory-records.json", "llm-exchanges.json", "in-flight-exchanges.json", "activity.json", "errors.json", "runtime.json"]) {
