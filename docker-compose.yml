@@ -1,0 +1,12 @@
+services:
+  beholder:
+    build:
+      context: .
+      args:
+        SOURCE_COMMIT_SHA: "${SOURCE_COMMIT_SHA:-}"
+    # Trusted LAN only: plain HTTP, no authentication. Do not expose this port to the internet.
+    ports:
+      - "${BEHOLDER_PORT:-3000}:3000"
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
