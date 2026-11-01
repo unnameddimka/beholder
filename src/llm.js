@@ -4,7 +4,7 @@
 // src/memory-generation.js generateValidatedDraft) and is never committed.
 import { callOpenRouter, fetchModelCatalog } from "./openrouter.js";
 import { coded, parseModelJson } from "./utils.js";
-import { REPAIR_INSTRUCTION, TRUNCATION_RECOVERY_INSTRUCTION } from "./prompts/repair.js";
+import { REPAIR_INSTRUCTION, TRUNCATION_RECOVERY_INSTRUCTION, DIALOGUE_REPAIR_INSTRUCTION } from "./prompts/repair.js";
 import { DIALOGUE_RESPONSE_FORMAT } from "./prompts/dialogue.js";
 
 export const PURPOSE_ROLES = Object.freeze({
@@ -124,7 +124,7 @@ export class LlmClient {
       this.diagnostics?.event({ type: "llm-repair", purpose, attempt: trace.repairs, errors: validation.errors.slice(0, 20), ...context });
       const errors = JSON.stringify(validation.errors.slice(0, 30));
       const repairMessages = dialogue ? [
-        { role: "system", content: `${REPAIR_INSTRUCTION}\nRequired fields: message (non-empty string), followUpDelaySeconds (integer or null), imageRequest (string or null). Return exactly these three fields. Repair ONLY the supplied response. Never include or reconstruct previous conversation turns.` },
+        { role: "system", content: DIALOGUE_REPAIR_INSTRUCTION },
         { role: "user", content: `Invalid response to repair (not a new dialogue turn):\n${String(response.content)}\nValidation errors: ${errors}` }
       ] : [...messages, { role: "assistant", content: String(response.content) },
         { role: "system", content: `${REPAIR_INSTRUCTION}\nValidation errors: ${errors}` }];
