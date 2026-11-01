@@ -209,8 +209,9 @@ non-interpretive observation is a manual judgment, not something the tests can c
   `image_observation`) linked to the user message the image belongs to, so it counts toward the 100/20/80 window like
   any message. Every consumer sees it as a typed non-speech entry that names its message and that message's text, so its
   source stays clear even when consolidation separates the two. Dialogue gets it as a labeled `[IMAGE OBSERVATION]`
-  entry with a `[viewed ...]` marker that names its source message by sent time and text (and says when that message
-  has left the history), never by position, and never the image itself. A user message whose image failed carries
+  entry with a `[viewed ...]` marker that names its source message by its stable id (`msg_<id>`, also shown on that
+  user message), sent time, and text, and says when that message has left the history. It never relies on position
+  and never includes the image itself. A user message whose image failed carries
   "The attached image could not be viewed". The STM prompt records it in ordinary third-person prose ("The user
   showed Mira a photo they called their selfie; the person pictured had ...") with no special memory field. Retry,
   follow-up and opener checks, elapsed time, and Contemplation watermarks use actual chat turns and ignore

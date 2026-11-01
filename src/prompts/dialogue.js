@@ -59,7 +59,7 @@ export function dialogueSystemPrompt({ character, gestalt = null, experiments, m
   if (userImages) {
     parts.push([
       "IMAGES FROM THE USER: the user can attach an image to a message. You cannot see images directly.",
-      `An ${IMAGE_OBSERVATION_LABEL} entry is your own perception of one attached image: it names the user message the image belongs to (by its sent time and text) and describes only what is visibly in the image. That message may already have left the history. The observation is not something the user said and not something you said.`,
+      `An ${IMAGE_OBSERVATION_LABEL} entry is your own perception of one attached image: it names the user message the image belongs to by that message's image id (such as msg_12, which also appears on the message itself), sent time and text, and describes only what is visibly in the image. That message may already have left the history. The observation is not something the user said and not something you said.`,
       "What the user says about an image (for example that it is their selfie) is their claim. You may react to what you see, wonder about it, or interpret its meaning in your own voice; keep those thoughts your own and never present them as part of what the image shows.",
       `If a message says its attached image could not be viewed, you do not know what it shows. Never pretend you saw it or invent its contents; you may say you could not see it or ask the user to send it again.`
     ].join(" "));
@@ -119,20 +119,23 @@ export function pinnedSelfDescriptionMessage(userDescription) {
 }
 
 export const IMAGE_OBSERVATION_LABEL = "[IMAGE OBSERVATION]";
+const wireMessage = (id) => `msg_${id}`;
 const ATTACHMENT_NOTES = Object.freeze({
-  observed: "[The user attached an image to this message. Your observation of it follows.]",
-  failed: "[The user attached an image to this message. The attached image could not be viewed: you do not know what it shows.]",
-  pending: "[The user attached an image to this message. It has not been viewed: you do not know what it shows.]"
+  observed: (ref) => `[The user attached an image to this message (image id ${ref}). Your observation of it is the ${IMAGE_OBSERVATION_LABEL} entry for ${ref}.]`,
+  failed: (ref) => `[The user attached an image to this message (image id ${ref}). The attached image could not be viewed: you do not know what it shows.]`,
+  pending: (ref) => `[The user attached an image to this message (image id ${ref}). It has not been viewed: you do not know what it shows.]`
 });
 
-// Names the user message an observation belongs to by its persisted link, never by position: its sent time and text,
-// and whether it is still in the verbatim history (review 0003 P1).
+// Names the user message an observation belongs to by its persisted link, never by position: the stable message id
+// (the same id is on the user entry), its sent time and text, and whether it is still in the verbatim history
+// (review 0003 P1 and its re-review).
 function observationSource(message, inHistory, clock) {
   const source = message.source || {};
+  const ref = ` ${wireMessage(message.sourceMessageId)}`;
   const sent = source.createdAt ? ` sent ${clock ? timestampMarker(source.createdAt, clock.timeZone).slice(6, -1) : source.createdAt}` : "";
   const text = source.text ? ` with the text ${JSON.stringify(source.text)}` : " with no text";
   const presence = inHistory ? "" : "; that message is no longer in the verbatim history";
-  return `the user's message${sent}${text}${presence}`;
+  return `the user's message${ref}${sent}${text}${presence}`;
 }
 
 // Verbatim history: user and character messages in order. A generated image is noted for the model's continuity; a
@@ -148,7 +151,7 @@ export function historyMessages(messages, imagesByMessage = new Map(), clock = n
     }
     const image = imagesByMessage.get(message.id);
     const note = image && image.status !== "failed" ? `\n[You showed the user an image: ${image.request}]` : "";
-    const attachment = message.upload ? `${message.text ? "\n" : ""}${ATTACHMENT_NOTES[message.upload.status]}` : "";
+    const attachment = message.upload ? `${message.text ? "\n" : ""}${ATTACHMENT_NOTES[message.upload.status](wireMessage(message.id))}` : "";
     const marker = clock ? `${timestampMarker(message.createdAt, clock.timeZone)}\n` : "";
     return { role: message.role === "user" ? "user" : "assistant", content: `${marker}${message.text}${message.role === "user" ? attachment : note}` };
   });

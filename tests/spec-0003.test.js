@@ -176,7 +176,8 @@ test("selfie: upload, one observation before the reply, exact Vision inputs, typ
     assert.doesNotMatch(JSON.stringify(dialogueBody), /image_url|base64/);
     assert.match(dialogueBody.messages[0].content, /IMAGES FROM THE USER/);
     const history = dialogueBody.messages.slice(2);
-    assert.match(history.at(-2).content, /Вот моё селфи\n\[The user attached an image to this message\. Your observation of it follows\.\]/);
+    assert.ok(history.at(-2).content.endsWith(`Вот моё селфи\n[The user attached an image to this message (image id msg_${user.id}). Your observation of it is the [IMAGE OBSERVATION] entry for msg_${user.id}.]`), history.at(-2).content);
+    assert.match(history.at(-1).content, new RegExp(`attached to the user's message msg_${user.id} sent `));
     assert.equal(history.at(-1).role, "user");
     assert.match(history.at(-1).content, /^\[viewed \d{4}-.*\]\n\[IMAGE OBSERVATION\]/);
     assert.ok(history.at(-1).content.endsWith(OBSERVATION));
@@ -272,7 +273,7 @@ test("Vision failure: the message and file stay, zero observations, and Dialogue
     assert.ok(app.uploads.exists(upload.file));
     assert.equal(app.store.allMessages().filter((m) => m.role === "observation").length, 0);
     const body = mock.byPurpose("dialogue_reply")[0].body;
-    assert.match(body.messages.at(-1).content, /look\n\[The user attached an image to this message\. The attached image could not be viewed: you do not know what it shows\.\]/);
+    assert.ok(body.messages.at(-1).content.endsWith(`look\n[The user attached an image to this message (image id msg_${message.id}). The attached image could not be viewed: you do not know what it shows.]`));
     assert.match(body.messages[0].content, /Never pretend you saw it/);
     assert.equal(mock.byPurpose("contemplation_prefetch").length, 1);
     assert.ok(app.diagnostics.errors.some((entry) => entry.stage === "vision_observation"));
@@ -473,14 +474,15 @@ test("review 0003 P1: after a split STM boundary, a new Dialogue request names t
     const entry = history.find((message) => message.content.includes("[IMAGE OBSERVATION]"));
     assert.equal(history.indexOf(entry), 0, "the observation now opens the verbatim history");
     const sent = turn.user.createdAt.replace(/\.\d{3}Z$/, "Z");
-    assert.ok(entry.content.includes(`attached to the user's message sent ${sent}`), entry.content);
+    assert.ok(entry.content.includes(`attached to the user's message msg_${turn.user.id} sent ${sent}`), entry.content);
     assert.ok(entry.content.includes('with the text "Вот моё селфи"'));
     assert.match(entry.content, /that message is no longer in the verbatim history/);
     assert.doesNotMatch(entry.content, /previous user message|UNRELATED-LATER-MESSAGE/);
     assert.ok(entry.content.endsWith(OBSERVATION));
     // While both entries are present, the source is still named explicitly and marked as present.
     const adjacent = historyMessages([turn.user, turn.observation].map((message) => app.store.getMessage(message.id)), new Map(), null);
-    assert.match(adjacent[1].content, /attached to the user's message sent \S+ with the text "Вот моё селфи" \(not words/);
+    assert.match(adjacent[1].content, new RegExp(`attached to the user's message msg_${turn.user.id} sent \\S+ with the text "Вот моё селфи" \\(not words`));
+    assert.match(adjacent[0].content, new RegExp(`\\(image id msg_${turn.user.id}\\)`));
   } finally { closeApp(app); }
 });
 
@@ -503,5 +505,28 @@ test("review 0003 P2: instruction-shaped Vision output is rejected; quoted visib
     assert.equal(app.store.uploadForMessage(message.id).errorCode, "VISION_OUTPUT_INVALID");
     assert.equal(app.store.allMessages().filter((m) => m.role === "observation").length, 0);
     assert.match(mock.byPurpose("dialogue_reply")[0].body.messages.at(-1).content, /could not be viewed/);
+  } finally { closeApp(app); }
+});
+
+test("review 0003 re-review: two image-only messages with the same visible time are told apart by their message ids", async () => {
+  const { app, mock } = await makeApp({ dialogue_reply: () => reply("ok") });
+  try {
+    const mira = app.createCharacter(base);
+    const first = await imageTurn(app, mira.id, { text: "" });
+    const second = await imageTurn(app, mira.id, { text: "" });
+    app.store.db.prepare("UPDATE messages SET text = ? WHERE id = ?").run("The image shows a red apple.", first.observation.id);
+    app.store.db.prepare("UPDATE messages SET text = ? WHERE id = ?").run("The image shows a green pear.", second.observation.id);
+    app.store.db.prepare("UPDATE messages SET created_at = ? WHERE character_id = ?").run("2026-11-01T10:00:00.250Z", mira.id);
+    await app.dialogue.generate(mira.id, "reply", { timeZone: "UTC" });
+    const history = mock.byPurpose("dialogue_reply")[0].body.messages.slice(2).map((message) => message.content);
+    assert.equal(history.length, 4);
+    const [userA, obsA, userB, obsB] = history;
+    // The visible labels collide (same second, no text), so only the id distinguishes them.
+    const label = (content) => content.replace(/msg_\d+/g, "msg_N");
+    assert.equal(label(obsA).replace("red apple", "X"), label(obsB).replace("green pear", "X"));
+    assert.ok(userA.includes(`(image id msg_${first.user.id})`) && obsA.includes(`message msg_${first.user.id} sent`) && obsA.endsWith("red apple."));
+    assert.ok(userB.includes(`(image id msg_${second.user.id})`) && obsB.includes(`message msg_${second.user.id} sent`) && obsB.endsWith("green pear."));
+    assert.ok(!obsA.includes(`msg_${second.user.id}`) && !obsB.includes(`msg_${first.user.id}`));
+    assert.equal(mock.byPurpose("dialogue_reply")[0].body.messages.slice(2).every((message) => message.role === "user"), true, "speaker roles unchanged");
   } finally { closeApp(app); }
 });
