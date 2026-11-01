@@ -110,15 +110,17 @@ export function createServer(app) {
     ["POST", /^\/api\/characters\/(\d+)\/messages$/, async (req, url, m) => {
       const character = mustCharacter(app, m[1]);
       if (!app.key.configured()) throw coded("API_KEY_MISSING", "Enter the OpenRouter API key first.");
-      return { message: app.dialogue.send(character.id, (await readJsonBody(req)).text) };
+      const body = await readJsonBody(req);
+      return { message: app.dialogue.send(character.id, body.text, { timeZone: body.timeZone ?? null }) };
     }],
-    ["POST", /^\/api\/characters\/(\d+)\/retry$/, (req, url, m) => {
+    ["POST", /^\/api\/characters\/(\d+)\/retry$/, async (req, url, m) => {
       if (!app.key.configured()) throw coded("API_KEY_MISSING", "Enter the OpenRouter API key first.");
-      return app.dialogue.retry(mustCharacter(app, m[1]).id);
+      const body = await readJsonBody(req);
+      return app.dialogue.retry(mustCharacter(app, m[1]).id, { timeZone: body.timeZone ?? null });
     }],
     ["POST", /^\/api\/presence$/, async (req) => {
       const body = await readJsonBody(req);
-      return app.dialogue.presence(body.clientId, { characterId: body.characterId ?? null, draftNonEmpty: body.draftNonEmpty === true, typingStarted: body.typingStarted === true });
+      return app.dialogue.presence(body.clientId, { characterId: body.characterId ?? null, draftNonEmpty: body.draftNonEmpty === true, typingStarted: body.typingStarted === true, timeZone: body.timeZone ?? null });
     }],
     ["POST", /^\/api\/presence\/leave$/, async (req) => { app.dialogue.leave((await readJsonBody(req)).clientId); return { ok: true }; }],
     ["GET", /^\/api\/characters\/(\d+)\/contemplation$/, (req, url, m) => contemplationView(app, mustCharacter(app, m[1]))],

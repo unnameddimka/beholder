@@ -73,13 +73,18 @@ function reportFrontendError(message, stack) {
 
 // ---- presence ------------------------------------------------------------------------------------------------
 
+// The device's IANA time zone for the Dialogue model's clock context; the server validates it and falls back to UTC.
+function browserTimeZone() {
+  try { return Intl.DateTimeFormat().resolvedOptions().timeZone || null; } catch { return null; }
+}
+
 function currentChatId() { return state.view?.kind === "chat" && document.visibilityState === "visible" ? state.view.characterId : null; }
 
 function sendPresence(extra = {}) {
   const characterId = currentChatId();
   const draft = characterId ? (state.drafts.get(characterId) || "") : "";
   return fetch("/api/presence", { method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ clientId: state.clientId, characterId, draftNonEmpty: draft.trim().length > 0, ...extra }) }).catch(() => {});
+    body: JSON.stringify({ clientId: state.clientId, characterId, draftNonEmpty: draft.trim().length > 0, timeZone: browserTimeZone(), ...extra }) }).catch(() => {});
 }
 
 setInterval(() => sendPresence(), HEARTBEAT_MS);
@@ -313,7 +318,7 @@ async function renderChat(characterId) {
         h("span", { text: chatState.error ? `The reply failed: ${chatState.error.message}` : "This message has no reply yet." }),
         h("button", { className: "btn small", type: "button", text: "Retry response", onClick: async (event) => {
           event.target.disabled = true;
-          try { await api(`/api/characters/${characterId}/retry`, { method: "POST" }); await refresh(); }
+          try { await api(`/api/characters/${characterId}/retry`, { method: "POST", body: { timeZone: browserTimeZone() } }); await refresh(); }
           catch (error) { showBanner(error.message); event.target.disabled = false; }
         } })));
     }
@@ -335,7 +340,7 @@ async function renderChat(characterId) {
     sending = true;
     renderStatus();
     try {
-      await api(`/api/characters/${characterId}/messages`, { method: "POST", body: { text: input.value } });
+      await api(`/api/characters/${characterId}/messages`, { method: "POST", body: { text: input.value, timeZone: browserTimeZone() } });
       input.value = "";
       state.drafts.delete(characterId);
       await refresh();

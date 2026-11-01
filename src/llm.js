@@ -25,6 +25,7 @@ export const PURPOSE_ROLES = Object.freeze({
 
 export const REPAIR_ATTEMPTS = 2;
 const DIALOGUE_ENVELOPE_PURPOSES = new Set(["dialogue_reply", "dialogue_followup", "dialogue_opener"]);
+export const DIALOGUE_FORMAT_MODES = Object.freeze(["json_schema", "json_object", "prompt"]);
 const TIMEOUTS = { dialogue: 150_000, contemplation: 240_000 };
 const CATALOG_TTL_MS = 6 * 60 * 60 * 1000;
 
@@ -37,6 +38,7 @@ export class LlmClient {
     this.backoffMs = backoffMs;
     this.timeouts = timeouts;
     this.catalog = null;
+    this.formatDowngrades = new Map(); // model id -> lowest DIALOGUE_FORMAT_MODES index allowed
   }
 
   async modelCatalog({ refresh = false } = {}) {
@@ -69,28 +71,43 @@ export class LlmClient {
     });
   }
 
-  // Enforce dialogue envelopes at the provider when supported, without rejecting user-selected models that
-  // lack structured outputs. OpenRouter's catalogue can be unavailable; prompt validation remains the fallback.
-  async dialogueResponseFormat() {
-    try { await this.modelCatalog(); } catch { return null; }
-    const entry = this.catalog?.byId.get(this.requestParameters("dialogue").model);
-    const parameters = entry?.supportedParameters || [];
-    if (parameters.includes("structured_outputs")) return DIALOGUE_RESPONSE_FORMAT;
-    if (parameters.includes("response_format")) return { type: "json_object" };
-    return null;
+  // Provider-enforced dialogue format, best first: strict JSON schema, JSON-object mode, then prompt-only. The
+  // catalogue is only a hint for the model as a whole, so a request that OpenRouter rejects because no endpoint
+  // supports the format steps down one mode and is retried with the same model; the step is kept until restart.
+  async dialogueFormatMode() {
+    try { await this.modelCatalog(); } catch {} // An unavailable catalogue means prompt-only enforcement.
+    const model = this.requestParameters("dialogue").model;
+    const parameters = this.catalog?.byId.get(model)?.supportedParameters || [];
+    const advertised = parameters.includes("structured_outputs") ? 0 : parameters.includes("response_format") ? 1 : 2;
+    return DIALOGUE_FORMAT_MODES[Math.max(advertised, this.formatDowngrades.get(model) ?? 0)];
   }
 
   // Structured call: technical truncation retry once, then JSON parse + validate with up to REPAIR_ATTEMPTS repairs.
   // validate(raw) returns { ok: true, value } or { ok: false, errors: [...] }.
   async structured({ purpose, messages, validate, context = {}, signal = null }) {
     const dialogue = DIALOGUE_ENVELOPE_PURPOSES.has(purpose);
-    const responseFormat = dialogue ? await this.dialogueResponseFormat() : null;
-    const trace = { exchangeIds: [], repairs: 0, truncationRetry: false, normalizedPlainText: false };
+    let formatMode = dialogue ? await this.dialogueFormatMode() : null;
+    const trace = { exchangeIds: [], repairs: 0, truncationRetry: false, normalizedPlainText: false, formatMode };
     const call = async (callMessages) => {
-      const result = await this.call({ purpose, messages: callMessages, context, signal, responseFormat });
-      trace.exchangeIds.push(result.exchangeId);
-      return result;
+      for (;;) {
+        try {
+          const result = await this.call({ purpose, messages: callMessages, context: dialogue ? { ...context, responseFormatMode: formatMode } : context, signal,
+            responseFormat: dialogue ? dialogueResponseFormat(formatMode) : null });
+          trace.exchangeIds.push(result.exchangeId);
+          return result;
+        } catch (error) {
+          if (error?.exchangeId) trace.exchangeIds.push(error.exchangeId);
+          if (!dialogue || formatMode === "prompt" || !isFormatRejection(error)) throw error;
+          const model = this.requestParameters("dialogue").model;
+          const next = DIALOGUE_FORMAT_MODES.indexOf(formatMode) + 1;
+          this.formatDowngrades.set(model, Math.max(next, this.formatDowngrades.get(model) ?? 0));
+          this.diagnostics?.event({ type: "dialogue-format-downgrade", purpose, model, from: formatMode, to: DIALOGUE_FORMAT_MODES[next], httpStatus: error.httpStatus ?? null, ...context });
+          formatMode = DIALOGUE_FORMAT_MODES[next];
+          trace.formatMode = formatMode;
+        }
+      }
     };
+    // A truncated output is never a plain-text candidate: it goes through truncation recovery first.
     let response;
     try { response = await call(messages); }
     catch (error) {
@@ -102,19 +119,17 @@ export class LlmClient {
       try { return validate(parseModelJson(content)); }
       catch (error) { return { ok: false, errors: [`response is not valid JSON: ${error.message}`] }; }
     };
-    // A dialogue model sometimes returns valid roleplay text instead of the envelope. Wrapping it locally
-    // preserves the original words and avoids another model call that might repeat a previous turn.
-    const plainDialogue = (content) => {
-      if (!dialogue) return null;
-      const plain = String(content || "").trim();
-      if (!plain || /^[{\[\x60]/.test(plain)) return null; // Broken JSON or fenced JSON still needs repair.
-      const candidate = validate({ message: plain, followUpDelaySeconds: null, imageRequest: null });
-      return candidate.ok ? candidate : null;
-    };
     let validation = check(response.content);
-    if (!validation.ok) {
-      const normalized = plainDialogue(response.content);
-      if (normalized) { validation = normalized; trace.normalizedPlainText = true; }
+    // A dialogue model sometimes answers with ordinary roleplay prose instead of the envelope. A complete answer
+    // generated from the full context (not a repair output) is accepted as written, without another model call
+    // that might repeat an earlier turn. Attempted JSON still goes to repair.
+    if (!validation.ok && dialogue && !looksLikeAttemptedJson(response.content)) {
+      const plain = validate({ message: String(response.content).trim(), followUpDelaySeconds: null, imageRequest: null });
+      if (plain.ok) {
+        validation = plain;
+        trace.normalizedPlainText = true;
+        this.diagnostics?.event({ type: "dialogue-plain-text-normalized", purpose, characters: plain.value.message.length, formatMode, ...context });
+      }
     }
     while (!validation.ok) {
       if (trace.repairs >= REPAIR_ATTEMPTS) {
@@ -123,6 +138,7 @@ export class LlmClient {
       trace.repairs += 1;
       this.diagnostics?.event({ type: "llm-repair", purpose, attempt: trace.repairs, errors: validation.errors.slice(0, 20), ...context });
       const errors = JSON.stringify(validation.errors.slice(0, 30));
+      // Dialogue repair is isolated: only the invalid output, the contract and the errors, never the chat context.
       const repairMessages = dialogue ? [
         { role: "system", content: DIALOGUE_REPAIR_INSTRUCTION },
         { role: "user", content: `Invalid response to repair (not a new dialogue turn):\n${String(response.content)}\nValidation errors: ${errors}` }
@@ -130,11 +146,24 @@ export class LlmClient {
         { role: "system", content: `${REPAIR_INSTRUCTION}\nValidation errors: ${errors}` }];
       response = await call(repairMessages);
       validation = check(response.content);
-      if (!validation.ok) {
-        const normalized = plainDialogue(response.content);
-        if (normalized) { validation = normalized; trace.normalizedPlainText = true; }
-      }
     }
     return { value: validation.value, model: response.model, trace };
   }
+}
+
+// Text that starts like JSON or a code fence, or carries an envelope field, was meant to be the envelope.
+function looksLikeAttemptedJson(content) {
+  const text = String(content || "").trim();
+  return !text || /^[{\[\x60]/.test(text) || /"(message|followUpDelaySeconds|imageRequest)"\s*:/.test(text);
+}
+
+function dialogueResponseFormat(mode) {
+  return mode === "json_schema" ? DIALOGUE_RESPONSE_FORMAT : mode === "json_object" ? { type: "json_object" } : null;
+}
+
+// OpenRouter refuses a request whose required parameters no endpoint of the model supports (HTTP 404 "No endpoints
+// found that can handle the requested parameters"); a provider may also reject the format itself with a 4xx.
+export function isFormatRejection(error) {
+  if (error?.code !== "PROVIDER_REQUEST_FAILED" || ![400, 404, 422].includes(error.httpStatus)) return false;
+  return /response.?format|structured.?output|json.?(schema|object|mode)|require_parameters|requested parameters/i.test(String(error.message || ""));
 }

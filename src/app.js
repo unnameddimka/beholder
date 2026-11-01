@@ -42,7 +42,7 @@ export class BeholderApp {
     this.contemplation = new Contemplation({ store: this.store, llm: this.llm, memory: this.memory, settings: this.settings, diagnostics: this.diagnostics, maxParallel });
     this.images = new ImageService({ store: this.store, settings: this.settings, key: this.key, diagnostics: this.diagnostics, fetchImpl, imagesDir: this.imagesDir, backoffMs: backoffMs * 2, ...(dnsLookup ? { lookupImpl: dnsLookup } : {}) });
     this.dialogue = new Dialogue({ store: this.store, llm: this.llm, memory: this.memory, contemplation: this.contemplation, images: this.images, settings: this.settings,
-      diagnostics: this.diagnostics, timeScaleMs, ...(openerDelaySeconds !== undefined ? { openerDelaySeconds } : {}), ...(presenceTtlMs !== undefined ? { presenceTtlMs } : {}) });
+      diagnostics: this.diagnostics, now, timeScaleMs, ...(openerDelaySeconds !== undefined ? { openerDelaySeconds } : {}), ...(presenceTtlMs !== undefined ? { presenceTtlMs } : {}) });
     this.timers = [];
   }
 

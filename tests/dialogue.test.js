@@ -27,7 +27,8 @@ test("dialogue context: character prompt, pinned self-description first, experim
     assert.match(call.body.messages[1].content, /Pinned user self-description/);
     assert.match(serialized, /absurd story/);
     assert.doesNotMatch(serialized, /SECRET-INTERPRETATION/);
-    assert.equal(call.body.messages.at(-1).content, "Hi *waves*");
+    assert.match(call.body.messages.at(-1).content, /^\[sent [^\]]+\]\nHi \*waves\*$/);
+    assert.doesNotMatch(call.body.messages[1].content, /\[sent /, "the pinned self-description is not a timestamped event");
     // The self-description is not a transcript message, so it is never consolidated as evidence.
     assert.ok(app.store.transcript(mira.id).every((message) => !message.text.includes("night-shift nurse")));
     assert.equal(app.store.lastMessage(mira.id).text, "*nods* Hello.");

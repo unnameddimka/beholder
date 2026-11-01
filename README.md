@@ -74,7 +74,9 @@ The tests cover the acceptance scenarios that can be automated: key secrecy acro
 scope flags; context assembly (pinned self-description, experiments in, interpretations out); envelope repair; Retry
 without duplication; the 100/20/80 Verbatim→STM threshold and failure safety; daily STM→LTM catch-up without double
 consolidation; prefetch inputs; both-flags ordering with concurrent maintenance; coalescing; stale-result protection;
-follow-up timers and races; asynchronous images; bounded retries; and HTTP safety.
+follow-up timers and races; asynchronous images; bounded retries; HTTP safety; and the spec 0001 scenarios (plain-text
+fallback, isolated repair, truncation precedence, format step-down, message timestamps, clock in every mode, time zones,
+DST, and the UTC fallback).
 
 ### Manual smoke procedure (Android / LAN)
 
@@ -99,15 +101,28 @@ follow-up timers and races; asynchronous images; bounded retries; and HTTP safet
   30 s), 5xx, and empty or provider-error completions, with exponential backoff. 401 is never retried. The model is
   never switched.
 - **Structured output:** every structured purpose is parsed and validated. Invalid output gets up to 2 LLM repairs and
-  is never committed. Dialogue replies, follow-ups, and openers differ in three ways:
+  is never committed. Dialogue replies, follow-ups, and openers differ in three ways (spec 0001):
   - OpenRouter receives a strict JSON schema when the catalogue lists `structured_outputs` for the Dialogue model, or
     JSON-object mode when it lists only `response_format`. Such requests set `require_parameters`, so only providers
     that honor the format are used. If the model is uncatalogued or the catalogue is unavailable, the format is
-    enforced by the prompt alone.
-  - A non-empty plain-text answer (one that does not start with `{`, `[`, or a backtick) is wrapped locally as the
-    message, with no follow-up or image request, and costs no extra model call. This also applies to a repair answer.
+    enforced by the prompt alone. If OpenRouter rejects the format because no endpoint supports it, the request steps
+    down one mode (schema, then JSON object, then prompt-only) and is retried with the same model. The step is
+    remembered for that model until restart. The chosen mode and every step are recorded in diagnostics.
+  - A non-empty plain-text answer is accepted as the message as written, with no follow-up or image request, and costs
+    no extra model call. A diagnostic event records it. This applies only to a complete answer generated from the full
+    context (including the retry after a truncated output), never to a repair answer. Text that starts with `{`, `[`,
+    or a backtick, or contains an envelope field name, is treated as attempted JSON and goes to repair.
   - A repair request contains only the invalid output, the validation errors, and the format instructions, never the
-    chat transcript.
+    chat transcript, self-description, memories, or experiments.
+- **Time awareness (spec 0001):** every Dialogue request (reply, Retry, follow-up, opener) states the current time,
+  taken when the request is assembled, and the user's time zone. Each history message starts with a
+  `[sent <UTC instant> | <local time>]` marker built from its stored timestamp. The pinned self-description has none.
+  The time zone is the browser's IANA zone, sent with presence, Send, and Retry. Follow-ups and openers use the most
+  recently active session in that chat. Each instant is localized with its own offset, so DST is correct. The time
+  since the latest message, and its gap to the one before, are computed from instants. Without a valid browser zone,
+  all times are labeled UTC and the prompt says the zone is unknown; the server's own time zone is never used. A
+  marker that the model copies to the start of its reply is removed before commit and logged. Only Dialogue requests
+  carry time data.
 - **Memory retrieval:** Society's semantic selector runs before every dialogue reply when the memory pool is not empty
   (Dialogue model; limits: 12 STM, 8 LTM). Contemplation runs it with the Contemplation model. Divergence from
   Society: if the selector fails after retries, Beholder falls back to importance ranking (recorded in diagnostics)
@@ -141,8 +156,8 @@ follow-up timers and races; asynchronous images; bounded retries; and HTTP safet
   reinstated. Autonomous messages are discarded at commit if anything changed in the chat.
 - **Images:** the OpenRouter Images API as in Society. Only options that every endpoint advertises are sent (`n: 1`,
   `aspect_ratio: 1:1`, `quality: medium`, `output_format: webp`, `stream: false`). Inline base64, data URIs, and
-  temporary https URLs are accepted. A temporary URL is downloaded at once: https on the default port only, no credentials, no redirects,
-  and the host must not be local or resolve to a loopback, private, link-local, CGNAT, or other internal address. The
+  temporary https URLs are accepted. A temporary URL is downloaded at once: https on the default port only, no
+  credentials, no redirects, and the host must not be local or resolve to a loopback, private, link-local, CGNAT, or other internal address. The
   body is read as a stream and aborted past the limit. PNG, JPEG, and WebP only, at most 16 MiB, signature checked. No
   re-encoding (Society's `sharp` normalization is omitted to stay dependency-free). Pending images resume after a
   restart once the key is entered.
@@ -155,7 +170,10 @@ follow-up timers and races; asynchronous images; bounded retries; and HTTP safet
 
 - Because the key exists only in memory, model-backed background work after a restart (missed STM→LTM catch-up,
   contemplation recovery, pending images) starts when the key is entered, not at process start.
-- No live-provider evaluation has been run. Prompt quality is untested against real models.
+- No live-provider evaluation has been run. Prompt quality is untested against real models, including how DeepSeek
+  routes handle the format modes and whether models use the time markers well.
+- The format step-down recognizes OpenRouter's "requested parameters" rejection and format-related 4xx messages. A
+  provider that rejects the format with different wording fails the reply visibly (Retry stays available).
 - The image URL check resolves DNS before the download; a DNS answer that changes between the check and the fetch is
   not defended against.
 - The browser UI has no automated tests; the navigation guard (review P2-2) is covered only by code review.
