@@ -5,6 +5,26 @@ export const FOLLOW_UP_MAX_SECONDS = 86_400;
 export const IMAGE_REQUEST_MAX_CHARS = 2000;
 export const MESSAGE_MAX_CHARS = 20_000;
 
+// OpenRouter-enforced schema for dialogue envelopes when the selected endpoint supports structured outputs.
+// Bounds and non-empty content are still enforced locally by validateDialogueEnvelope.
+export const DIALOGUE_RESPONSE_FORMAT = {
+  type: "json_schema",
+  json_schema: {
+    name: "beholder_dialogue_envelope",
+    strict: true,
+    schema: {
+      type: "object",
+      properties: {
+        message: { type: "string" },
+        followUpDelaySeconds: { type: ["integer", "null"] },
+        imageRequest: { type: ["string", "null"] }
+      },
+      required: ["message", "followUpDelaySeconds", "imageRequest"],
+      additionalProperties: false
+    }
+  }
+};
+
 export function dialogueSystemPrompt({ character, experiments, memories, imageEnabled, mode }) {
   const parts = [];
   parts.push([
