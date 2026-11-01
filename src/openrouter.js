@@ -9,8 +9,8 @@ export const OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completion
 export const OPENROUTER_MODELS_ENDPOINT = "https://openrouter.ai/api/v1/models";
 export const OPENROUTER_KEY_ENDPOINT = "https://openrouter.ai/api/v1/key";
 export const TRUNCATION_FINISH_REASONS = Object.freeze(["length", "max_tokens", "max_output_tokens"]);
-// Society PROVIDER_BLACKLIST.
-const PROVIDER_IGNORE = ["alibaba", "Phala", "SiliconFlow", "GMICloud"];
+// Society PROVIDER_BLACKLIST plus Baidu Qianfan (Specification 0002 B1); sent with every text Chat Completions request.
+export const PROVIDER_IGNORE = Object.freeze(["alibaba", "Phala", "SiliconFlow", "GMICloud", "baidu"]);
 export const TRANSPORT_ATTEMPTS = 3;
 const RETRYABLE_CODES = new Set(["NETWORK_ERROR", "AI_REQUEST_TIMEOUT", "RATE_LIMITED", "PROVIDER_5XX", "MALFORMED_PROVIDER_RESPONSE", "AI_PROVIDER_COMPLETION_ERROR"]);
 

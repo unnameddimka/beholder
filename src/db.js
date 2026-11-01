@@ -10,7 +10,7 @@ export function privatePool(characterId) { return `character:${characterId}`; }
 export function memoryPoolOf(character) { return character.useSharedMemory ? SHARED_POOL : privatePool(character.id); }
 export function interpretationPoolOf(character) { return character.useSharedInterpretations ? SHARED_POOL : privatePool(character.id); }
 
-const MIGRATIONS = [
+export const MIGRATIONS = [
   `
   CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   CREATE TABLE characters (
@@ -97,6 +97,12 @@ const MIGRATIONS = [
     updated_at TEXT NOT NULL,
     PRIMARY KEY (pool, character_id)
   );
+  `,
+  // Specification 0002: one evolving gestalt per interpretation pool and the interpretation revision it reflects.
+  `
+  ALTER TABLE interpretation_pools ADD COLUMN gestalt TEXT;
+  ALTER TABLE interpretation_pools ADD COLUMN gestalt_revision INTEGER;
+  ALTER TABLE interpretation_pools ADD COLUMN gestalt_updated_at TEXT;
   `
 ];
 
@@ -316,7 +322,8 @@ export class Store {
   ensureInterpretationPool(pool) {
     this.db.prepare("INSERT INTO interpretation_pools (pool) VALUES (?) ON CONFLICT(pool) DO NOTHING").run(pool);
     const row = this.db.prepare("SELECT * FROM interpretation_pools WHERE pool = ?").get(pool);
-    return { pool: row.pool, interpretationRevision: row.interpretation_revision, experimentRevision: row.experiment_revision, planningNeeded: row.planning_needed === 1 };
+    return { pool: row.pool, interpretationRevision: row.interpretation_revision, experimentRevision: row.experiment_revision, planningNeeded: row.planning_needed === 1,
+      gestalt: row.gestalt, gestaltRevision: row.gestalt_revision, gestaltUpdatedAt: row.gestalt_updated_at };
   }
 
   interpretationPools() { return this.db.prepare("SELECT pool FROM interpretation_pools ORDER BY pool").all().map((row) => this.ensureInterpretationPool(row.pool)); }
@@ -370,6 +377,12 @@ export class Store {
   setPlanningNeeded(pool, needed) {
     this.ensureInterpretationPool(pool);
     this.db.prepare("UPDATE interpretation_pools SET planning_needed = ? WHERE pool = ?").run(needed ? 1 : 0, pool);
+  }
+
+  // Replaces the pool's single gestalt; no history of earlier gestalts is kept.
+  setGestalt(pool, text, revision) {
+    this.ensureInterpretationPool(pool);
+    this.db.prepare("UPDATE interpretation_pools SET gestalt = ?, gestalt_revision = ?, gestalt_updated_at = ? WHERE pool = ?").run(text, revision, nowIso(), pool);
   }
 
   watermark(pool, characterId) {

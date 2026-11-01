@@ -72,6 +72,7 @@ function contemplationView(app, character) {
     pool,
     poolState: app.store.ensureInterpretationPool(pool),
     contemplationEnabled: app.settings.get().contemplationEnabled,
+    gestalt: app.contemplation.gestaltView(pool),
     interpretations: app.store.interpretations(pool),
     experiments: app.store.experiments(pool),
     status: app.contemplation.status(pool)

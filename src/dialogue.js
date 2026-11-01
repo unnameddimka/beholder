@@ -1,6 +1,6 @@
 // Dialogue: synchronous-feeling chat replies plus server-guarded follow-up timers (Specification 0000 section 6).
-// A reply starts immediately on send and never waits for Contemplation. It sees a snapshot of the active
-// experiment intentions (never interpretation texts) and Society-style retrieved memory.
+// A reply starts immediately on send and never waits for Contemplation. It sees a snapshot of the pool's gestalt and
+// active experiment intentions (never interpretation texts) and Society-style retrieved memory.
 import { coded } from "./utils.js";
 import { interpretationPoolOf, memoryPoolOf } from "./db.js";
 import { messageView } from "./memory.js";
@@ -14,9 +14,9 @@ const RETRIEVAL_SITUATION_MESSAGES = 12;
 
 // Pure context assembly, exported for tests: system contract + pinned self-description + verbatim history. The
 // clock adds the current time and a timestamp marker per history message; the pinned self-description has none.
-export function buildDialogueMessages({ character, userDescription, history, imagesByMessage, experiments, memories, imageEnabled, mode, clock = null }) {
+export function buildDialogueMessages({ character, userDescription, history, imagesByMessage, gestalt = null, experiments, memories, imageEnabled, mode, clock = null }) {
   return [
-    { role: "system", content: dialogueSystemPrompt({ character, experiments, memories, imageEnabled, mode, clock }) },
+    { role: "system", content: dialogueSystemPrompt({ character, gestalt, experiments, memories, imageEnabled, mode, clock }) },
     pinnedSelfDescriptionMessage(userDescription),
     ...historyMessages(history, imagesByMessage, clock)
   ];
@@ -107,8 +107,11 @@ export class Dialogue {
     const character = this.store.getCharacter(characterId);
     const settings = this.settings.get();
     const history = this.store.activeMessages(characterId, VERBATIM_WINDOW);
-    // Snapshot of the experiment intentions at request start; later updates apply to the next request only.
-    const experiments = settings.contemplationEnabled ? this.store.experiments(interpretationPoolOf(character)) : [];
+    // Snapshot of the gestalt and experiment intentions at request start; later updates apply to the next request only.
+    // Both come from the character's current interpretation pool and only while Contemplation is enabled.
+    const pool = interpretationPoolOf(character);
+    const gestalt = settings.contemplationEnabled ? this.store.ensureInterpretationPool(pool).gestalt : null;
+    const experiments = settings.contemplationEnabled ? this.store.experiments(pool) : [];
     progress.stage = "retrieval";
     const memories = await this.memory.retrieve({ pool: memoryPoolOf(character), purpose: "dialogue_memory_retrieval", currentCharacterId: characterId,
       situation: { character: character.name, mode, recentMessages: history.slice(-RETRIEVAL_SITUATION_MESSAGES).map((message) => messageView(message, character.name)) } });
@@ -119,10 +122,10 @@ export class Dialogue {
     // messages use the most recently active session in the chat.
     const clock = clockContext({ now: this.now(), timeZone: mode === "reply" ? progress.timeZone : this.timeZoneFor(characterId),
       lastMessageAt: history.at(-1)?.createdAt ?? null, previousMessageAt: history.at(-2)?.createdAt ?? null });
-    const messages = buildDialogueMessages({ character, userDescription: this.settings.userDescription(), history, imagesByMessage, experiments,
+    const messages = buildDialogueMessages({ character, userDescription: this.settings.userDescription(), history, imagesByMessage, gestalt, experiments,
       memories: { shortTermMemories: memories.shortTermMemories, longTermMemories: memories.longTermMemories }, imageEnabled: settings.imageEnabled, mode, clock });
     const purpose = mode === "reply" ? "dialogue_reply" : mode === "followup" ? "dialogue_followup" : "dialogue_opener";
-    const context = { characterId, characterName: character.name, experimentCount: experiments.length, timeZone: clock.timeZone, timeZoneKnown: clock.timeZoneKnown };
+    const context = { characterId, characterName: character.name, gestaltPresent: Boolean(gestalt), experimentCount: experiments.length, timeZone: clock.timeZone, timeZoneKnown: clock.timeZoneKnown };
     const { value } = await this.llm.structured({ purpose, messages, validate: validateDialogueEnvelope, context });
     // A model that copies the history's timestamp markers gets them removed; the marker is metadata, not speech.
     const echo = stripTimestampEcho(value.message);

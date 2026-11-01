@@ -369,80 +369,62 @@ async function renderChat(characterId) {
 
 // ---- contemplation ---------------------------------------------------------------------------------------------
 
+// Reference-only view (Specification 0002 U1/U2): reading and polling never change contemplation state.
 async function renderContemplation(characterId) {
   const root = els.root;
   const character = state.characters.find((entry) => entry.id === characterId);
   if (!character) throw new Error("Character not found.");
   setTitle(root, `Contemplation: ${character.name}`);
   let data = await api(`/api/characters/${characterId}/contemplation`);
-  const editing = new Set();
   const statusEl = h("div", { className: "card" });
+  const gestaltEl = h("div", { className: "card" });
   const interpretationsEl = h("div", { className: "card" });
   const experimentsEl = h("div", { className: "card" });
-  const forceRow = h("div", { className: "row" },
-    ...[["generation", "Force Generation"], ["maintenance", "Force Maintenance"], ["experimentation", "Force Experimentation"]].map(([kind, label]) => h("button", { className: "btn small", type: "button", text: label, onClick: async (event) => {
-      event.target.disabled = true;
-      try { data = await api(`/api/characters/${characterId}/contemplation/force`, { method: "POST", body: { kind } }); renderAll(); }
-      catch (error) { showBanner(error.message); }
-      finally { event.target.disabled = false; }
-    } })));
 
   const renderStatusCard = () => {
     const s = data.status;
     const roles = state.activity?.roles?.contemplation;
     const rows = [
       ["Pool", poolLabel(data.pool)],
-      ["Contemplation", data.contemplationEnabled ? "enabled" : "disabled (manual Force actions only; experiments are not sent to dialogue)"],
+      ["Contemplation", data.contemplationEnabled ? "enabled" : "disabled (no automatic contemplation; gestalt and experiments are not sent to dialogue)"],
       ["Stage", s.running ? `${s.stage}${s.stageCharacterId ? ` (chat ${state.characters.find((c) => c.id === s.stageCharacterId)?.name || s.stageCharacterId})` : ""}` : "idle"],
       ["Parallel", s.parallel.total ? `${s.parallel.inFlight} running of ${s.parallel.total} maintenance requests` : "-"],
       ["Model requests", roles ? `${roles.pendingCount} in flight` : "-"],
       ["Queued", [s.queued.pendingCharacterIds.length ? `${s.queued.pendingCharacterIds.length} chat(s) with new messages` : null, s.queued.forced.length ? `forced: ${s.queued.forced.join(", ")}` : null,
-        s.queued.planningRequested ? "experiment review pending" : null].filter(Boolean).join("; ") || "nothing"],
+        s.queued.gestaltDue ? "gestalt update pending" : null, s.queued.planningRequested ? "experiment review pending" : null].filter(Boolean).join("; ") || "nothing"],
       ["Last cycle", s.lastCycle ? `${s.lastCycle.status}${s.lastCycle.flags ? ` (generation ${s.lastCycle.flags.generation}, maintenance ${s.lastCycle.flags.maintenance})` : ""}` : "-"],
       ["Last error", s.lastError ? `${s.lastError.stage}: ${s.lastError.message}` : "none"]
     ];
     statusEl.replaceChildren(h("div", { className: "row spread" }, h("h3", { text: "Status" }), h("span", { className: `dot${s.running ? " working" : s.lastError ? " error" : ""}` })),
-      h("div", { className: "stage-grid" }, ...rows.flatMap(([label, value]) => [h("span", { className: "muted", text: label }), h("span", { text: value })])), h("div", { className: "row" }, forceRow));
+      h("div", { className: "stage-grid" }, ...rows.flatMap(([label, value]) => [h("span", { className: "muted", text: label }), h("span", { text: value })])));
   };
 
-  const listSection = (container, title, items, endpoint, hint) => {
-    const addInput = h("textarea", { rows: 3, placeholder: hint });
-    const entries = items.map((item) => {
-      const key = `${endpoint}:${item.id}`;
-      const text = h("div", { className: "text" }, item.text);
-      const editor = h("textarea", { rows: 5, value: item.text, className: editing.has(key) ? "" : "hidden" });
-      const edit = h("button", { className: "btn small", type: "button", text: editing.has(key) ? "Save" : "Edit", onClick: async () => {
-        if (!editing.has(key)) { editing.add(key); editor.classList.remove("hidden"); text.classList.add("hidden"); edit.textContent = "Save"; return; }
-        try { data = await api(`/api/characters/${characterId}/${endpoint}/${item.id}`, { method: "PUT", body: { text: editor.value } }); editing.delete(key); renderAll(); }
-        catch (error) { showBanner(error.message); }
-      } });
-      if (editing.has(key)) text.classList.add("hidden");
-      const del = h("button", { className: "btn small danger", type: "button", text: "Delete", onClick: async () => {
-        if (!confirm("Delete this entry?")) return;
-        try { data = await api(`/api/characters/${characterId}/${endpoint}/${item.id}`, { method: "DELETE" }); editing.delete(key); renderAll(); }
-        catch (error) { showBanner(error.message); }
-      } });
-      return h("div", { className: "list-entry" }, text, editor, h("div", { className: "row" }, edit, del, h("span", { className: "muted", text: formatTime(item.updatedAt) })));
-    });
-    const add = h("button", { className: "btn small primary", type: "button", text: "Add", onClick: async () => {
-      if (!addInput.value.trim()) return;
-      try { data = await api(`/api/characters/${characterId}/${endpoint}`, { method: "POST", body: { text: addInput.value } }); renderAll(); }
-      catch (error) { showBanner(error.message); }
-    } });
-    container.replaceChildren(h("h3", { text: `${title} (${items.length})` }), ...(entries.length ? entries : [h("p", { className: "muted", text: "None yet." })]), h("div", { className: "stack" }, addInput, add));
+  const renderGestalt = () => {
+    const g = data.gestalt;
+    const label = g.status === "pending" ? (g.text ? "Update pending: this gestalt predates the latest interpretation changes." : "Not formed yet; the first synthesis is pending.")
+      : g.status === "none" ? "Not formed yet." : "Current.";
+    gestaltEl.replaceChildren(h("h3", { text: "Gestalt" }),
+      h("p", { className: "muted", text: `${label}${g.updatedAt ? ` Last updated ${formatTime(g.updatedAt)}.` : ""}` }),
+      ...(g.text ? [h("div", { className: "text" }, g.text)] : []));
+  };
+
+  const listSection = (container, title, items) => {
+    const entries = items.map((item) => h("div", { className: "list-entry" }, h("div", { className: "text" }, item.text), h("span", { className: "muted", text: formatTime(item.updatedAt) })));
+    container.replaceChildren(h("h3", { text: `${title} (${items.length})` }), ...(entries.length ? entries : [h("p", { className: "muted", text: "None yet." })]));
   };
 
   let signature = "";
   const renderAll = () => {
     renderStatusCard();
-    const next = JSON.stringify([data.interpretations, data.experiments]);
-    if (next === signature || editing.size) return;
+    const next = JSON.stringify([data.gestalt, data.interpretations, data.experiments]);
+    if (next === signature) return;
     signature = next;
-    listSection(interpretationsEl, "Interpretations", data.interpretations, "interpretations", "Add an interpretation of the user (free-form prose).");
-    listSection(experimentsEl, "Active experiments", data.experiments, "experiments", "Add an experiment intention (what to learn, not a script).");
+    renderGestalt();
+    listSection(interpretationsEl, "Interpretations", data.interpretations);
+    listSection(experimentsEl, "Active experiments", data.experiments);
   };
-  root.append(statusEl, interpretationsEl, experimentsEl,
-    h("p", { className: "muted", text: "Only the active experiments reach the dialogue model; interpretations never do. Editing interpretations triggers one experiment review; editing experiments does not." }));
+  root.append(statusEl, gestaltEl, interpretationsEl, experimentsEl,
+    h("p", { className: "muted", text: "This page is read-only. The dialogue model receives the gestalt and the active experiments, never the interpretations themselves. Contemplation runs on its own after your messages." }));
   renderAll();
   return {
     kind: "contemplation",
@@ -502,7 +484,7 @@ async function renderSettings() {
     h("div", { className: "card stack" }, h("h3", { text: "Images" }), modelRow("image", "Image generation model", "image-models"),
       h("label", { className: "check" }, imageEnabled, h("span", { text: "Enable image generation (the dialogue model may then show pictures)" }))),
     h("div", { className: "card stack" }, h("h3", { text: "Contemplation" }),
-      h("label", { className: "check" }, contemplationEnabled, h("span", { text: "Enable Contemplation (off: no automatic contemplation and no experiments in dialogue; stored state and Force actions remain)" }))),
+      h("label", { className: "check" }, contemplationEnabled, h("span", { text: "Enable Contemplation (off: no automatic contemplation, and no gestalt or experiments in dialogue; stored state stays visible)" }))),
     h("div", { className: "row" }, save, h("button", { className: "btn", type: "button", text: "Refresh model list", onClick: () => api("/api/models?refresh=1").then((value) => { models = value; fillLists(); }).catch((error) => showBanner(error.message)) })));
   const onActivity = (activity) => {
     for (const [role, dot] of Object.entries(dots)) {

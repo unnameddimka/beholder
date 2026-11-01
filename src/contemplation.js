@@ -1,18 +1,20 @@
 // Contemplation: an independent background process per interpretation pool (Specification 0000 section 5).
 // One serial pipeline per pool: prefetch -> maintenance (parallel per interpretation, all-or-nothing batch) ->
-// generation (with an LLM review of the candidate) -> at most one experiment-planning pass against the final pool.
+// generation (with an LLM review of the candidate) -> gestaltization (Specification 0002) -> at most one
+// experiment-planning pass against the final pool.
 // User messages arriving during a cycle are coalesced through a persisted per-(pool, chat) watermark. Writes are
 // atomic SQLite transactions guarded by revisions/snapshots, so stale results never overwrite newer state.
 import { coded, exactKeys, mapLimited } from "./utils.js";
 import { interpretationPoolOf, memoryPoolOf } from "./db.js";
 import { messageView } from "./memory.js";
 import {
-  INTERPRETATION_MAX_CHARS, EXPERIMENT_MAX_CHARS,
-  prefetchSystemPrompt, maintenanceSystemPrompt, generationSystemPrompt, generationReviewSystemPrompt, experimentPlanningSystemPrompt
+  INTERPRETATION_MAX_CHARS, EXPERIMENT_MAX_CHARS, GESTALT_MAX_CHARS,
+  prefetchSystemPrompt, maintenanceSystemPrompt, generationSystemPrompt, generationReviewSystemPrompt, gestaltizationSystemPrompt, experimentPlanningSystemPrompt
 } from "./prompts/contemplation.js";
 
 export const CONTEMPLATION_HISTORY = 100;
 const PLANNING_STALE_RETRIES = 3;
+const GESTALT_STALE_RETRIES = 3;
 const GENERATION_REREVIEWS = 2;
 const RETRIEVAL_SITUATION_MESSAGES = 12;
 // Manual edits often come in quick succession; a short debounce lets them coalesce into one experiment review.
@@ -66,6 +68,18 @@ export function validateGenerationReview(raw) {
   return { ok: true, value: { accept: raw.accept, problem: raw.problem ? raw.problem.slice(0, 500) : null } };
 }
 
+export function validateGestalt(raw) {
+  if (!exactKeys(raw, ["gestalt"]) || typeof raw.gestalt !== "string" || !raw.gestalt.trim()) return { ok: false, errors: ["response must be exactly {\"gestalt\": non-empty text}."] };
+  if (raw.gestalt.trim().length > GESTALT_MAX_CHARS) return { ok: false, errors: [`gestalt must be at most ${GESTALT_MAX_CHARS} characters.`] };
+  return { ok: true, value: raw.gestalt.trim() };
+}
+
+// A gestalt is due when it does not reflect the current interpretation revision and there is something to
+// synthesize: interpretations, or an earlier gestalt to reconsider. An empty pool without a gestalt stays empty.
+export function gestaltDue(state, interpretationCount) {
+  return state.gestaltRevision !== state.interpretationRevision && (interpretationCount > 0 || state.gestalt !== null);
+}
+
 export function validatePlanning(raw, experimentIds) {
   const errors = [];
   if (!exactKeys(raw, ["experiments"]) || !Array.isArray(raw.experiments)) return { ok: false, errors: ["response must be exactly {\"experiments\": [...]}."] };
@@ -90,7 +104,7 @@ export function validatePlanning(raw, experimentIds) {
 
 function newPoolRuntime(pool) {
   return { pool, running: false, stage: "idle", stageCharacterId: null, parallel: { total: 0, inFlight: 0 }, pendingCharacters: new Set(), forced: [],
-    planningRequested: false, lastError: null, lastCycle: null, cycles: 0, promise: null };
+    planningRequested: false, gestaltFailedRevision: null, lastError: null, lastCycle: null, cycles: 0, promise: null };
 }
 
 export class Contemplation {
@@ -137,14 +151,18 @@ export class Contemplation {
     return this.kick(pool);
   }
 
-  // Restart recovery: re-evaluate unprocessed user messages and persisted pending experiment planning.
+  // Restart recovery: re-evaluate unprocessed user messages, persisted pending experiment planning, and gestalts that
+  // do not reflect the current interpretation revision (including pools upgraded from before Specification 0002).
   recover() {
     if (!this.enabled()) return;
     for (const character of this.store.listCharacters()) {
       const pool = interpretationPoolOf(character);
       if (this.store.lastUserMessageId(character.id) > this.store.watermark(pool, character.id)) this.runtime(pool).pendingCharacters.add(character.id);
     }
-    for (const state of this.store.interpretationPools()) if (state.planningNeeded) this.runtime(state.pool).planningRequested = true;
+    for (const state of this.store.interpretationPools()) {
+      if (state.planningNeeded) this.runtime(state.pool).planningRequested = true;
+      if (gestaltDue(state, this.store.interpretations(state.pool).length)) this.runtime(state.pool).gestaltFailedRevision = null;
+    }
     for (const pool of this.pools.keys()) this.kick(pool);
   }
 
@@ -179,6 +197,7 @@ export class Contemplation {
         try {
           if (op.kind === "maintenance") await this.runMaintenance(rt, op.characterId);
           else if (op.kind === "generation") await this.runGeneration(rt, op.characterId);
+          await this.gestaltizeIfDue(rt);
           await this.planIfNeeded(rt, { force: op.kind === "experimentation" });
         } catch (error) {
           rt.lastError = this.diagnostics.error(`contemplation_${op.kind}`, error, { pool, characterId: op.characterId });
@@ -190,7 +209,14 @@ export class Contemplation {
         await this.runCycle(rt, characterId);
         continue;
       }
-      if ((rt.planningRequested || this.store.ensureInterpretationPool(pool).planningNeeded) && this.enabled()) {
+      // A gestalt that already failed for this revision waits for the next opportunity (message, edit, restart,
+      // re-enable) instead of retrying in a loop.
+      const state = this.store.ensureInterpretationPool(pool);
+      if (this.enabled() && rt.gestaltFailedRevision !== state.interpretationRevision && gestaltDue(state, this.store.interpretations(pool).length)) {
+        await this.gestaltizeIfDue(rt);
+        continue;
+      }
+      if ((rt.planningRequested || state.planningNeeded) && this.enabled()) {
         rt.planningRequested = false;
         try { await this.planIfNeeded(rt, {}); }
         catch (error) {
@@ -261,6 +287,7 @@ export class Contemplation {
       if (flags.maintenance && this.store.interpretations(pool).length) await this.runMaintenance(rt, characterId);
       if (flags.generation) await this.runGeneration(rt, characterId);
       this.store.setWatermark(pool, characterId, targetMessageId);
+      await this.gestaltizeIfDue(rt);
       await this.planIfNeeded(rt, {});
       cycle.status = "succeeded";
       rt.cycles += 1;
@@ -391,6 +418,56 @@ export class Contemplation {
     }
   }
 
+  // Gestaltization (Specification 0002 G2/G3): reinterprets the previous gestalt in the light of every current
+  // interpretation. It never changes interpretations or experiments. A failure keeps the last valid gestalt, is
+  // recorded, and never fails the surrounding cycle; the revision is remembered so the idle loop does not retry it.
+  async gestaltizeIfDue(rt) {
+    const pool = rt.pool;
+    if (!this.enabled()) return { status: "disabled" };
+    const state = this.store.ensureInterpretationPool(pool);
+    if (!gestaltDue(state, this.store.interpretations(pool).length)) return { status: "not_needed" };
+    try {
+      const result = await this.runGestaltization(rt);
+      rt.gestaltFailedRevision = null;
+      return result;
+    } catch (error) {
+      rt.gestaltFailedRevision = this.store.ensureInterpretationPool(pool).interpretationRevision;
+      rt.lastError = this.diagnostics.error("contemplation_gestaltization", error, { pool });
+      return { status: "failed" };
+    }
+  }
+
+  async runGestaltization(rt) {
+    const pool = rt.pool;
+    for (let attempt = 1; attempt <= GESTALT_STALE_RETRIES; attempt += 1) {
+      this.setStage(rt, "gestaltization");
+      const state = this.store.ensureInterpretationPool(pool);
+      const interpretations = this.interpretationViews(pool);
+      if (!gestaltDue(state, interpretations.length)) return { status: "not_needed" };
+      const payload = { interpretationRevision: state.interpretationRevision, interpretations,
+        previousGestalt: state.gestalt === null ? null : { text: state.gestalt, interpretationRevision: state.gestaltRevision, updatedAt: state.gestaltUpdatedAt },
+        requiredResponseShape: { gestalt: "..." } };
+      const messages = [{ role: "system", content: gestaltizationSystemPrompt() }, { role: "user", content: JSON.stringify(payload) }];
+      // The whole interpretation set is always sent; a set that cannot fit is refused rather than truncated.
+      try { await this.llm.modelCatalog(); } catch {}
+      const fit = this.llm.contextFit("contemplation", messages);
+      if (fit && !fit.fits) {
+        throw coded("GESTALT_CONTEXT_EXCEEDED", `The ${interpretations.length} interpretations do not fit the Contemplation model's context (estimated ${fit.estimatedTokens} of ${fit.contextLength} tokens including the output budget); the gestalt was not updated.`);
+      }
+      const { value } = await this.llm.structured({ purpose: "contemplation_gestaltization", messages, validate: validateGestalt,
+        context: { pool, interpretationRevision: state.interpretationRevision, interpretationCount: interpretations.length } });
+      const committed = this.store.tx(() => {
+        if (this.store.ensureInterpretationPool(pool).interpretationRevision !== state.interpretationRevision) return false;
+        this.store.setGestalt(pool, value, state.interpretationRevision);
+        return true;
+      });
+      this.diagnostics.event({ type: "contemplation-gestaltization", pool, attempt, status: committed ? "committed" : "stale", interpretationRevision: state.interpretationRevision,
+        interpretationCount: interpretations.length, characters: value.length });
+      if (committed) return { status: "committed", revision: state.interpretationRevision };
+    }
+    throw coded("GESTALTIZATION_STALE", "The gestalt stayed stale after repeated interpretation changes; it will be synthesized at the next opportunity.");
+  }
+
   // Experiment planning sees only the interpretation pool and the active experiments. It runs once against the
   // final committed pool after maintenance/generation; a result computed from an outdated revision is discarded.
   async planIfNeeded(rt, { force = false }) {
@@ -462,6 +539,7 @@ export class Contemplation {
 
   afterManualInterpretationChange(pool) {
     if (!this.enabled()) return;
+    this.runtime(pool).gestaltFailedRevision = null;
     this.runtime(pool).planningRequested = true;
     clearTimeout(this.planningTimers.get(pool));
     const handle = setTimeout(() => { this.planningTimers.delete(pool); this.kick(pool); }, this.planningDebounceMs);
@@ -488,10 +566,19 @@ export class Contemplation {
 
   // ---- status -------------------------------------------------------------------------------------------------
 
+  // The persisted gestalt with its freshness: none (not formed), pending (older than the interpretation revision),
+  // or current.
+  gestaltView(pool) {
+    const state = this.store.ensureInterpretationPool(pool);
+    const status = gestaltDue(state, this.store.interpretations(pool).length) ? "pending" : state.gestalt === null ? "none" : "current";
+    return { text: state.gestalt, status, revision: state.gestaltRevision, interpretationRevision: state.interpretationRevision, updatedAt: state.gestaltUpdatedAt };
+  }
+
   status(pool = null) {
     const view = (rt) => ({
       pool: rt.pool, running: rt.running, stage: rt.stage, stageCharacterId: rt.stageCharacterId, parallel: { ...rt.parallel },
-      queued: { pendingCharacterIds: [...rt.pendingCharacters], forced: rt.forced.map((op) => op.kind), planningRequested: rt.planningRequested || this.store.ensureInterpretationPool(rt.pool).planningNeeded },
+      queued: { pendingCharacterIds: [...rt.pendingCharacters], forced: rt.forced.map((op) => op.kind), planningRequested: rt.planningRequested || this.store.ensureInterpretationPool(rt.pool).planningNeeded,
+        gestaltDue: this.gestaltView(rt.pool).status === "pending" },
       lastError: rt.lastError ? { at: rt.lastError.at, stage: rt.lastError.stage, code: rt.lastError.code, message: rt.lastError.message } : null,
       lastCycle: rt.lastCycle, cycles: rt.cycles
     });

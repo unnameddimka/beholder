@@ -20,6 +20,7 @@ export const PURPOSE_ROLES = Object.freeze({
   contemplation_maintenance: "contemplation",
   contemplation_generation: "contemplation",
   contemplation_generation_review: "contemplation",
+  contemplation_gestaltization: "contemplation",
   contemplation_experiment_planning: "contemplation"
 });
 
@@ -28,6 +29,8 @@ const DIALOGUE_ENVELOPE_PURPOSES = new Set(["dialogue_reply", "dialogue_followup
 export const DIALOGUE_FORMAT_MODES = Object.freeze(["json_schema", "json_object", "prompt"]);
 const TIMEOUTS = { dialogue: 150_000, contemplation: 240_000 };
 const CATALOG_TTL_MS = 6 * 60 * 60 * 1000;
+// Deliberately low characters-per-token ratio for the pre-flight context estimate, so non-Latin text is not underestimated.
+const CHARS_PER_TOKEN_ESTIMATE = 3;
 
 export class LlmClient {
   constructor({ settings, key, diagnostics, fetchImpl = fetch, backoffMs = 1000, timeouts = TIMEOUTS }) {
@@ -59,6 +62,17 @@ export class LlmClient {
     const temperatureSupported = !entry?.supportedParameters || entry.supportedParameters.includes("temperature");
     const temperature = temperatureSetting.enabled && temperatureSupported ? temperatureSetting.value : null;
     return { model, maxTokens, temperature };
+  }
+
+  // Pre-flight size estimate of a request against the catalogue's context length, including the output budget. Null
+  // when the catalogue does not know the model's context length; the provider then decides.
+  contextFit(role, messages) {
+    const { model, maxTokens } = this.requestParameters(role);
+    const contextLength = this.catalog?.byId.get(model)?.contextLength;
+    if (!contextLength) return null;
+    const characters = messages.reduce((total, message) => total + String(message.content || "").length, 0);
+    const estimatedTokens = Math.ceil(characters / CHARS_PER_TOKEN_ESTIMATE) + maxTokens;
+    return { fits: estimatedTokens <= contextLength, estimatedTokens, contextLength };
   }
 
   async call({ purpose, messages, context = {}, signal = null, responseFormat = null }) {

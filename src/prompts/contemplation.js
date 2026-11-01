@@ -1,9 +1,10 @@
 // Contemplation model prompts: prefetch triage, per-interpretation maintenance, new interpretation generation, the
-// LLM review of a generated candidate, and experiment planning. Interpretations are free-form prose with no
+// LLM review of a generated candidate, gestaltization, and experiment planning. Interpretations are free-form prose with no
 // ontology, confidence scores, or mandatory citations; experiments are intentions, never scripted lines.
 
 export const INTERPRETATION_MAX_CHARS = 4000;
 export const EXPERIMENT_MAX_CHARS = 1000;
+export const GESTALT_MAX_CHARS = 16_000;
 
 const ROLE = [
   "You are part of the private Contemplation process behind a roleplay chat character. The human chatting with the character is called the user.",
@@ -60,6 +61,26 @@ export function generationReviewSystemPrompt() {
     "1) distinct: does it offer a meaningfully different explanation from every existing interpretation (not a rephrasing or minor variation)? Judge meaning, not wording.",
     "2) compatible: does it avoid asserting anything that established facts in the evidence contradict? Speculation and unproven ideas are acceptable.",
     "Return exactly {\"accept\": true|false, \"problem\": <null when accepted, otherwise one short sentence naming the problem>}. Return one JSON object only."
+  ].join(" ");
+}
+
+// Specification 0002 section 1: the user is one whole, ultimately unknowable person; interpretations are perspectives.
+export function gestaltizationSystemPrompt() {
+  return [
+    ROLE,
+    "You write the gestalt: Contemplation's current, evolving perception of the user as one whole, ultimately unknown and inexhaustible person. The character will carry it as a tentative impression of the user.",
+    "Input: interpretations are every current interpretation in the pool, the present hypotheses. previousGestalt is the gestalt you wrote earlier (null if none exists yet). Write a renewed gestalt by reinterpreting the previous one in the light of the current interpretations.",
+    "Think of several interpretations of one artwork: beauty, danger, scale, movement, vulnerability, humor and countless other readings may coexist, and none of them is the artwork itself. Likewise the user is not any one interpretation, nor the sum of a checklist of them.",
+    "Preserve the key points of every current interpretation as possible readings or perspectives, never as established facts. Do not silently drop interpretations or keep only the convenient ones.",
+    "Make the unity and fundamental unknowability of the person the central organizing idea: one person, many incomplete views. The interpretations may all illuminate the same user at once, including in apparently conflicting ways; none defines or exhausts them.",
+    "Let contradictory or tension-filled readings coexist. Do not force a resolution, choose a winner, rank the interpretations, or average them into a dull compromise. You may show how readings relate and find new connections between them.",
+    "Allow surprise, uncertainty, ambiguity and reinterpretation. Do not finalize the user into a fixed psychological portrait, type, diagnosis, trait table, score or verdict.",
+    "Do not invent biographical facts and do not present speculation as observed truth.",
+    "The previous gestalt is a historical perspective, not evidence that its own conclusions were true. Revise, radically rethink or discard its emphases freely when the current interpretations warrant it; retract any reading that no current interpretation still supports.",
+    "If interpretations is empty, no specific reading is currently supported: retract the previous specific claims and keep at most an open-ended acknowledgment that the user is still unknown.",
+    "The gestalt is not a plan to influence the user and not a list of experiments or tasks.",
+    "Write integrated, readable, free-form reflective prose, not an inventory or bullet list, in the language the interpretations are mostly written in.",
+    `Return exactly {"gestalt": <the renewed gestalt prose>}. gestalt is non-empty and at most ${GESTALT_MAX_CHARS} characters. Return one JSON object only.`
   ].join(" ");
 }
 

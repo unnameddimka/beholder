@@ -1,11 +1,14 @@
 # Beholder — local AI roleplay companion (PoC, Specification 0000)
 
 Beholder is a local, single-user roleplay chat. Each character has its own chat. Behind every chat, an independent
-**Contemplation** process keeps free-form *interpretations* of the user and turns them into *experiments*
-(intentions to learn more). The dialogue model may weave those intentions into its replies. The dialogue model only
-ever sees the experiment intentions, never the interpretations.
+**Contemplation** process keeps free-form *interpretations* of the user, synthesizes them into one evolving
+*gestalt* (a tentative impression of the user as one whole, ultimately unknown person), and turns them into
+*experiments* (intentions to learn more). The dialogue model receives the gestalt and the experiment intentions, never
+the interpretations themselves.
 
-Full requirements: [docs/specs/0000-beholder-poc.md](docs/specs/0000-beholder-poc.md).
+Full requirements: [docs/specs/0000-beholder-poc.md](docs/specs/0000-beholder-poc.md), amended by
+[0001](docs/specs/0001-dialogue-response-reliability-and-time-awareness.md) and
+[0002](docs/specs/0002-gestaltization-readonly-contemplation-baidu.md).
 
 > **Trusted LAN only.** Plain HTTP, no authentication, no HTTPS. Never expose the port to the internet.
 
@@ -49,17 +52,16 @@ SQLite (`data/beholder.sqlite`) and generated images (`data/images/`) survive co
    Contemplation model runs a cheap prefetch. It sees the interpretations, the last 100 messages and the active
    experiments (never consolidated memory), and requests maintenance when an interpretation needs revisiting or an
    experiment appears to have produced a result.
-2. Open **Contemplation** (from the chat header). It shows the current stage, the number of parallel maintenance
-   requests, queued work, the last cycle's flags, and errors.
-3. Use **Force Generation** to get a first interpretation. An interpretation change triggers one experiment review, so
-   active experiments appear shortly after.
-4. Keep chatting. The dialogue model receives the active experiments as private, optional intentions.
-   **Force Maintenance** revises every interpretation against the recent evidence, one parallel request each, and can
-   retire experiments that have reached a result. **Force Experimentation** runs one experiment review now.
-5. You can add, edit, or delete interpretations and experiments by hand. Interpretation edits trigger one experiment
-   review. Experiment edits trigger nothing.
-6. To compare behavior, untick **Enable Contemplation** in Settings. Automatic contemplation stops and experiments are
-   no longer sent to dialogue. Stored state and the Force actions remain.
+   When the prefetch sees a genuinely new angle, generation adds an interpretation.
+2. Open **Contemplation** (from the chat header). The page is read-only. It shows the gestalt (with "Not formed yet" or
+   "Update pending" when that applies), the interpretations, the active experiments, the current stage, the number of
+   parallel maintenance requests, queued work, the last cycle's flags, and errors. It has no edit or Force controls.
+3. Every interpretation change leads to one gestalt update and then one experiment review, so the gestalt and active
+   experiments appear shortly after the first interpretation.
+4. Keep chatting. The dialogue model receives the gestalt as its own tentative impression of the user and the active
+   experiments as private, optional intentions.
+5. To compare behavior, untick **Enable Contemplation** in Settings. Automatic contemplation (including gestalt
+   updates) stops, and neither the gestalt nor the experiments are sent to dialogue. Stored state stays visible.
 
 **Emergency Dump** (the red **Dump** button, always in the header) downloads a sanitized ZIP of state and diagnostics.
 It works while the server is busy and never changes state.
@@ -71,12 +73,15 @@ npm test        # node --check on every .js file, then node --test with a mocked
 ```
 
 The tests cover the acceptance scenarios that can be automated: key secrecy across restarts, dumps, and data files;
-scope flags; context assembly (pinned self-description, experiments in, interpretations out); envelope repair; Retry
+scope flags; context assembly (pinned self-description, gestalt and experiments in, interpretations out); envelope repair; Retry
 without duplication; the 100/20/80 Verbatim→STM threshold and failure safety; daily STM→LTM catch-up without double
 consolidation; prefetch inputs; both-flags ordering with concurrent maintenance; coalescing; stale-result protection;
-follow-up timers and races; asynchronous images; bounded retries; HTTP safety; and the spec 0001 scenarios (plain-text
+follow-up timers and races; asynchronous images; bounded retries; HTTP safety; the spec 0001 scenarios (plain-text
 fallback, isolated repair, truncation precedence, format step-down, message timestamps, clock in every mode, time zones,
-DST, and the UTC fallback).
+DST, and the UTC fallback); and the spec 0002 scenarios (schema migration and initial synthesis, gestalt inputs and
+prompt semantics, empty pools, one synthesis per cycle, stale-result protection, failure and restart recovery, the
+disabled state, the gestalt in every Dialogue mode and scope, the read-only page, and the Baidu exclusion on every text
+request). Whether a live model writes a good gestalt is a manual judgment, not something the tests can certify.
 
 ### Manual smoke procedure (Android / LAN)
 
@@ -99,7 +104,8 @@ DST, and the UTC fallback).
   `max_tokens`. A truncated output gets one compact retry.
 - **Transport reliability:** 3 attempts per request for timeouts, network errors, 429 (honoring `Retry-After`, capped at
   30 s), 5xx, and empty or provider-error completions, with exponential backoff. 401 is never retried. The model is
-  never switched.
+  never switched. Every text request asks OpenRouter to ignore the providers `alibaba`, `Phala`, `SiliconFlow`,
+  `GMICloud`, and `baidu` (spec 0002), while still allowing fallback among the others. Image requests are unchanged.
 - **Structured output:** every structured purpose is parsed and validated. Invalid output gets up to 2 LLM repairs and
   is never committed. Dialogue replies, follow-ups, and openers differ in three ways (spec 0001):
   - OpenRouter receives a strict JSON schema when the catalogue lists `structured_outputs` for the Dialogue model, or
@@ -144,17 +150,31 @@ DST, and the UTC fallback).
   date. The global date advances only when every pool succeeds. Each LTM job commits atomically, so a later failure
   keeps the remaining STM for the retry (15-minute backoff). Every STM present when the boundary runs is consolidated.
 - **Contemplation:** one serial pipeline per interpretation pool. Maintenance requests within a batch run in parallel
-  (up to 16 at once). The batch applies all-or-nothing. A result for an interpretation that was edited by hand in the
-  meantime is skipped as superseded, including the experiment completions it reported. A completion retires an
-  experiment only if its text is still exactly what the model examined, so a manual experiment edit is never lost.
-  Generation is reviewed by a second Contemplation-model call (distinct and compatible?), with one retry using the
-  reviewer's feedback, otherwise it declines. The candidate commits only if the interpretation pool revision is
-  unchanged since the snapshot. If it changed, the candidate is re-reviewed against the current pool (at most twice)
-  and discarded if rejected. Experiment planning commits only when neither the interpretation revision nor the
-  experiment revision changed during the request. Otherwise it reruns (up to 3 times). Manual interpretation edits are
-  debounced by 200 ms so quick edits produce one review.
+  (up to 16 at once). The batch applies all-or-nothing. A result for an interpretation that was edited through the
+  API in the meantime is skipped as superseded, including the experiment completions it reported. A completion
+  retires an experiment only if its text is still exactly what the model examined, so an experiment edit made through
+  the API is never lost. Generation is reviewed by a second Contemplation-model call (distinct and compatible?), with
+  one retry using the reviewer's feedback, otherwise it declines. The candidate commits only if the interpretation
+  pool revision is unchanged since the snapshot. If it changed, the candidate is re-reviewed against the current pool
+  (at most twice) and discarded if rejected. Experiment planning commits only when neither the interpretation
+  revision nor the experiment revision changed during the request. Otherwise it reruns (up to 3 times).
+  Interpretation edits through the API are debounced by 200 ms so quick edits produce one review.
   A per-(pool, chat) watermark of the last processed user message is persisted. It advances only after a successful
   cycle, so restarts and failures re-evaluate unprocessed evidence.
+- **Gestalt (spec 0002):** one gestalt per interpretation pool, so a shared pool has one gestalt shared by its
+  characters. It is stored in SQLite with the interpretation revision it reflects and its update time. Order in a
+  cycle: prefetch, maintenance, generation, gestaltization, experiment review. Gestaltization runs only when the
+  interpretation revision changed (generation, maintenance, or an edit through the API), once per cycle against the
+  final interpretations. Experiment changes and messages that change no interpretation cost no gestalt call. The
+  Contemplation model receives every current interpretation and the previous gestalt (as continuity, not evidence),
+  and nothing else: no chat, memory, or experiments. A result commits only if the interpretation revision is unchanged
+  (otherwise it reruns, up to 3 times). An empty pool with no gestalt gets none; a pool that becomes empty has its old
+  gestalt reconsidered. If the interpretations would not fit the model's context (estimated at 3 characters per token
+  plus the output budget, using the catalogue's context length), the call is skipped and recorded instead of sending
+  a truncated set. A failure keeps the last valid gestalt, records the \`contemplation_gestaltization\` stage, and does
+  not stop experiment review or dialogue. It retries at the next opportunity (a user message, an interpretation
+  change, a restart, entering the key, or re-enabling Contemplation), never in a loop. Pools upgraded from an older
+  database get their first gestalt automatically. Gestalt text is at most 16,000 characters.
 - **Follow-ups:** presence is a 5-second heartbeat with a 20-second TTL plus a `sendBeacon` on page close. A hidden
   tab counts as away. The opener timer starts whenever an empty chat is opened. A canceled follow-up is never
   reinstated. Autonomous messages are discarded at commit if anything changed in the chat.
@@ -180,7 +200,13 @@ DST, and the UTC fallback).
   provider that rejects the format with different wording fails the reply visibly (Retry stays available).
 - The image URL check resolves DNS before the download; a DNS answer that changes between the check and the fetch is
   not defended against.
-- The browser UI has no automated tests; the navigation guard (review P2-2) is covered only by code review.
+- The browser UI has no automated tests; the navigation guard (review P2-2) is covered only by code review. The
+  read-only Contemplation page is checked only by a source scan for mutation requests and controls.
+- The gestalt's context check is an estimate. A model whose tokenizer is less efficient than 3 characters per token can
+  still reject an oversized request; that also fails visibly and keeps the previous gestalt.
+- The interpretation and experiment edit routes and the Force route remain on the server for compatibility (spec 0002
+  U2), but no page uses them.
+- That OpenRouter no longer routes text to Baidu can only be confirmed from a live Emergency Dump after deployment.
 - The Emergency Dump ZIP is uncompressed (Society's stored-ZIP writer) and does not include image bytes.
 
 ## Society sources reused

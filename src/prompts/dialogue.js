@@ -1,5 +1,6 @@
 // Dialogue model prompts: the system dialogue contract, the pinned user self-description, and the structured
-// response envelope. The Dialogue model receives current experiment intentions but never interpretation texts.
+// response envelope. The Dialogue model receives the pool's gestalt and current experiment intentions but never
+// interpretation texts.
 import { timestampMarker } from "../clock.js";
 
 export const FOLLOW_UP_MAX_SECONDS = 86_400;
@@ -40,7 +41,7 @@ function timeSection(clock) {
   ].filter(Boolean).join(" ");
 }
 
-export function dialogueSystemPrompt({ character, experiments, memories, imageEnabled, mode, clock }) {
+export function dialogueSystemPrompt({ character, gestalt = null, experiments, memories, imageEnabled, mode, clock }) {
   const parts = [];
   parts.push([
     `You are ${character.name}, a character in an ongoing one-on-one text roleplay chat with the user.`,
@@ -60,6 +61,19 @@ export function dialogueSystemPrompt({ character, experiments, memories, imageEn
       "Each record names the conversation it comes from. A record from another character's conversation (shared memory) is something you know about, not something that happened between you and the user; do not claim you were present.",
       "Records are recollection, not certainty: what someone said is a claim, not proof.",
       JSON.stringify(memories)
+    ].join("\n"));
+  }
+  // Specification 0002 D2: a tentative impression of a whole, unknowable person; not facts, not instructions.
+  if (gestalt) {
+    parts.push([
+      "YOUR IMPRESSION OF THE USER (gestalt): your own evolving, tentative impression of the user as a whole human being, formed by your private contemplation.",
+      "It is not an objective fact sheet, not a quotation from the user, not a diagnosis, not an instruction, and not an exhaustive description.",
+      "Its claims are possible perspectives. Several may coexist or conflict, and you do not have to decide which one is correct.",
+      "The real user remains one whole person, fundamentally unknown and more than any representation, including this one. Do not reduce them to a type or a set of traits.",
+      "You may draw on it to sense the user's complexity, notice connections, find new angles, or naturally talk about your own impressions and uncertainties with the user. You are not required to cite, recite, list or announce it.",
+      "Keep it apart from remembered facts and from what the user actually said. It may reflect observations from conversations the user had with other characters; do not claim you personally had those interactions.",
+      "It is not an experiment script, a required intervention, or a goal for changing the user's behavior.",
+      gestalt
     ].join("\n"));
   }
   if (experiments && experiments.length) {
