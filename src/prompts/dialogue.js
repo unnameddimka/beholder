@@ -59,7 +59,7 @@ export function dialogueSystemPrompt({ character, gestalt = null, experiments, m
   if (userImages) {
     parts.push([
       "IMAGES FROM THE USER: the user can attach an image to a message. You cannot see images directly.",
-      `An ${IMAGE_OBSERVATION_LABEL} entry right after such a message is your own perception of that image: it describes only what is visibly in it. It is not something the user said and not something you said.`,
+      `An ${IMAGE_OBSERVATION_LABEL} entry is your own perception of one attached image: it names the user message the image belongs to (by its sent time and text) and describes only what is visibly in the image. That message may already have left the history. The observation is not something the user said and not something you said.`,
       "What the user says about an image (for example that it is their selfie) is their claim. You may react to what you see, wonder about it, or interpret its meaning in your own voice; keep those thoughts your own and never present them as part of what the image shows.",
       `If a message says its attached image could not be viewed, you do not know what it shows. Never pretend you saw it or invent its contents; you may say you could not see it or ask the user to send it again.`
     ].join(" "));
@@ -125,15 +125,26 @@ const ATTACHMENT_NOTES = Object.freeze({
   pending: "[The user attached an image to this message. It has not been viewed: you do not know what it shows.]"
 });
 
+// Names the user message an observation belongs to by its persisted link, never by position: its sent time and text,
+// and whether it is still in the verbatim history (review 0003 P1).
+function observationSource(message, inHistory, clock) {
+  const source = message.source || {};
+  const sent = source.createdAt ? ` sent ${clock ? timestampMarker(source.createdAt, clock.timeZone).slice(6, -1) : source.createdAt}` : "";
+  const text = source.text ? ` with the text ${JSON.stringify(source.text)}` : " with no text";
+  const presence = inHistory ? "" : "; that message is no longer in the verbatim history";
+  return `the user's message${sent}${text}${presence}`;
+}
+
 // Verbatim history: user and character messages in order. A generated image is noted for the model's continuity; a
 // user's attachment carries its perception state, and an image observation is its own clearly labeled non-speech
-// entry in the user position (the neighboring messages keep their roles). With a clock, each entry starts with its
-// persisted instant, localized in the user's time zone.
+// entry in the user position (the neighboring messages keep their roles) that names its source message explicitly.
+// With a clock, each entry starts with its persisted instant, localized in the user's time zone.
 export function historyMessages(messages, imagesByMessage = new Map(), clock = null) {
+  const ids = new Set(messages.map((message) => message.id));
   return messages.map((message) => {
     if (message.role === "observation") {
       const marker = clock ? `${timestampMarker(message.createdAt, clock.timeZone, "viewed")}\n` : "";
-      return { role: "user", content: `${marker}${IMAGE_OBSERVATION_LABEL} Your perception of the image attached to the previous user message (not words written by anyone):\n${message.text}` };
+      return { role: "user", content: `${marker}${IMAGE_OBSERVATION_LABEL} Your perception of the image attached to ${observationSource(message, ids.has(message.sourceMessageId), clock)} (not words written by anyone):\n${message.text}` };
     }
     const image = imagesByMessage.get(message.id);
     const note = image && image.status !== "failed" ? `\n[You showed the user an image: ${image.request}]` : "";

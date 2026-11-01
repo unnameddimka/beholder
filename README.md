@@ -200,18 +200,21 @@ non-interpretive observation is a manual judgment, not something the tests can c
   only the attached image, the chat's whole active verbatim window (up to 100 entries, including earlier observations),
   and the current gestalt of the character's interpretation pool when Contemplation is enabled. It never receives
   memory records, interpretations, experiments, or the pinned self-description. The output is one prose observation
-  (at most 6,000 characters); empty, oversized, or JSON-shaped output is rejected rather than repaired, because a repair
-  would need the image again. A model the catalogue lists without image input or text output, and a request that would
-  not fit the model's context (estimated, with 3,000 tokens per image), fail before any call; the model is never
-  switched. Transport retries are the usual bounded ones.
+  (at most 6,000 characters). Empty, oversized, JSON-shaped, or instruction-shaped output (such as "ignore previous
+  instructions" or a chat-role prefix, checked outside quoted text so quoted writing seen in the image stays) is
+  rejected rather than repaired, because a repair would need the image again. A model the catalogue lists without
+  image input or text output, and a request that would not fit the model's context (estimated, with 3,000 tokens per
+  image), fail before any call; the model is never switched. Transport retries are the usual bounded ones.
 - **Image observations in the verbatim stream:** an observation is its own entry (role `observation`, kind
   `image_observation`) linked to the user message the image belongs to, so it counts toward the 100/20/80 window like
   any message. Every consumer sees it as a typed non-speech entry that names its message and that message's text, so its
   source stays clear even when consolidation separates the two. Dialogue gets it as a labeled `[IMAGE OBSERVATION]`
-  entry with a `[viewed ...]` marker, never the image itself; a user message whose image failed carries "The attached
-  image could not be viewed". The STM prompt records it in ordinary third-person prose ("The user showed Mira a photo
-  they called their selfie; the person pictured had ...") with no special memory field. Retry, follow-up and opener
-  checks, elapsed time, and Contemplation watermarks use actual chat turns and ignore observations.
+  entry with a `[viewed ...]` marker that names its source message by sent time and text (and says when that message
+  has left the history), never by position, and never the image itself. A user message whose image failed carries
+  "The attached image could not be viewed". The STM prompt records it in ordinary third-person prose ("The user
+  showed Mira a photo they called their selfie; the person pictured had ...") with no special memory field. Retry,
+  follow-up and opener checks, elapsed time, and Contemplation watermarks use actual chat turns and ignore
+  observations.
 - **Image turn lifecycle:** the upload is validated by its bytes (PNG, JPEG, WebP; at most 10 MiB, within a bounded
   multipart body), written under a random name via a temporary file, and committed with its message in one
   transaction; a rejected upload leaves no message and no file. The reply first runs Vision, then triggers Contemplation
@@ -260,7 +263,7 @@ non-interpretive observation is a manual judgment, not something the tests can c
   any public release, a product upload maximum must be decided and enforced in the browser and authoritatively on the
   server, with tests for oversize rejection. This patch does not make the server safe to expose.
 - Whether a Vision model's observation is accurate and free of interpretation is checked only by its prompt and manual
-  testing; the mechanical checks are emptiness, length, and JSON shape.
+  testing; the mechanical checks are emptiness, length, JSON shape, and obvious instruction shapes.
 - There is no UI to retry a failed perception; the user can send the image again.
 
 ## Society sources reused

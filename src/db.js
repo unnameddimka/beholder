@@ -148,7 +148,8 @@ export const MIGRATIONS = [
 
 // Message rows carry their upload (a user message) or their source message (an observation) for every consumer.
 const MESSAGE_SELECT = `SELECT m.*, u.id AS upload_id, u.file AS upload_file, u.mime AS upload_mime, u.status AS upload_status,
-  u.observation_message_id AS upload_observation_id, obs.text AS upload_observation_text, src.text AS source_text
+  u.observation_message_id AS upload_observation_id, obs.text AS upload_observation_text, src.text AS source_text,
+  src.created_at AS source_created_at
   FROM messages m LEFT JOIN uploads u ON u.message_id = m.id LEFT JOIN messages obs ON obs.id = u.observation_message_id
   LEFT JOIN messages src ON src.id = m.source_message_id`;
 
@@ -163,7 +164,7 @@ function characterRow(row) {
 function messageRow(row) {
   return {
     id: row.id, characterId: row.character_id, role: row.role, kind: row.kind, text: row.text, createdAt: row.created_at, active: row.active === 1,
-    sourceMessageId: row.source_message_id ?? null, source: row.source_message_id ? { id: row.source_message_id, text: row.source_text ?? null } : null,
+    sourceMessageId: row.source_message_id ?? null, source: row.source_message_id ? { id: row.source_message_id, text: row.source_text ?? null, createdAt: row.source_created_at ?? null } : null,
     upload: row.upload_id ? { id: row.upload_id, file: row.upload_file, mime: row.upload_mime, status: row.upload_status, observationMessageId: row.upload_observation_id ?? null,
       observation: row.upload_observation_text ?? null } : null
   };

@@ -43,7 +43,7 @@ const ATTACHED_IMAGE_NOTES = Object.freeze({
 export function messageView(message, characterName) {
   if (message.role === "observation") {
     return { id: wire.msg(message.id), type: "image_observation", at: message.createdAt,
-      imageAttachedTo: { id: wire.msg(message.sourceMessageId), userText: message.source?.text ?? null }, text: message.text };
+      imageAttachedTo: { id: wire.msg(message.sourceMessageId), at: message.source?.createdAt ?? null, userText: message.source?.text ?? null }, text: message.text };
   }
   const view = { id: wire.msg(message.id), speaker: message.role === "user" ? "user" : characterName, at: message.createdAt, text: message.text };
   if (message.upload) view.attachedImage = ATTACHED_IMAGE_NOTES[message.upload.status];

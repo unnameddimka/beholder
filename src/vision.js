@@ -10,6 +10,17 @@ import { visionSystemPrompt, VISION_OBSERVATION_MAX_CHARS } from "./prompts/visi
 
 const wireMessage = (id) => `msg_${id}`;
 
+// Unambiguous instruction or chat-role shapes (review 0003 P2), checked outside quoted text so that writing visible in
+// the image, quoted in the description, stays acceptable.
+const INSTRUCTION_PATTERNS = Object.freeze([
+  /\b(ignore|disregard|forget|override)\s+(?:(?:all|any|the|your|my|these|those)\s+)*(?:previous|prior|above|earlier|system|original)\s+(?:instructions?|prompts?|messages?|rules)\b/i,
+  /(игнорируй|игнорируйте|забудь|забудьте|проигнорируй)\s+(?:все\s+)?(?:предыдущие|прошлые|прежние|системные)\s+(?:инструкции|указания|правила)/i,
+  /^\s*(?:system|assistant|developer|user)\s*:/im,
+  /^\s*(?:you are now|from now on|you must|you should|new instructions?)\b/i,
+  /^\s*(?:instructions?|task|answer|response|reply)\s*:/i
+]);
+const QUOTED = /"[^"\n]*"|“[^”\n]*”|«[^»\n]*»|„[^“”\n]*[“”]|'[^'\n]{2,}'/g;
+
 // One non-empty prose observation; structured or instruction-like output is unusable rather than repaired, because
 // a repair would need the image again and the result is evidence, not a format.
 export function validateObservation(content) {
@@ -17,6 +28,8 @@ export function validateObservation(content) {
   if (!text) return { ok: false, error: "empty observation" };
   if (text.length > VISION_OBSERVATION_MAX_CHARS) return { ok: false, error: `observation longer than ${VISION_OBSERVATION_MAX_CHARS} characters` };
   if (/^[{[]/.test(text)) return { ok: false, error: "observation is structured data, not prose" };
+  const unquoted = text.replace(QUOTED, "\"\"");
+  if (INSTRUCTION_PATTERNS.some((pattern) => pattern.test(unquoted))) return { ok: false, error: "observation is shaped like instructions, not a description" };
   return { ok: true, text };
 }
 
