@@ -95,8 +95,13 @@ follow-up timers and races; asynchronous images; bounded retries; and HTTP safet
 - **Transport reliability:** 3 attempts per request for timeouts, network errors, 429 (honoring `Retry-After`, capped at
   30 s), 5xx, and empty or provider-error completions, with exponential backoff. 401 is never retried. The model is
   never switched.
-- **Structured output:** every structured purpose is parsed and validated. Invalid output gets up to 2 LLM repairs and
-  is never committed.
+- **Structured output:** every structured purpose is parsed and validated. For Dialogue replies, OpenRouter
+  receives a strict JSON schema when the model catalogue advertises structured outputs, or JSON-object mode if only
+  `response_format` is supported. Such requests require a provider that honours the parameter; unsupported or
+  uncatalogued models keep prompt-only enforcement. A non-empty plain-text Dialogue reply is locally wrapped in the
+  envelope (with no follow-up or image request) without an extra model call. Broken JSON and invalid field types still
+  get up to 2 bounded LLM repairs, but Dialogue repairs see only the invalid output and format instructions, never
+  the full chat transcript. Invalid output is never committed.
 - **Memory retrieval:** Society's semantic selector runs before every dialogue reply when the memory pool is not empty
   (Dialogue model; limits: 12 STM, 8 LTM). Contemplation runs it with the Contemplation model. Divergence from
   Society: if the selector fails after retries, Beholder falls back to importance ranking (recorded in diagnostics)
