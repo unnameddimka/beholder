@@ -251,8 +251,10 @@ export class Contemplation {
     rt.lastCycle = cycle;
     try {
       this.setStage(rt, "prefetch", characterId);
-      // Prefetch sees exactly the whole interpretation pool and the latest verbatim messages; no consolidated memory.
-      const payload = { interpretations: this.interpretationViews(pool), conversation: this.conversation(characterId), requiredResponseShape: { generation: false, maintenance: false } };
+      // Prefetch sees exactly the whole interpretation pool, the latest verbatim messages and the active experiment
+      // intentions; no consolidated memory.
+      const payload = { interpretations: this.interpretationViews(pool), activeExperiments: this.experimentViews(pool), conversation: this.conversation(characterId),
+        requiredResponseShape: { generation: false, maintenance: false } };
       const { value: flags } = await this.llm.structured({ purpose: "contemplation_prefetch", messages: [{ role: "system", content: prefetchSystemPrompt() }, { role: "user", content: JSON.stringify(payload) }],
         validate: validatePrefetch, context: { characterId, pool } });
       cycle.flags = flags;

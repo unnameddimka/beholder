@@ -93,6 +93,7 @@ After each newly committed user message, schedule a cheap **prefetch** invocatio
 
 - The currently selected interpretation pool, **all** interpretations.
 - Up to the last **100 available verbatim dialogue messages** for the triggering chat.
+- The **current active experiment intentions** of that interpretation pool (an empty list if none).
 - **No STM/LTM** or other consolidated memory.
 
 Its strict output is:
@@ -101,9 +102,7 @@ Its strict output is:
 {"generation": true, "maintenance": false}
 ```
 
-Both Boolean fields are independent. `generation` means the model sees the possibility of a **substantially different way to explain the user's behavior**, not another rephrasing or an arbitrary extra description. It is a creative judgment, not a mechanical contradiction detector. `maintenance` means existing interpretations plausibly need checking or revising against incoming evidence, **or** an active experiment appears to have reached a meaningful result. Do not require lengthy explanations from the prefetch model. No work is needed if both are false.
-
-*Clarification (owner decision, review 0000 SPEC-1):* the prefetch input stays exactly as listed above and does not include the active experiments. Detecting that an experiment has reached a result is therefore a heuristic judgment from the conversation alone and may be missed; maintenance, which does receive the active experiments, remains the place where completed experiments are retired.
+Both Boolean fields are independent. `generation` means the model sees the possibility of a **substantially different way to explain the user's behavior**, not another rephrasing or an arbitrary extra description. It is a creative judgment, not a mechanical contradiction detector. `maintenance` means existing interpretations plausibly need checking or revising against incoming evidence, **or** an active experiment appears to have reached a meaningful result. Do not require lengthy explanations from the prefetch model. No work is needed if both are false. Prefetch sees the active experiments so that it can choose `maintenance: true` when the newest evidence plausibly completes or materially advances one of them; this remains an LLM judgment, never an automatic or deterministic completion. Maintenance remains the place where completed experiments are retired.
 
 ### 5.2 Maintenance
 
@@ -224,7 +223,7 @@ Each item below should be covered by automated tests where feasible and/or a sho
 4. **Dialogue:** user submits text containing `*actions*`; full model answer renders safely with action styling. While pending, the input stays editable, Send is disabled, and the typed draft survives.
 5. **Memory threshold:** at 100 active literal messages the 20 oldest enter Society-derived STM processing and only disappear from active verbatim after successful validated commit; the newest 80 remain. Failures preserve source observations and visible chat history.
 6. **LTM boundary:** once per server-local day, STM→LTM executes. If the server misses midnight, restart catches up safely without double consolidating. Uses Dialogue model.
-7. **Prefetch:** every user message schedules prefetch with exactly the interpretation pool and the available last 100 verbatim messages (no consolidated memory). Flags are independent and validated.
+7. **Prefetch:** every user message schedules prefetch with exactly the interpretation pool, the available last 100 verbatim messages and the active experiment intentions (possibly empty; no consolidated memory). Flags are independent and validated.
 8. **Both flags:** on `generation=true, maintenance=true`, maintenance processes every interpretation separately and concurrently; the generation request sees the post-maintenance pool; experiment review executes once against the final relevant state.
 9. **Interpretation quality:** generator produces new free-form prose or declines; variants need not be mutually consistent, but maintenance/generation must not assert known contradictions as facts. Manual Force actions and text edits work.
 10. **Experiments:** after an interpretation change, the planner sees all interpretations plus current experiments and returns a replacement array. The Dialogue model receives **only active intentions**, not interpretations. A completed experiment can be removed through maintenance/experiment reconsideration without extra results storage.

@@ -15,8 +15,8 @@ folder's file describes a different project (a SugarCube RPG) and does not apply
   in browser storage, dumps, or diagnostics. Sanitize every diagnostic entry.
 - The Dialogue model receives the active experiment intentions, but **never interpretation texts**. Image prompts come
   only from the Dialogue model.
-- The prefetch input is exactly the whole interpretation pool plus up to the last 100 verbatim messages of the
-  triggering chat. No consolidated memory.
+- The prefetch input is exactly the whole interpretation pool, up to the last 100 verbatim messages of the
+  triggering chat, and the pool's active experiment intentions (possibly empty). No consolidated memory.
 - Experiment planning input is only the interpretation pool and the active experiment array. Its output replaces the
   whole array atomically, guarded by interpretation and experiment revisions.
 - A maintenance batch applies all-or-nothing. Maintenance, then generation, then at most one experiment review. One

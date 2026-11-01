@@ -6,7 +6,7 @@ import { validatePrefetch, validatePlanning } from "../src/contemplation.js";
 
 const base = { name: "Mira", description: "Keeper.", useSharedMemory: false, useSharedInterpretations: false };
 
-test("prefetch receives exactly the whole interpretation pool and the last 100 verbatim messages, no memory", async () => {
+test("prefetch receives exactly the whole interpretation pool, the last 100 verbatim messages and the active experiments, no memory", async () => {
   const { app, mock } = await makeApp({
     contemplation_prefetch: () => ({ generation: false, maintenance: false }),
     dialogue_reply: () => reply("ok"),
@@ -19,6 +19,8 @@ test("prefetch receives exactly the whole interpretation pool and the last 100 v
     app.settings.update({ contemplationEnabled: false });
     app.contemplation.addInterpretation(pool, "Interpretation A");
     app.contemplation.addInterpretation(pool, "Interpretation B");
+    app.contemplation.addExperiment(pool, "Experiment X");
+    app.store.setPlanningNeeded(pool, false);
     app.store.insertMemory({ pool: `character:${mira.id}`, tier: "ltm", topic: "MEMORY-TOPIC", summary: "MEMORY-SUMMARY", retrievalBrief: "x", importance: 0.5, sources: [] });
     seedMessages(app, mira.id, 120);
     app.settings.update({ contemplationEnabled: true });
@@ -26,11 +28,64 @@ test("prefetch receives exactly the whole interpretation pool and the last 100 v
     await waitFor(() => mock.byPurpose("contemplation_prefetch").length === 1);
     await app.contemplation.idle(pool);
     const payload = JSON.parse(mock.byPurpose("contemplation_prefetch")[0].body.messages[1].content);
+    assert.deepEqual(Object.keys(payload).sort(), ["activeExperiments", "conversation", "interpretations", "requiredResponseShape"]);
     assert.deepEqual(payload.interpretations.map((entry) => entry.text), ["Interpretation A", "Interpretation B"]);
+    assert.deepEqual(payload.activeExperiments.map((entry) => entry.text), ["Experiment X"]);
     assert.equal(payload.conversation.messages.length, 100);
     assert.equal(payload.conversation.messages.at(-1).text, "newest user message");
     assert.doesNotMatch(JSON.stringify(mock.byPurpose("contemplation_prefetch")[0].body), /MEMORY-TOPIC|MEMORY-SUMMARY/);
     assert.equal(app.store.watermark(pool, mira.id), app.store.lastUserMessageId(mira.id));
+  } finally { closeApp(app); }
+});
+
+test("prefetch chooses maintenance from an experiment the latest message bears on, and maintenance retires it", async () => {
+  const { app, mock } = await makeApp({
+    contemplation_prefetch: (body) => {
+      const payload = JSON.parse(body.messages[1].content);
+      const latest = payload.conversation.messages.at(-1).text;
+      return { generation: false, maintenance: payload.activeExperiments.some((entry) => latest.includes("lighthouse") && entry.text.includes("lighthouse")) };
+    },
+    contemplation_memory_retrieval: () => ({ stmIds: [], ltmIds: [] }),
+    contemplation_maintenance: (body) => {
+      const payload = JSON.parse(body.messages[1].content);
+      return { action: "replace", text: "Fears the dark, but loves the lighthouse.", completedExperimentIds: payload.activeExperiments.map((entry) => entry.id) };
+    },
+    contemplation_experiment_planning: () => ({ experiments: [] }),
+    dialogue_reply: () => reply("ok")
+  });
+  try {
+    const mira = app.createCharacter(base);
+    const pool = interpretationPoolOf(mira);
+    app.settings.update({ contemplationEnabled: false });
+    app.contemplation.addInterpretation(pool, "Fears the dark.");
+    app.contemplation.addExperiment(pool, "Mention the old lighthouse and watch how the user reacts.");
+    app.store.setPlanningNeeded(pool, false);
+    app.settings.update({ contemplationEnabled: true });
+    app.dialogue.send(mira.id, "Oh, the lighthouse! I used to climb it every summer.");
+    await waitFor(() => app.contemplation.status(pool).lastCycle?.status === "succeeded");
+    await app.contemplation.idle(pool);
+    assert.deepEqual(app.contemplation.status(pool).lastCycle.flags, { generation: false, maintenance: true });
+    assert.equal(mock.byPurpose("contemplation_maintenance").length, 1);
+    assert.deepEqual(app.store.interpretations(pool).map((entry) => entry.text), ["Fears the dark, but loves the lighthouse."]);
+    assert.deepEqual(app.store.experiments(pool), []);
+  } finally { closeApp(app); }
+});
+
+test("prefetch receives an empty experiment array when none are active", async () => {
+  const { app, mock } = await makeApp({
+    contemplation_prefetch: () => ({ generation: false, maintenance: false }),
+    dialogue_reply: () => reply("ok")
+  });
+  try {
+    const mira = app.createCharacter(base);
+    const pool = interpretationPoolOf(mira);
+    app.dialogue.send(mira.id, "hello");
+    await waitFor(() => mock.byPurpose("contemplation_prefetch").length === 1);
+    await app.contemplation.idle(pool);
+    const payload = JSON.parse(mock.byPurpose("contemplation_prefetch")[0].body.messages[1].content);
+    assert.deepEqual(payload.activeExperiments, []);
+    assert.deepEqual(payload.interpretations, []);
+    assert.equal(app.contemplation.status(pool).lastCycle.status, "succeeded");
   } finally { closeApp(app); }
 });
 

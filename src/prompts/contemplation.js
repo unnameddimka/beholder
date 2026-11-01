@@ -23,7 +23,7 @@ export function prefetchSystemPrompt() {
     ROLE,
     "You are the cheap triage step that runs after every new user message. Decide two independent flags:",
     "generation = true only if the conversation suggests a substantially different way to explain the user's behavior that none of the current interpretations captures. Not a rephrasing, refinement, or arbitrary extra description: a genuinely new angle. This is a creative judgment.",
-    "maintenance = true if any existing interpretation plausibly needs checking or revising against the newest evidence (it may be contradicted, strengthened, enriched, or outdated), or if something in the conversation looks like a meaningful result of an earlier probe of the user. With no interpretations, maintenance is false.",
+    "maintenance = true if any existing interpretation plausibly needs checking or revising against the newest evidence (it may be contradicted, strengthened, enriched, or outdated), or if the newest evidence plausibly completes or materially advances one of the activeExperiments (the character's current intentions to learn something about the user; the list may be empty). With no interpretations, maintenance is false.",
     "Both may be false; both may be true.",
     "Return exactly {\"generation\": true|false, \"maintenance\": true|false} and nothing else. No explanation."
   ].join(" ");
