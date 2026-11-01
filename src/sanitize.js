@@ -24,7 +24,9 @@ function redactText(input, explicitSecrets = []) {
   return text
     .replace(/sk-or-v1-[A-Za-z0-9_-]{12,}/g, "[REDACTED_OPENROUTER_KEY]")
     .replace(/Bearer\s+[A-Za-z0-9._~+\/-]{12,}/gi, "Bearer [REDACTED]")
-    .replace(/\bsk-[A-Za-z0-9_-]{16,}\b/g, "[REDACTED_API_KEY]");
+    .replace(/\bsk-[A-Za-z0-9_-]{16,}\b/g, "[REDACTED_API_KEY]")
+    // Beholder: inline image data (uploaded or generated images) is never kept in diagnostics or dumps.
+    .replace(/data:[a-z]+\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+/gi, (match) => `[REDACTED_DATA_URL ${match.length} chars]`);
 }
 
 export function sanitize(value, explicitSecrets = [], seen = new WeakSet(), depth = 0) {

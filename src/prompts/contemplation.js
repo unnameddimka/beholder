@@ -16,7 +16,8 @@ const ROLE = [
 const EVIDENCE_RULES = [
   "Evidence: conversation.messages are verbatim chat messages between the user and the named character, oldest first; text between *asterisks* is roleplay action or narration.",
   "memory records, when supplied, are consolidated recollection from the selected memory pool; each names the conversation it comes from. A record from another character's conversation is real evidence about the user but was not an interaction with the current character.",
-  "What the user says is evidence of what they said and chose to present, not proof that it is literally true."
+  "What the user says is evidence of what they said and chose to present, not proof that it is literally true.",
+  "An entry with type image_observation is not speech: it is the character's perception of an image the user attached to the message named in imageAttachedTo, describing only what the image visibly shows. That the user showed the image, and what they said about it, is evidence; what they claim about it (for example that it is their selfie) remains their claim. A message whose attachedImage could not be viewed has unknown content."
 ].join(" ");
 
 export function prefetchSystemPrompt() {

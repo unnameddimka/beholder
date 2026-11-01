@@ -31,8 +31,23 @@ const wire = {
   }
 };
 
+// Attachment state of a user message, as every verbatim consumer sees it (Specification 0003 M1).
+const ATTACHED_IMAGE_NOTES = Object.freeze({
+  observed: "the user attached an image to this message; the image_observation entry for it describes what it shows",
+  failed: "the user attached an image to this message, but it could not be viewed; what it shows is unknown",
+  pending: "the user attached an image to this message that has not been viewed yet; what it shows is unknown"
+});
+
+// The shared verbatim serialization. An image observation is a typed non-speech entry that names the message it
+// belongs to (with that message's text), so its provenance survives even when the two entries are split apart.
 export function messageView(message, characterName) {
-  return { id: wire.msg(message.id), speaker: message.role === "user" ? "user" : characterName, at: message.createdAt, text: message.text };
+  if (message.role === "observation") {
+    return { id: wire.msg(message.id), type: "image_observation", at: message.createdAt,
+      imageAttachedTo: { id: wire.msg(message.sourceMessageId), userText: message.source?.text ?? null }, text: message.text };
+  }
+  const view = { id: wire.msg(message.id), speaker: message.role === "user" ? "user" : characterName, at: message.createdAt, text: message.text };
+  if (message.upload) view.attachedImage = ATTACHED_IMAGE_NOTES[message.upload.status];
+  return view;
 }
 
 function originText(sources, currentCharacterId) {
@@ -319,6 +334,9 @@ export class MemoryEngine {
     if (job?.status === "running") return job.promise;
     if (job?.status === "failed" && Date.now() - job.failedAtMs < this.stmRetryBackoffMs) return null;
     if (this.store.activeCount(characterId) < VERBATIM_WINDOW) return null;
+    // An image still being perceived keeps the chat's verbatim window as is, so its message never leaves the window
+    // before its observation exists (Specification 0003 M3); consolidation runs again once perception settles.
+    if (this.store.pendingUploadCount(characterId)) return null;
     const character = this.store.getCharacter(characterId);
     if (!character) return null;
     const pool = memoryPoolOf(character);

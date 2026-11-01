@@ -157,6 +157,8 @@ export class Contemplation {
     if (!this.enabled()) return;
     for (const character of this.store.listCharacters()) {
       const pool = interpretationPoolOf(character);
+      // A chat whose image is still being perceived is triggered by Dialogue once the turn is complete.
+      if (this.store.pendingUploadCount(character.id)) continue;
       if (this.store.lastUserMessageId(character.id) > this.store.watermark(pool, character.id)) this.runtime(pool).pendingCharacters.add(character.id);
     }
     for (const state of this.store.interpretationPools()) {

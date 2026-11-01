@@ -9,18 +9,25 @@ export const CURATED_TEXT_MODELS = Object.freeze([
   { id: "z-ai/glm-5.3-flash", label: "GLM 5.3 Flash" },
   { id: "qwen/qwen3-235b-a22b-2507", label: "Qwen3 235B A22B Instruct 2507" }
 ]);
+// Specification 0003 V2: curated multimodal models for perceiving user-uploaded images (any compatible id is accepted).
+export const CURATED_VISION_MODELS = Object.freeze([
+  { id: "google/gemini-3-flash-preview", label: "Google Gemini 3 Flash Preview" },
+  { id: "qwen/qwen3-vl-235b-a22b-instruct", label: "Qwen3-VL-235B-A22B Instruct" },
+  { id: "google/gemini-3.1-flash-lite", label: "Google Gemini 3.1 Flash Lite" }
+]);
 // Society src/world-illustration.js ILLUSTRATION_MODEL.
 export const DEFAULT_IMAGE_MODEL = "openai/gpt-image-2";
 
-export const TEXT_ROLES = Object.freeze(["dialogue", "contemplation"]);
-export const MODEL_ROLES = Object.freeze(["dialogue", "contemplation", "image"]);
+// Roles with text output (their own temperature and output budget) and every model role.
+export const TEXT_ROLES = Object.freeze(["dialogue", "contemplation", "vision"]);
+export const MODEL_ROLES = Object.freeze(["dialogue", "contemplation", "vision", "image"]);
 export const MAX_OUTPUT_TOKENS_LIMIT = 200_000;
 
 export function defaultSettings() {
   return {
-    models: { dialogue: CURATED_TEXT_MODELS[0].id, contemplation: CURATED_TEXT_MODELS[0].id, image: DEFAULT_IMAGE_MODEL },
-    temperature: { dialogue: { enabled: false, value: 0.8 }, contemplation: { enabled: false, value: 0.8 } },
-    maxTokens: { dialogue: 8192, contemplation: 16384 },
+    models: { dialogue: CURATED_TEXT_MODELS[0].id, contemplation: CURATED_TEXT_MODELS[0].id, vision: CURATED_VISION_MODELS[0].id, image: DEFAULT_IMAGE_MODEL },
+    temperature: { dialogue: { enabled: false, value: 0.8 }, contemplation: { enabled: false, value: 0.8 }, vision: { enabled: false, value: 0.8 } },
+    maxTokens: { dialogue: 8192, contemplation: 16384, vision: 4096 },
     imageEnabled: false,
     contemplationEnabled: true
   };

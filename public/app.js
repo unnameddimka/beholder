@@ -281,10 +281,33 @@ async function renderChat(characterId) {
   const statusEl = h("div");
   const input = h("textarea", { rows: 2, placeholder: `Message ${character.name}...`, value: state.drafts.get(characterId) || "", "aria-label": "Message" });
   const sendButton = h("button", { className: "btn primary", type: "button", text: "Send" });
+  // One attached image per message (Specification 0003 U1), validated again by the server.
+  const fileInput = h("input", { type: "file", accept: "image/png,image/jpeg,image/webp", className: "hidden", "aria-hidden": "true" });
+  const attachButton = h("button", { className: "btn", type: "button", text: "Attach Image", title: "Attach one image (PNG, JPEG, or WebP)", onClick: () => fileInput.click() });
+  const previewEl = h("div", { className: "attachment-preview hidden" });
   const nodes = new Map();
   let lastId = 0;
   let chatState = data.chat;
   let sending = false;
+  let attachment = null;
+  const maxBytes = state.status.uploadMaxBytes;
+
+  const setAttachment = (file) => {
+    if (attachment?.url) URL.revokeObjectURL(attachment.url);
+    attachment = file ? { file, url: URL.createObjectURL(file) } : null;
+    fileInput.value = "";
+    previewEl.classList.toggle("hidden", !attachment);
+    previewEl.replaceChildren(...(attachment ? [h("img", { src: attachment.url, alt: "Selected image" }), h("span", { text: file.name }),
+      h("button", { className: "btn small", type: "button", text: "Remove", onClick: () => setAttachment(null) })] : []));
+  };
+  fileInput.addEventListener("change", () => {
+    const file = fileInput.files?.[0];
+    if (!file) return;
+    if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) { showBanner("Only PNG, JPEG, and WebP images can be attached."); fileInput.value = ""; return; }
+    if (maxBytes && file.size > maxBytes) { showBanner(`The image exceeds ${Math.floor(maxBytes / (1024 * 1024))} MiB.`); fileInput.value = ""; return; }
+    setAttachment(file);
+    sendPresence({ typingStarted: true });
+  });
 
   const nearBottom = () => messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 120;
   const renderImage = (container, image) => {
@@ -295,14 +318,27 @@ async function renderChat(characterId) {
         : h("div", { className: "image-slot image-error", text: `Image could not be generated${image.error ? `: ${image.error}` : "."}` });
     container.insertBefore(slot, container.querySelector(".meta"));
   };
+  // The user's own attachment with a collapsed note on what the character perceived; never a chat utterance.
+  const renderUpload = (container, upload) => {
+    container.querySelector(".upload-slot")?.remove();
+    if (!upload) return;
+    const note = upload.status === "observed" && upload.observation
+      ? h("details", { className: "upload-note" }, h("summary", { text: `What ${character.name} saw` }), h("div", { className: "observation", text: upload.observation }))
+      : upload.status === "pending" ? h("div", { className: "upload-note", text: "Viewing..." })
+        : h("div", { className: "upload-note failed", text: "Could not be viewed" });
+    const slot = h("div", { className: "upload-slot" },
+      upload.url ? h("img", { src: upload.url, alt: "Image you attached", loading: "lazy" }) : h("div", { className: "image-error", text: "The attached image file is unavailable." }), note);
+    container.insertBefore(slot, container.querySelector(".meta"));
+  };
   const upsertMessage = (message) => {
     let node = nodes.get(message.id);
     if (!node) {
-      node = { el: h("div", { className: `message ${message.role}` }, renderMessageText(message.text), h("span", { className: "meta", text: formatTime(message.createdAt) })), image: null };
+      node = { el: h("div", { className: `message ${message.role}` }, renderMessageText(message.text), h("span", { className: "meta", text: formatTime(message.createdAt) })), image: null, upload: null };
       nodes.set(message.id, node);
       messagesEl.append(node.el);
     }
     if (JSON.stringify(node.image) !== JSON.stringify(message.image)) { node.image = message.image; renderImage(node.el, message.image); }
+    if (JSON.stringify(node.upload) !== JSON.stringify(message.upload ?? null)) { node.upload = message.upload ?? null; renderUpload(node.el, node.upload); }
     lastId = Math.max(lastId, message.id);
   };
   const applyMessages = (messages) => {
@@ -312,7 +348,7 @@ async function renderChat(characterId) {
   };
   const renderStatus = () => {
     const children = [];
-    if (chatState.pending) children.push(h("div", { className: "typing", text: `${character.name} is writing...` }));
+    if (chatState.pending) children.push(h("div", { className: "typing", text: chatState.pending.stage === "vision" ? `${character.name} is looking at the image...` : `${character.name} is writing...` }));
     else if (chatState.retryAvailable) {
       children.push(h("div", { className: "reply-error" },
         h("span", { text: chatState.error ? `The reply failed: ${chatState.error.message}` : "This message has no reply yet." }),
@@ -324,24 +360,38 @@ async function renderChat(characterId) {
     }
     statusEl.replaceChildren(...children);
     sendButton.disabled = Boolean(chatState.pending) || sending;
+    attachButton.disabled = Boolean(chatState.pending) || sending;
   };
-  // Image placeholders are re-read until they settle; other messages are fetched incrementally.
+  // Image placeholders and attachments being viewed are re-read until they settle; other messages are fetched
+  // incrementally.
   const refresh = async () => {
-    const pendingImages = [...nodes.entries()].filter(([, node]) => node.image?.status === "pending").map(([id]) => id);
+    const pendingImages = [...nodes.entries()].filter(([, node]) => node.image?.status === "pending" || node.upload?.status === "pending").map(([id]) => id);
     const after = pendingImages.length ? Math.min(...pendingImages) - 1 : lastId;
     const next = await api(`/api/characters/${characterId}/chat?after=${after}`);
     chatState = next.chat;
     applyMessages(next.messages);
     renderStatus();
   };
+  // A message with an attachment goes as multipart/form-data; a rejected upload keeps the draft and the attachment.
+  const sendWithImage = async () => {
+    const form = new FormData();
+    form.append("text", input.value);
+    form.append("timeZone", browserTimeZone() || "");
+    form.append("image", attachment.file, attachment.file.name);
+    const response = await fetch(`/api/characters/${characterId}/messages`, { method: "POST", body: form });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(payload?.error?.message || `HTTP ${response.status}`);
+  };
   const submit = async () => {
     const text = input.value.trim();
-    if (!text || chatState.pending || sending) return;
+    if ((!text && !attachment) || chatState.pending || sending) return;
     sending = true;
     renderStatus();
     try {
-      await api(`/api/characters/${characterId}/messages`, { method: "POST", body: { text: input.value, timeZone: browserTimeZone() } });
+      if (attachment) await sendWithImage();
+      else await api(`/api/characters/${characterId}/messages`, { method: "POST", body: { text: input.value, timeZone: browserTimeZone() } });
       input.value = "";
+      setAttachment(null);
       state.drafts.delete(characterId);
       await refresh();
       messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -360,7 +410,7 @@ async function renderChat(characterId) {
   root.append(h("div", { className: "chat" },
     h("div", { className: "row spread" }, h("span", { className: "muted", text: `${poolLabel(character.memoryPool)} memory, ${poolLabel(character.interpretationPool).toLowerCase()} interpretations` }),
       h("span", { className: "row" }, h("a", { className: "btn small", href: `#/contemplation/${characterId}`, text: "Contemplation" }), h("a", { className: "btn small", href: `#/edit/${characterId}`, text: "Edit" }))),
-    messagesEl, statusEl, h("div", { className: "composer" }, input, sendButton)));
+    messagesEl, statusEl, previewEl, h("div", { className: "composer" }, attachButton, fileInput, input, sendButton)));
   applyMessages(data.messages);
   messagesEl.scrollTop = messagesEl.scrollHeight;
   renderStatus();
@@ -444,10 +494,14 @@ async function renderSettings() {
   let models = null;
   api("/api/models").then((value) => { models = value; fillLists(); }).catch(() => {});
   const textList = h("datalist", { id: "text-models" });
+  const visionList = h("datalist", { id: "vision-models" });
   const imageList = h("datalist", { id: "image-models" });
   const fillLists = () => {
     const text = new Map([...(models?.curated || state.status.curatedModels).map((m) => [m.id, m.label || m.name]), ...(models?.text || []).map((m) => [m.id, m.name])]);
     textList.replaceChildren(...[...text].map(([id, label]) => h("option", { value: id, text: label })));
+    // Vision offers exactly the curated models (Specification 0003 V2); another image-capable id can still be typed.
+    const vision = new Map(state.status.curatedVisionModels.map((m) => [m.id, m.label]));
+    visionList.replaceChildren(...[...vision].map(([id, label]) => h("option", { value: id, text: label })));
     const images = new Map([[state.status.defaultImageModel, "Default (Society)"], ...(models?.image || []).map((m) => [m.id, m.name])]);
     imageList.replaceChildren(...[...images].map(([id, label]) => h("option", { value: id, text: label })));
   };
@@ -458,14 +512,14 @@ async function renderSettings() {
     dots[role] = h("span", { className: "dot", title: `${label} activity` });
     return h("label", { className: "field" }, label, h("div", { className: "model-row" }, input, dots[role]));
   };
-  const textModelCard = (role, label) => {
+  const textModelCard = (role, label, list = "text-models") => {
     const temperature = settings.temperature[role];
     const valueLabel = h("span", { text: temperature.value.toFixed(2) });
     const range = h("input", { type: "range", min: 0, max: 2, step: 0.05, value: temperature.value, disabled: !temperature.enabled,
       onInput: (event) => { temperature.value = Number(event.target.value); valueLabel.textContent = temperature.value.toFixed(2); } });
     const toggle = h("input", { type: "checkbox", checked: temperature.enabled, onChange: (event) => { temperature.enabled = event.target.checked; range.disabled = !temperature.enabled; } });
     const maxTokens = h("input", { type: "number", min: 256, max: 200000, step: 256, value: settings.maxTokens[role], onInput: (event) => { settings.maxTokens[role] = Number(event.target.value); } });
-    return h("div", { className: "card stack" }, h("h3", { text: label }), modelRow(role, "Model", "text-models"),
+    return h("div", { className: "card stack" }, h("h3", { text: label }), modelRow(role, "Model", list),
       h("label", { className: "check" }, toggle, h("span", {}, "Override temperature ", h("span", { className: "muted", text: "(off: provider default; ignored for models that do not support it)" }))),
       h("div", { className: "row" }, range, valueLabel),
       h("label", { className: "field" }, "Maximum output tokens (includes reasoning tokens on reasoning models)", maxTokens));
@@ -478,11 +532,12 @@ async function renderSettings() {
     catch (error) { showBanner(error.message); }
     finally { save.disabled = false; }
   } });
-  container.append(textList, imageList,
+  container.append(textList, visionList, imageList,
     textModelCard("dialogue", "Dialogue model (chat replies and memory consolidation)"),
     textModelCard("contemplation", "Contemplation model (prefetch, interpretations, maintenance, experiments)"),
+    textModelCard("vision", "Vision model (perceives images you attach; needs image input and text output)", "vision-models"),
     h("div", { className: "card stack" }, h("h3", { text: "Images" }), modelRow("image", "Image generation model", "image-models"),
-      h("label", { className: "check" }, imageEnabled, h("span", { text: "Enable image generation (the dialogue model may then show pictures)" }))),
+      h("label", { className: "check" }, imageEnabled, h("span", { text: "Enable image generation (the dialogue model may then show pictures; attaching your own images works either way)" }))),
     h("div", { className: "card stack" }, h("h3", { text: "Contemplation" }),
       h("label", { className: "check" }, contemplationEnabled, h("span", { text: "Enable Contemplation (off: no automatic contemplation, and no gestalt or experiments in dialogue; stored state stays visible)" }))),
     h("div", { className: "row" }, save, h("button", { className: "btn", type: "button", text: "Refresh model list", onClick: () => api("/api/models?refresh=1").then((value) => { models = value; fillLists(); }).catch((error) => showBanner(error.message)) })));

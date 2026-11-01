@@ -30,6 +30,8 @@ export function buildEmergencyDump(app) {
   section("characters.json", () => store.listCharacters());
   section("messages.json", () => store.allMessages());
   section("images.json", () => store.allImages());
+  // Uploaded images: metadata and perception state only; the original bytes stay in data/uploaded-images.
+  section("uploads.json", () => store.allUploads());
   section("memory-pools.json", () => store.memoryPools());
   section("memory-records.json", () => store.allMemoryRecords());
   section("interpretation-pools.json", () => store.interpretationPools());
@@ -41,6 +43,7 @@ export function buildEmergencyDump(app) {
   section("dialogue-runtime.json", () => app.dialogue.status());
   section("memory-runtime.json", () => app.memory.status());
   section("image-runtime.json", () => app.images.status());
+  section("vision-runtime.json", () => app.vision.status());
   section("llm-exchanges.json", () => app.diagnostics.exchanges);
   section("in-flight-exchanges.json", () => app.diagnostics.pendingExchanges());
   section("errors.json", () => app.diagnostics.errors);

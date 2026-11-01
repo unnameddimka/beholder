@@ -103,8 +103,54 @@ export const MIGRATIONS = [
   ALTER TABLE interpretation_pools ADD COLUMN gestalt TEXT;
   ALTER TABLE interpretation_pools ADD COLUMN gestalt_revision INTEGER;
   ALTER TABLE interpretation_pools ADD COLUMN gestalt_updated_at TEXT;
+  `,
+  // Specification 0003: a typed image_observation verbatim entry (role 'observation') linked to its source user
+  // message, and uploaded user images with their perception state. The CHECK constraints require a table rebuild
+  // (SQLite procedure: foreign keys off, rebuild, foreign_key_check before commit; see Store.migrate).
+  `
+  CREATE TABLE messages_v3 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    character_id INTEGER NOT NULL REFERENCES characters(id),
+    role TEXT NOT NULL CHECK (role IN ('user', 'character', 'observation')),
+    kind TEXT NOT NULL CHECK (kind IN ('user', 'reply', 'followup', 'opener', 'image_observation')),
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    consolidated_pool TEXT,
+    consolidated_at TEXT,
+    source_message_id INTEGER REFERENCES messages_v3(id),
+    CHECK ((role = 'observation') = (source_message_id IS NOT NULL))
+  );
+  INSERT INTO messages_v3 (id, character_id, role, kind, text, created_at, active, consolidated_pool, consolidated_at)
+    SELECT id, character_id, role, kind, text, created_at, active, consolidated_pool, consolidated_at FROM messages ORDER BY id;
+  DROP TABLE messages;
+  ALTER TABLE messages_v3 RENAME TO messages;
+  CREATE INDEX messages_by_character ON messages (character_id, id);
+  CREATE INDEX messages_active ON messages (character_id, active, id);
+  CREATE TABLE uploads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL UNIQUE REFERENCES messages(id),
+    character_id INTEGER NOT NULL,
+    file TEXT NOT NULL UNIQUE,
+    mime TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'observed', 'failed')),
+    observation_message_id INTEGER UNIQUE REFERENCES messages(id),
+    model TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  );
+  CREATE INDEX uploads_pending ON uploads (status, id);
   `
 ];
+
+// Message rows carry their upload (a user message) or their source message (an observation) for every consumer.
+const MESSAGE_SELECT = `SELECT m.*, u.id AS upload_id, u.file AS upload_file, u.mime AS upload_mime, u.status AS upload_status,
+  u.observation_message_id AS upload_observation_id, obs.text AS upload_observation_text, src.text AS source_text
+  FROM messages m LEFT JOIN uploads u ON u.message_id = m.id LEFT JOIN messages obs ON obs.id = u.observation_message_id
+  LEFT JOIN messages src ON src.id = m.source_message_id`;
 
 function characterRow(row) {
   return row ? {
@@ -115,7 +161,19 @@ function characterRow(row) {
 }
 
 function messageRow(row) {
-  return { id: row.id, characterId: row.character_id, role: row.role, kind: row.kind, text: row.text, createdAt: row.created_at, active: row.active === 1 };
+  return {
+    id: row.id, characterId: row.character_id, role: row.role, kind: row.kind, text: row.text, createdAt: row.created_at, active: row.active === 1,
+    sourceMessageId: row.source_message_id ?? null, source: row.source_message_id ? { id: row.source_message_id, text: row.source_text ?? null } : null,
+    upload: row.upload_id ? { id: row.upload_id, file: row.upload_file, mime: row.upload_mime, status: row.upload_status, observationMessageId: row.upload_observation_id ?? null,
+      observation: row.upload_observation_text ?? null } : null
+  };
+}
+
+function uploadRow(row) {
+  return row ? {
+    id: row.id, messageId: row.message_id, characterId: row.character_id, file: row.file, mime: row.mime, bytes: row.bytes, status: row.status,
+    observationMessageId: row.observation_message_id, model: row.model, errorCode: row.error_code, errorMessage: row.error_message, createdAt: row.created_at, updatedAt: row.updated_at
+  } : null;
 }
 
 function memoryRow(row) {
@@ -142,13 +200,23 @@ export class Store {
     this.migrate();
   }
 
+  // Foreign keys are off while migrating (a table rebuild drops and renames a referenced table) and every
+  // migration must leave no violation before it commits.
   migrate() {
     const version = this.db.prepare("PRAGMA user_version").get().user_version;
-    for (let index = version; index < MIGRATIONS.length; index += 1) {
-      this.tx(() => {
-        this.db.exec(MIGRATIONS[index]);
-        this.db.exec(`PRAGMA user_version = ${index + 1}`);
-      });
+    if (version >= MIGRATIONS.length) return;
+    this.db.exec("PRAGMA foreign_keys = OFF");
+    try {
+      for (let index = version; index < MIGRATIONS.length; index += 1) {
+        this.tx(() => {
+          this.db.exec(MIGRATIONS[index]);
+          const violations = this.db.prepare("PRAGMA foreign_key_check").all();
+          if (violations.length) throw new Error(`Migration ${index + 1} left ${violations.length} foreign key violation(s).`);
+          this.db.exec(`PRAGMA user_version = ${index + 1}`);
+        });
+      }
+    } finally {
+      this.db.exec("PRAGMA foreign_keys = ON");
     }
   }
 
@@ -203,33 +271,41 @@ export class Store {
   }
 
   // ---- messages --------------------------------------------------------------------------------------------
-  addMessage({ characterId, role, kind, text }) {
-    const result = this.db.prepare("INSERT INTO messages (character_id, role, kind, text, created_at) VALUES (?, ?, ?, ?, ?)").run(characterId, role, kind, text, nowIso());
+  // sourceMessageId is set only for an image_observation entry (role 'observation').
+  addMessage({ characterId, role, kind, text, sourceMessageId = null }) {
+    const result = this.db.prepare("INSERT INTO messages (character_id, role, kind, text, created_at, source_message_id) VALUES (?, ?, ?, ?, ?, ?)").run(characterId, role, kind, text, nowIso(), sourceMessageId);
     return this.getMessage(Number(result.lastInsertRowid));
   }
 
   getMessage(id) {
-    const row = this.db.prepare("SELECT * FROM messages WHERE id = ?").get(id);
+    const row = this.db.prepare(`${MESSAGE_SELECT} WHERE m.id = ?`).get(id);
     return row ? messageRow(row) : null;
   }
 
   transcript(characterId, { afterId = 0, limit = 10_000 } = {}) {
-    return this.db.prepare("SELECT * FROM messages WHERE character_id = ? AND id > ? ORDER BY id LIMIT ?").all(characterId, afterId, limit).map(messageRow);
+    return this.db.prepare(`${MESSAGE_SELECT} WHERE m.character_id = ? AND m.id > ? ORDER BY m.id LIMIT ?`).all(characterId, afterId, limit).map(messageRow);
   }
 
-  // The bounded active verbatim window, oldest first.
+  // The bounded active verbatim window, oldest first. Observations are counted entries like any other.
   activeMessages(characterId, limit = 100) {
-    return this.db.prepare("SELECT * FROM (SELECT * FROM messages WHERE character_id = ? AND active = 1 ORDER BY id DESC LIMIT ?) ORDER BY id").all(characterId, limit).map(messageRow);
+    return this.db.prepare(`SELECT * FROM (${MESSAGE_SELECT} WHERE m.character_id = ? AND m.active = 1 ORDER BY m.id DESC LIMIT ?) ORDER BY id`).all(characterId, limit).map(messageRow);
   }
 
   activeCount(characterId) { return this.db.prepare("SELECT COUNT(*) AS n FROM messages WHERE character_id = ? AND active = 1").get(characterId).n; }
 
   oldestActiveMessages(characterId, count) {
-    return this.db.prepare("SELECT * FROM messages WHERE character_id = ? AND active = 1 ORDER BY id LIMIT ?").all(characterId, count).map(messageRow);
+    return this.db.prepare(`${MESSAGE_SELECT} WHERE m.character_id = ? AND m.active = 1 ORDER BY m.id LIMIT ?`).all(characterId, count).map(messageRow);
   }
 
+  // The last raw verbatim row, which may be an image observation.
   lastMessage(characterId) {
-    const row = this.db.prepare("SELECT * FROM messages WHERE character_id = ? ORDER BY id DESC LIMIT 1").get(characterId);
+    const row = this.db.prepare(`${MESSAGE_SELECT} WHERE m.character_id = ? ORDER BY m.id DESC LIMIT 1`).get(characterId);
+    return row ? messageRow(row) : null;
+  }
+
+  // The last actual chat turn (user or character message), skipping image observations.
+  lastTurn(characterId) {
+    const row = this.db.prepare(`${MESSAGE_SELECT} WHERE m.character_id = ? AND m.role != 'observation' ORDER BY m.id DESC LIMIT 1`).get(characterId);
     return row ? messageRow(row) : null;
   }
 
@@ -239,7 +315,38 @@ export class Store {
 
   messageCount(characterId) { return this.db.prepare("SELECT COUNT(*) AS n FROM messages WHERE character_id = ?").get(characterId).n; }
 
-  allMessages() { return this.db.prepare("SELECT * FROM messages ORDER BY id").all().map(messageRow); }
+  allMessages() { return this.db.prepare(`${MESSAGE_SELECT} ORDER BY m.id`).all().map(messageRow); }
+
+  // ---- uploaded user images --------------------------------------------------------------------------------
+  insertUpload({ messageId, characterId, file, mime, bytes }) {
+    const at = nowIso();
+    const result = this.db.prepare("INSERT INTO uploads (message_id, character_id, file, mime, bytes, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)")
+      .run(messageId, characterId, file, mime, bytes, at, at);
+    return this.getUpload(Number(result.lastInsertRowid));
+  }
+
+  getUpload(id) { return uploadRow(this.db.prepare("SELECT * FROM uploads WHERE id = ?").get(id)); }
+
+  uploadForMessage(messageId) { return uploadRow(this.db.prepare("SELECT * FROM uploads WHERE message_id = ?").get(messageId)); }
+
+  uploadByFile(file) { return uploadRow(this.db.prepare("SELECT * FROM uploads WHERE file = ?").get(file)); }
+
+  pendingUploads() { return this.db.prepare("SELECT * FROM uploads WHERE status = 'pending' ORDER BY id").all().map(uploadRow); }
+
+  pendingUploadCount(characterId) { return this.db.prepare("SELECT COUNT(*) AS n FROM uploads WHERE character_id = ? AND status = 'pending'").get(characterId).n; }
+
+  allUploads() { return this.db.prepare("SELECT * FROM uploads ORDER BY id").all().map(uploadRow); }
+
+  // Both transitions apply only to a still-pending upload, so a perception result is recorded at most once.
+  completeUpload(id, { observationMessageId, model }) {
+    return Number(this.db.prepare("UPDATE uploads SET status = 'observed', observation_message_id = ?, model = ?, error_code = NULL, error_message = NULL, updated_at = ? WHERE id = ? AND status = 'pending'")
+      .run(observationMessageId, model, nowIso(), id).changes);
+  }
+
+  failUpload(id, { code, message, model = null }) {
+    return Number(this.db.prepare("UPDATE uploads SET status = 'failed', model = ?, error_code = ?, error_message = ?, updated_at = ? WHERE id = ? AND status = 'pending'")
+      .run(model, code, String(message || "").slice(0, 500), nowIso(), id).changes);
+  }
 
   // ---- images ----------------------------------------------------------------------------------------------
   addImage({ messageId, characterId, request, model }) {

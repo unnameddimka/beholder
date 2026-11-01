@@ -84,6 +84,15 @@ textarea { resize: vertical; min-height: 44px; }
 .reply-error { align-self: stretch; border: 1px solid var(--error); color: var(--error); border-radius: 10px; padding: 8px 10px; font-size: 14px; display: flex; gap: 8px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
 .composer { display: flex; gap: 8px; align-items: flex-end; padding-top: 8px; padding-bottom: env(safe-area-inset-bottom); border-top: 1px solid var(--border); }
 .composer textarea { flex: 1; max-height: 40vh; }
+/* Specification 0003: an uploaded image is the user's attachment, framed differently from generated character art. */
+.upload-slot { margin-top: 8px; }
+.upload-slot img { margin-top: 0; max-height: 50vh; object-fit: contain; border: 2px solid var(--border); }
+.upload-note { margin-top: 4px; font-size: 12px; color: var(--muted); white-space: normal; }
+.upload-note summary { cursor: pointer; }
+.upload-note .observation { margin-top: 4px; white-space: pre-wrap; }
+.upload-note.failed { color: var(--error); }
+.attachment-preview { display: flex; gap: 8px; align-items: center; padding-top: 8px; font-size: 13px; color: var(--muted); }
+.attachment-preview img { max-height: 72px; max-width: 120px; border-radius: 8px; border: 1px solid var(--border); }
 
 .list-entry { border-top: 1px solid var(--border); padding: 10px 0; }
 .list-entry:first-of-type { border-top: none; }

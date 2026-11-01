@@ -1,5 +1,5 @@
-// Named-purpose LLM calls on top of the OpenRouter transport. Each purpose maps to one model role (Dialogue or
-// Contemplation); memory purposes use the Dialogue model as Specification 0000 section 4.1 requires. Structured
+// Named-purpose LLM calls on top of the OpenRouter transport. Each purpose maps to one model role (Dialogue,
+// Contemplation, or Vision); memory purposes use the Dialogue model as Specification 0000 section 4.1 requires. Structured
 // outputs are parsed and validated; malformed output gets bounded LLM repair (pattern from Society
 // src/memory-generation.js generateValidatedDraft) and is never committed.
 import { callOpenRouter, fetchModelCatalog } from "./openrouter.js";
@@ -21,16 +21,19 @@ export const PURPOSE_ROLES = Object.freeze({
   contemplation_generation: "contemplation",
   contemplation_generation_review: "contemplation",
   contemplation_gestaltization: "contemplation",
-  contemplation_experiment_planning: "contemplation"
+  contemplation_experiment_planning: "contemplation",
+  vision_observation: "vision"
 });
 
 export const REPAIR_ATTEMPTS = 2;
 const DIALOGUE_ENVELOPE_PURPOSES = new Set(["dialogue_reply", "dialogue_followup", "dialogue_opener"]);
 export const DIALOGUE_FORMAT_MODES = Object.freeze(["json_schema", "json_object", "prompt"]);
-const TIMEOUTS = { dialogue: 150_000, contemplation: 240_000 };
+const TIMEOUTS = { dialogue: 150_000, contemplation: 240_000, vision: 120_000 };
 const CATALOG_TTL_MS = 6 * 60 * 60 * 1000;
 // Deliberately low characters-per-token ratio for the pre-flight context estimate, so non-Latin text is not underestimated.
 const CHARS_PER_TOKEN_ESTIMATE = 3;
+// Allowance per image content part in that estimate; providers bill images at a few hundred to a few thousand tokens.
+const IMAGE_TOKEN_ALLOWANCE = 3000;
 
 export class LlmClient {
   constructor({ settings, key, diagnostics, fetchImpl = fetch, backoffMs = 1000, timeouts = TIMEOUTS }) {
@@ -70,9 +73,21 @@ export class LlmClient {
     const { model, maxTokens } = this.requestParameters(role);
     const contextLength = this.catalog?.byId.get(model)?.contextLength;
     if (!contextLength) return null;
-    const characters = messages.reduce((total, message) => total + String(message.content || "").length, 0);
-    const estimatedTokens = Math.ceil(characters / CHARS_PER_TOKEN_ESTIMATE) + maxTokens;
+    const parts = messages.flatMap((message) => Array.isArray(message.content) ? message.content : [{ type: "text", text: String(message.content || "") }]);
+    const characters = parts.reduce((total, part) => total + (part.type === "text" ? String(part.text || "").length : 0), 0);
+    const images = parts.filter((part) => part.type === "image_url").length;
+    const estimatedTokens = Math.ceil(characters / CHARS_PER_TOKEN_ESTIMATE) + images * IMAGE_TOKEN_ALLOWANCE + maxTokens;
     return { fits: estimatedTokens <= contextLength, estimatedTokens, contextLength };
+  }
+
+  // Whether the catalogue says a model accepts image input and returns text. Unknown (uncatalogued) is not refused.
+  visionCapability(model) {
+    const entry = this.catalog?.byId.get(model);
+    if (!entry) return { known: false, ok: true };
+    const input = entry.inputModalities;
+    const output = entry.outputModalities;
+    const ok = (!input || input.includes("image")) && (!output || output.includes("text"));
+    return { known: true, ok, inputModalities: input, outputModalities: output };
   }
 
   async call({ purpose, messages, context = {}, signal = null, responseFormat = null }) {

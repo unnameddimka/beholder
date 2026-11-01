@@ -24,12 +24,13 @@ export function localLabel(date, timeZone) {
 }
 
 // The per-message metadata marker. Its exact shape is also what stripTimestampEcho removes from replies.
-export function timestampMarker(createdAt, timeZone) {
+// verb is "sent" for chat messages and "viewed" for image observations (Specification 0003 M4).
+export function timestampMarker(createdAt, timeZone, verb = "sent") {
   const date = new Date(createdAt);
-  return `[sent ${isoSeconds(date)} | ${localLabel(date, timeZone)}]`;
+  return `[${verb} ${isoSeconds(date)} | ${localLabel(date, timeZone)}]`;
 }
 
-const MARKER_ECHO = /^(?:\s*\[sent \d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z \|[^\]\n]*\])+\s*/;
+const MARKER_ECHO = /^(?:\s*\[(?:sent|viewed) \d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z \|[^\]\n]*\])+\s*/;
 
 // Removes timestamp markers the model copied to the start of its reply; the rest of the text is untouched.
 export function stripTimestampEcho(text) {

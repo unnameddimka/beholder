@@ -10,6 +10,8 @@ import { MemoryEngine } from "./memory.js";
 import { Contemplation } from "./contemplation.js";
 import { ImageService } from "./images.js";
 import { Dialogue } from "./dialogue.js";
+import { Vision } from "./vision.js";
+import { UploadFiles } from "./uploads.js";
 import { verifyApiKey } from "./openrouter.js";
 import { KeyedMutex, coded, msUntilNextLocalMidnight } from "./utils.js";
 
@@ -26,6 +28,8 @@ export class BeholderApp {
     presenceTtlMs = undefined, maxParallel = 16, dnsLookup = undefined, stmRetryBackoffMs = undefined, ltmRetryBackoffMs = undefined, rootDir = process.cwd() }) {
     this.dataDir = dataDir;
     this.imagesDir = path.join(dataDir, "images");
+    // User-uploaded originals (Specification 0003 F1), a sibling of the generated images on the same data volume.
+    this.uploadsDir = path.join(dataDir, "uploaded-images");
     this.fetchImpl = fetchImpl;
     this.projectMeta = readJson(path.join(rootDir, "package.json"), {});
     this.projectMeta = { name: this.projectMeta.name || "beholder", version: this.projectMeta.version || null };
@@ -40,14 +44,18 @@ export class BeholderApp {
     this.memory = new MemoryEngine({ store: this.store, llm: this.llm, diagnostics: this.diagnostics, mutex: this.locks, now,
       ...(stmRetryBackoffMs !== undefined ? { stmRetryBackoffMs } : {}), ...(ltmRetryBackoffMs !== undefined ? { ltmRetryBackoffMs } : {}) });
     this.contemplation = new Contemplation({ store: this.store, llm: this.llm, memory: this.memory, settings: this.settings, diagnostics: this.diagnostics, maxParallel });
+    this.uploads = new UploadFiles(this.uploadsDir);
+    this.uploads.reconcile(this.store, this.diagnostics);
+    this.vision = new Vision({ store: this.store, llm: this.llm, settings: this.settings, diagnostics: this.diagnostics, uploads: this.uploads });
     this.images = new ImageService({ store: this.store, settings: this.settings, key: this.key, diagnostics: this.diagnostics, fetchImpl, imagesDir: this.imagesDir, backoffMs: backoffMs * 2, ...(dnsLookup ? { lookupImpl: dnsLookup } : {}) });
-    this.dialogue = new Dialogue({ store: this.store, llm: this.llm, memory: this.memory, contemplation: this.contemplation, images: this.images, settings: this.settings,
+    this.dialogue = new Dialogue({ store: this.store, llm: this.llm, memory: this.memory, contemplation: this.contemplation, images: this.images, vision: this.vision, uploads: this.uploads, settings: this.settings,
       diagnostics: this.diagnostics, now, timeScaleMs, ...(openerDelaySeconds !== undefined ? { openerDelaySeconds } : {}), ...(presenceTtlMs !== undefined ? { presenceTtlMs } : {}) });
     this.timers = [];
   }
 
   // Background schedules. Model-backed work needs the key, which exists only after entry in this process, so the
-  // catch-up for missed STM -> LTM boundaries and contemplation recovery start as soon as the key is set.
+  // catch-up for missed STM -> LTM boundaries, contemplation recovery, and pending image perception start as soon as
+  // the key is set.
   start() {
     const daily = () => { if (this.key.configured()) this.memory.runDailyIfDue().catch((error) => this.diagnostics.error("memory_ltm_schedule", error)); };
     const interval = setInterval(daily, DAILY_CHECK_INTERVAL_MS);
@@ -84,6 +92,7 @@ export class BeholderApp {
     this.memory.runDailyIfDue().catch((error) => this.diagnostics.error("memory_ltm_schedule", error));
     for (const character of this.store.listCharacters()) this.memory.maybeConsolidate(character.id);
     this.contemplation.recover();
+    this.dialogue.recoverPendingVision();
     this.images.resumePending();
   }
 
@@ -117,7 +126,7 @@ export class BeholderApp {
   }
 
   characterSummary(character) {
-    const last = this.store.lastMessage(character.id);
+    const last = this.store.lastTurn(character.id);
     return { ...character, memoryPool: memoryPoolOf(character), interpretationPool: interpretationPoolOf(character), messageCount: this.store.messageCount(character.id),
       lastMessageAt: last?.createdAt || null, chat: this.dialogue.chatState(character.id) };
   }
@@ -132,13 +141,14 @@ export class BeholderApp {
     const memoryRunning = memory.stmJobs.some((job) => job.status === "running") || memory.ltm.running;
     const errors = this.diagnostics.errors.slice(-5);
     return {
-      working: Object.values(roles).some((role) => role.working) || contemplation.some((pool) => pool.running) || memoryRunning || this.images.inFlight.size > 0,
+      working: Object.values(roles).some((role) => role.working) || contemplation.some((pool) => pool.running) || memoryRunning || this.images.inFlight.size > 0 || this.vision.inFlight.size > 0,
       apiKeyConfigured: this.key.configured(),
       roles,
       dialogue: dialogueChats,
       contemplation,
       memory,
       images: { inFlight: this.images.inFlight.size },
+      vision: { inFlight: this.vision.inFlight.size },
       recentErrors: errors.map((entry) => ({ at: entry.at, stage: entry.stage, code: entry.code, message: String(entry.message).slice(0, 300) }))
     };
   }

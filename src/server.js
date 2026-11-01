@@ -1,14 +1,16 @@
 // HTTP server for the trusted LAN (no auth, no HTTPS by design; never expose it to the internet). Plain node:http
-// like Society src/server.js; static files are an explicit allowlist and images are served only by known name.
+// like Society src/server.js; static files are an explicit allowlist and images (generated and uploaded) are served
+// only by a known, recorded name.
 import http from "node:http";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { BeholderApp } from "./app.js";
-import { CURATED_TEXT_MODELS, DEFAULT_IMAGE_MODEL } from "./settings.js";
+import { CURATED_TEXT_MODELS, CURATED_VISION_MODELS, DEFAULT_IMAGE_MODEL } from "./settings.js";
 import { interpretationPoolOf } from "./db.js";
 import { buildEmergencyDump } from "./dump.js";
 import { IMAGE_FILE_PATTERN } from "./images.js";
+import { readBoundedBody, parseMultipart, UPLOAD_BODY_LIMIT, UPLOAD_MAX_BYTES } from "./uploads.js";
 import { coded } from "./utils.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -25,9 +27,10 @@ const STATIC_FILES = Object.freeze({
 const SECURITY_HEADERS = {
   "X-Content-Type-Options": "nosniff",
   "Referrer-Policy": "no-referrer",
-  "Content-Security-Policy": "default-src 'self'; img-src 'self'; style-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+  "Content-Security-Policy": "default-src 'self'; img-src 'self' blob:; style-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
 };
-const STATUS_BY_CODE = { CHARACTER_NOT_FOUND: 404, NOT_FOUND: 404, REPLY_PENDING: 409, NOTHING_TO_RETRY: 409, API_KEY_MISSING: 409, PAYLOAD_TOO_LARGE: 413 };
+const STATUS_BY_CODE = { CHARACTER_NOT_FOUND: 404, NOT_FOUND: 404, REPLY_PENDING: 409, NOTHING_TO_RETRY: 409, API_KEY_MISSING: 409, PAYLOAD_TOO_LARGE: 413,
+  UPLOAD_TOO_LARGE: 413, UPLOAD_UNSUPPORTED: 415, UPLOAD_INVALID: 400 };
 
 function send(res, status, body, headers = {}) {
   res.writeHead(status, { ...SECURITY_HEADERS, ...headers });
@@ -57,12 +60,17 @@ function idParam(value) {
   return id;
 }
 
+// Chat transcript for the browser. Image observations are not chat utterances: they are omitted as entries and shown
+// only as the perception state of the user's attachment. Image bytes are never part of this JSON.
 function messagesWithImages(app, characterId, afterId) {
   const images = new Map(app.store.imagesForCharacter(characterId).map((image) => [image.messageId, image]));
-  return app.store.transcript(characterId, { afterId }).map((message) => {
+  return app.store.transcript(characterId, { afterId }).filter((message) => message.role !== "observation").map((message) => {
     const image = images.get(message.id);
+    const upload = message.upload;
+    const available = upload ? app.uploads.exists(upload.file) : false;
     return { id: message.id, role: message.role, text: message.text, createdAt: message.createdAt,
-      image: image ? { status: image.status, url: image.status === "ready" ? `/images/${image.file}` : null, error: image.status === "failed" ? image.errorMessage : null } : null };
+      image: image ? { status: image.status, url: image.status === "ready" ? `/images/${image.file}` : null, error: image.status === "failed" ? image.errorMessage : null } : null,
+      upload: upload ? { status: upload.status, url: available ? `/uploads/${upload.file}` : null, observation: upload.status === "observed" ? upload.observation : null } : null };
   });
 }
 
@@ -82,7 +90,7 @@ function contemplationView(app, character) {
 export function createServer(app) {
   const routes = [
     ["GET", /^\/api\/status$/, () => ({ apiKeyConfigured: app.key.configured(), settings: app.settings.get(), userDescription: app.settings.userDescription(),
-      curatedModels: CURATED_TEXT_MODELS, defaultImageModel: DEFAULT_IMAGE_MODEL, build: { ...app.projectMeta, sourceCommitSha: app.buildInfo.sourceCommitSha } })],
+      curatedModels: CURATED_TEXT_MODELS, curatedVisionModels: CURATED_VISION_MODELS, defaultImageModel: DEFAULT_IMAGE_MODEL, uploadMaxBytes: UPLOAD_MAX_BYTES, build: { ...app.projectMeta, sourceCommitSha: app.buildInfo.sourceCommitSha } })],
     ["POST", /^\/api\/key$/, async (req) => app.setApiKey((await readJsonBody(req)).apiKey)],
     ["GET", /^\/api\/models$/, async (req, url) => {
       let catalog = null;
@@ -111,6 +119,12 @@ export function createServer(app) {
     ["POST", /^\/api\/characters\/(\d+)\/messages$/, async (req, url, m) => {
       const character = mustCharacter(app, m[1]);
       if (!app.key.configured()) throw coded("API_KEY_MISSING", "Enter the OpenRouter API key first.");
+      // A message with an attached image arrives as bounded multipart/form-data (fields text, timeZone, image).
+      if (/^multipart\/form-data/i.test(String(req.headers["content-type"] || ""))) {
+        const fields = parseMultipart(await readBoundedBody(req, UPLOAD_BODY_LIMIT), req.headers["content-type"]);
+        if (!fields.image) throw coded("UPLOAD_INVALID", "No image was attached.");
+        return { message: await app.dialogue.sendImage(character.id, fields.text ?? "", { timeZone: fields.timeZone ?? null, image: fields.image }) };
+      }
       const body = await readJsonBody(req);
       return { message: app.dialogue.send(character.id, body.text, { timeZone: body.timeZone ?? null }) };
     }],
@@ -184,6 +198,14 @@ export function createServer(app) {
         if (!image) throw coded("NOT_FOUND", "Not found.");
         const bytes = await fs.readFile(path.join(app.imagesDir, file));
         return send(res, 200, bytes, { "Content-Type": image.mime, "Cache-Control": "private, max-age=31536000, immutable" });
+      }
+      if (req.method === "GET" && url.pathname.startsWith("/uploads/")) {
+        const file = url.pathname.slice("/uploads/".length);
+        if (!IMAGE_FILE_PATTERN.test(file)) throw coded("NOT_FOUND", "Not found.");
+        const upload = app.store.uploadByFile(file);
+        if (!upload) throw coded("NOT_FOUND", "Not found.");
+        const bytes = await fs.readFile(app.uploads.filePath(file));
+        return send(res, 200, bytes, { "Content-Type": upload.mime, "Cache-Control": "private, max-age=31536000, immutable" });
       }
       if (req.method === "GET" && STATIC_FILES[url.pathname]) {
         const [file, type] = STATIC_FILES[url.pathname];

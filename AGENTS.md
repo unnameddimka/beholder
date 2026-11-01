@@ -5,7 +5,7 @@ folder's file describes a different project (a SugarCube RPG) and does not apply
 
 ## Scope
 
-- The authoritative requirements are `docs/specs/0000-beholder-poc.md`, amended by specs 0001 and 0002 in
+- The authoritative requirements are `docs/specs/0000-beholder-poc.md`, amended by specs 0001, 0002, and 0003 in
   `docs/specs/`. Implement only what an approved spec says. Scope expansion needs a new, explicitly approved spec.
 - Society (`../society/society`) is a read-only implementation donor. Never modify it.
 
@@ -20,6 +20,14 @@ folder's file describes a different project (a SugarCube RPG) and does not apply
   blocks experiment review or dialogue. One gestalt per interpretation pool; no history of old gestalts.
 - The Contemplation page is read-only: it must not expose or call any mutation or Force route.
 - Every text Chat Completions request carries the provider ignore list (`PROVIDER_IGNORE`, including `baidu`).
+- Vision input is only the attached image, the chat's whole active verbatim window, and the pool's gestalt (only while
+  Contemplation is enabled). Never memory records, interpretations, experiments, or the pinned self-description. Its
+  output is one prose observation stored as a typed `image_observation` verbatim entry linked to its user message;
+  the type marker stops at the verbatim boundary (STM and LTM stay ordinary prose).
+- An observation is never a chat utterance, a reply trigger, or a Contemplation trigger. Retry, follow-ups, openers,
+  elapsed time, and watermarks use actual chat turns (`Store.lastTurn`). At most one observation per upload.
+- Dialogue never receives image bytes. Image bytes and data URLs never appear in diagnostics, dumps, or chat JSON.
+- Uploaded originals live in `data/uploaded-images` under random names and are served only by a recorded name.
 - The prefetch input is exactly the whole interpretation pool, up to the last 100 verbatim messages of the
   triggering chat, and the pool's active experiment intentions (possibly empty). No consolidated memory.
 - Experiment planning input is only the interpretation pool and the active experiment array. Its output replaces the
@@ -38,7 +46,8 @@ folder's file describes a different project (a SugarCube RPG) and does not apply
 ## Layout
 
 - `src/server.js`: HTTP routes. `src/app.js`: composition. `src/db.js`: schema, migrations, store.
-- `src/dialogue.js`, `src/contemplation.js`, `src/memory.js`, `src/images.js`: subsystems.
+- `src/dialogue.js`, `src/contemplation.js`, `src/memory.js`, `src/images.js`, `src/vision.js`: subsystems.
+  `src/uploads.js`: upload transport, validation, and files.
 - `src/openrouter.js`, `src/llm.js`: transport and named purposes. `src/dump.js`, `src/diagnostics.js`.
 - `public/`: browser UI. `tests/`: `node:test` suites with a mocked OpenRouter.
 
