@@ -48,7 +48,7 @@ test("contemplation disabled omits experiments from dialogue and schedules no pr
 });
 
 test("plain dialogue text is normalized without a repair request or repeated speech", async () => {
-  const original = '*tilts her head, amused*\\n\\nNo dreams, just a mission to make me smile.';
+  const original = ["*tilts her head, amused*", "", "No dreams, just a mission to make me smile."].join("\n");
   const { app, mock } = await makeApp({
     dialogue_reply: () => original,
     contemplation_prefetch: () => ({ generation: false, maintenance: false })
@@ -93,6 +93,7 @@ test("OpenRouter request asks supported providers for strict dialogue JSON schem
   });
   try {
     await app.llm.modelCatalog();
+    app.settings.update({ models: { ...app.settings.get().models, dialogue: "test/dialogue" } });
     const mira = app.createCharacter(character());
     app.dialogue.send(mira.id, "hi");
     await waitFor(() => app.store.lastMessage(mira.id)?.role === "character");
@@ -103,8 +104,9 @@ test("OpenRouter request asks supported providers for strict dialogue JSON schem
       ["message", "followUpDelaySeconds", "imageRequest"]);
     assert.equal(body.response_format.json_schema.schema.additionalProperties, false);
     assert.equal(body.provider.require_parameters, true);
-    assert.equal("response_format" in mock.byPurpose("contemplation_prefetch")[0]?.body || {}, false,
-      "non-dialogue structured work is not changed by this fix");
+    for (const exchange of mock.byPurpose("contemplation_prefetch")) {
+      assert.equal("response_format" in exchange.body, false, "non-dialogue work is unchanged");
+    }
   } finally { closeApp(app); }
 });
 
