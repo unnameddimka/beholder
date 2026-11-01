@@ -47,19 +47,81 @@ test("contemplation disabled omits experiments from dialogue and schedules no pr
   } finally { closeApp(app); }
 });
 
-test("malformed envelope is repaired by the LLM and never committed raw", async () => {
+test("plain dialogue text is normalized without a repair request or repeated speech", async () => {
+  const original = '*tilts her head, amused*\\n\\nNo dreams, just a mission to make me smile.';
   const { app, mock } = await makeApp({
-    dialogue_reply: (body, { count }) => count === 1 ? "Sure! here is my answer without json" : reply("Repaired reply."),
+    dialogue_reply: () => original,
     contemplation_prefetch: () => ({ generation: false, maintenance: false })
   });
   try {
     const mira = app.createCharacter(character());
+    app.store.addMessage({ characterId: mira.id, role: "character", kind: "reply", text: '"Darling"? Well, good morning.' });
+    app.dialogue.send(mira.id, "I don't dream usually.");
+    await waitFor(() => app.store.lastMessage(mira.id)?.role === "character" && app.store.lastMessage(mira.id).text === original);
+    assert.equal(mock.byPurpose("dialogue_reply").length, 1, "no LLM repair for valid roleplay text");
+    assert.equal(app.store.lastMessage(mira.id).text, original);
+    assert.doesNotMatch(app.store.lastMessage(mira.id).text, /Darling/);
+    assert.equal(app.diagnostics.exchanges.filter((entry) => entry.purpose === "dialogue_reply").length, 1);
+  } finally { closeApp(app); }
+});
+
+test("broken dialogue JSON is repaired without passing old dialogue turns", async () => {
+  const { app, mock } = await makeApp({
+    dialogue_reply: (body, { count }) => count === 1 ? '{"message":"Half the answer"' : reply("Repaired reply."),
+    contemplation_prefetch: () => ({ generation: false, maintenance: false })
+  });
+  try {
+    const mira = app.createCharacter(character());
+    app.store.addMessage({ characterId: mira.id, role: "character", kind: "reply", text: 'Previous darling speech must not be repeated.' });
     app.dialogue.send(mira.id, "hello");
-    await waitFor(() => app.store.lastMessage(mira.id)?.role === "character");
-    assert.equal(app.store.lastMessage(mira.id).text, "Repaired reply.");
+    await waitFor(() => app.store.lastMessage(mira.id)?.role === "character" && app.store.lastMessage(mira.id)?.text === "Repaired reply.");
+    assert.equal(mock.byPurpose("dialogue_reply").length, 2);
     const repair = mock.byPurpose("dialogue_reply")[1].body.messages;
-    assert.equal(repair.at(-2).role, "assistant");
-    assert.match(repair.at(-1).content, /violates the required JSON contract/);
+    assert.equal(repair.length, 2, "repair receives only the invalid output and the repair contract");
+    assert.deepEqual(repair.map((m) => m.role), ["system", "user"]);
+    assert.match(repair[0].content, /Repair only the invalid dialogue response/);
+    assert.match(repair[1].content, /Half the answer/);
+    assert.doesNotMatch(JSON.stringify(repair), /Previous darling speech/);
+    assert.equal(app.store.lastMessage(mira.id).text, "Repaired reply.");
+  } finally { closeApp(app); }
+});
+
+test("OpenRouter request asks supported providers for strict dialogue JSON schema", async () => {
+  const { app, mock } = await makeApp({
+    dialogue_reply: () => reply("hello"),
+    contemplation_prefetch: () => ({ generation: false, maintenance: false })
+  });
+  try {
+    await app.llm.modelCatalog();
+    const mira = app.createCharacter(character());
+    app.dialogue.send(mira.id, "hi");
+    await waitFor(() => app.store.lastMessage(mira.id)?.role === "character");
+    const body = mock.byPurpose("dialogue_reply")[0].body;
+    assert.equal(body.response_format.type, "json_schema");
+    assert.equal(body.response_format.json_schema.strict, true);
+    assert.deepEqual(body.response_format.json_schema.schema.required,
+      ["message", "followUpDelaySeconds", "imageRequest"]);
+    assert.equal(body.response_format.json_schema.schema.additionalProperties, false);
+    assert.equal(body.provider.require_parameters, true);
+    assert.equal("response_format" in mock.byPurpose("contemplation_prefetch")[0]?.body || {}, false,
+      "non-dialogue structured work is not changed by this fix");
+  } finally { closeApp(app); }
+});
+
+test("unsupported selected dialogue model keeps prompt validation without forced provider format", async () => {
+  const { app, mock } = await makeApp({
+    dialogue_reply: () => reply("hello"),
+    contemplation_prefetch: () => ({ generation: false, maintenance: false })
+  });
+  try {
+    await app.llm.modelCatalog();
+    app.settings.update({ models: { ...app.settings.get().models, dialogue: "test/unsupported" } });
+    const mira = app.createCharacter(character());
+    app.dialogue.send(mira.id, "hi");
+    await waitFor(() => app.store.lastMessage(mira.id)?.role === "character");
+    const body = mock.byPurpose("dialogue_reply")[0].body;
+    assert.equal("response_format" in body, false);
+    assert.equal("require_parameters" in body.provider, false);
   } finally { closeApp(app); }
 });
 
