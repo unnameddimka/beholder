@@ -1,0 +1,471 @@
+// Contemplation: an independent background process per interpretation pool (Specification 0000 section 5).
+// One serial pipeline per pool: prefetch -> maintenance (parallel per interpretation, all-or-nothing batch) ->
+// generation (with an LLM review of the candidate) -> at most one experiment-planning pass against the final pool.
+// User messages arriving during a cycle are coalesced through a persisted per-(pool, chat) watermark. Writes are
+// atomic SQLite transactions guarded by revisions/snapshots, so stale results never overwrite newer state.
+import { coded, exactKeys, mapLimited } from "./utils.js";
+import { interpretationPoolOf, memoryPoolOf } from "./db.js";
+import { messageView } from "./memory.js";
+import {
+  INTERPRETATION_MAX_CHARS, EXPERIMENT_MAX_CHARS, EXPERIMENTS_MAX,
+  prefetchSystemPrompt, maintenanceSystemPrompt, generationSystemPrompt, generationReviewSystemPrompt, experimentPlanningSystemPrompt
+} from "./prompts/contemplation.js";
+
+export const CONTEMPLATION_HISTORY = 100;
+const PLANNING_STALE_RETRIES = 3;
+const RETRIEVAL_SITUATION_MESSAGES = 12;
+// Manual edits often come in quick succession; a short debounce lets them coalesce into one experiment review.
+const MANUAL_PLANNING_DEBOUNCE_MS = 200;
+
+const wireInterpretation = (id) => `int_${id}`;
+const wireExperiment = (id) => `exp_${id}`;
+const parseWire = (value, prefix) => {
+  const match = typeof value === "string" ? new RegExp(`^${prefix}_(\\d+)$`).exec(value) : null;
+  return match ? Number(match[1]) : null;
+};
+
+// ---- validators -------------------------------------------------------------------------------------------------
+
+export function validatePrefetch(raw) {
+  if (!exactKeys(raw, ["generation", "maintenance"]) || typeof raw.generation !== "boolean" || typeof raw.maintenance !== "boolean") {
+    return { ok: false, errors: ["response must be exactly {\"generation\": boolean, \"maintenance\": boolean}."] };
+  }
+  return { ok: true, value: { generation: raw.generation, maintenance: raw.maintenance } };
+}
+
+export function validateMaintenance(raw, experimentIds) {
+  const errors = [];
+  if (!exactKeys(raw, ["action", "text", "completedExperimentIds"])) return { ok: false, errors: ["response must contain exactly action, text and completedExperimentIds."] };
+  if (!["unchanged", "replace", "delete"].includes(raw.action)) errors.push("action must be unchanged, replace, or delete.");
+  if (raw.action === "replace") {
+    if (typeof raw.text !== "string" || !raw.text.trim()) errors.push("text must be the revised interpretation for replace.");
+    else if (raw.text.trim().length > INTERPRETATION_MAX_CHARS) errors.push(`text must be at most ${INTERPRETATION_MAX_CHARS} characters.`);
+  } else if (raw.text !== null) errors.push("text must be null unless action is replace.");
+  if (!Array.isArray(raw.completedExperimentIds)) errors.push("completedExperimentIds must be an array.");
+  else for (const id of raw.completedExperimentIds) if (!experimentIds.has(id)) errors.push(`completedExperimentIds contains unknown id ${id}.`);
+  if (errors.length) return { ok: false, errors };
+  return { ok: true, value: { action: raw.action, text: raw.action === "replace" ? raw.text.trim() : null, completedExperimentIds: [...new Set(raw.completedExperimentIds)] } };
+}
+
+export function validateGeneration(raw) {
+  const errors = [];
+  if (!exactKeys(raw, ["decision", "text"])) return { ok: false, errors: ["response must contain exactly decision and text."] };
+  if (!["add", "decline"].includes(raw.decision)) errors.push("decision must be add or decline.");
+  if (raw.decision === "add") {
+    if (typeof raw.text !== "string" || !raw.text.trim()) errors.push("text must be the new interpretation for add.");
+    else if (raw.text.trim().length > INTERPRETATION_MAX_CHARS) errors.push(`text must be at most ${INTERPRETATION_MAX_CHARS} characters.`);
+  } else if (raw.text !== null) errors.push("text must be null for decline.");
+  return errors.length ? { ok: false, errors } : { ok: true, value: { decision: raw.decision, text: raw.decision === "add" ? raw.text.trim() : null } };
+}
+
+export function validateGenerationReview(raw) {
+  if (!exactKeys(raw, ["accept", "problem"]) || typeof raw.accept !== "boolean" || !(raw.problem === null || typeof raw.problem === "string")) {
+    return { ok: false, errors: ["response must be exactly {\"accept\": boolean, \"problem\": string or null}."] };
+  }
+  return { ok: true, value: { accept: raw.accept, problem: raw.problem ? raw.problem.slice(0, 500) : null } };
+}
+
+export function validatePlanning(raw, experimentIds) {
+  const errors = [];
+  if (!exactKeys(raw, ["experiments"]) || !Array.isArray(raw.experiments)) return { ok: false, errors: ["response must be exactly {\"experiments\": [...]}."] };
+  if (raw.experiments.length > EXPERIMENTS_MAX) errors.push(`at most ${EXPERIMENTS_MAX} experiments are allowed.`);
+  const seen = new Set();
+  const value = [];
+  raw.experiments.forEach((entry, index) => {
+    const path = `experiments[${index}]`;
+    if (!exactKeys(entry, ["id", "text"])) { errors.push(`${path} must contain exactly id and text.`); return; }
+    if (entry.id !== null) {
+      if (!experimentIds.has(entry.id)) errors.push(`${path}.id must be null or a supplied experiment id.`);
+      else if (seen.has(entry.id)) errors.push(`${path}.id repeats ${entry.id}.`);
+      seen.add(entry.id);
+    }
+    if (typeof entry.text !== "string" || !entry.text.trim()) errors.push(`${path}.text must be non-empty text.`);
+    else if (entry.text.trim().length > EXPERIMENT_MAX_CHARS) errors.push(`${path}.text must be at most ${EXPERIMENT_MAX_CHARS} characters.`);
+    else value.push({ id: entry.id, text: entry.text.trim() });
+  });
+  return errors.length ? { ok: false, errors } : { ok: true, value };
+}
+
+// ---- runtime ----------------------------------------------------------------------------------------------------
+
+function newPoolRuntime(pool) {
+  return { pool, running: false, stage: "idle", stageCharacterId: null, parallel: { total: 0, inFlight: 0 }, pendingCharacters: new Set(), forced: [],
+    planningRequested: false, lastError: null, lastCycle: null, cycles: 0, promise: null };
+}
+
+export class Contemplation {
+  constructor({ store, llm, memory, settings, diagnostics, maxParallel = 16, planningDebounceMs = MANUAL_PLANNING_DEBOUNCE_MS }) {
+    this.store = store;
+    this.llm = llm;
+    this.memory = memory;
+    this.settings = settings;
+    this.diagnostics = diagnostics;
+    this.maxParallel = maxParallel;
+    this.planningDebounceMs = planningDebounceMs;
+    this.planningTimers = new Map();
+    this.pools = new Map();
+  }
+
+  runtime(pool) {
+    if (!this.pools.has(pool)) this.pools.set(pool, newPoolRuntime(pool));
+    return this.pools.get(pool);
+  }
+
+  enabled() { return this.settings.get().contemplationEnabled; }
+
+  // ---- triggers -----------------------------------------------------------------------------------------------
+
+  onUserMessage(characterId) {
+    if (!this.enabled()) return null;
+    const character = this.store.getCharacter(characterId);
+    if (!character) return null;
+    const pool = interpretationPoolOf(character);
+    this.runtime(pool).pendingCharacters.add(characterId);
+    return this.kick(pool);
+  }
+
+  force(pool, kind, characterId) {
+    if (!["generation", "maintenance", "experimentation"].includes(kind)) throw coded("FORCE_KIND_INVALID", "Unknown contemplation action.");
+    if ((kind === "generation" || kind === "maintenance") && !this.store.getCharacter(characterId)) throw coded("CHARACTER_NOT_FOUND", "A character is required for this action.");
+    this.store.ensureInterpretationPool(pool);
+    this.runtime(pool).forced.push({ kind, characterId });
+    return this.kick(pool);
+  }
+
+  requestPlanning(pool) {
+    this.runtime(pool).planningRequested = true;
+    return this.kick(pool);
+  }
+
+  // Restart recovery: re-evaluate unprocessed user messages and persisted pending experiment planning.
+  recover() {
+    if (!this.enabled()) return;
+    for (const character of this.store.listCharacters()) {
+      const pool = interpretationPoolOf(character);
+      if (this.store.lastUserMessageId(character.id) > this.store.watermark(pool, character.id)) this.runtime(pool).pendingCharacters.add(character.id);
+    }
+    for (const state of this.store.interpretationPools()) if (state.planningNeeded) this.runtime(state.pool).planningRequested = true;
+    for (const pool of this.pools.keys()) this.kick(pool);
+  }
+
+  kick(pool) {
+    const rt = this.runtime(pool);
+    if (rt.running) return rt.promise;
+    rt.running = true;
+    rt.promise = this.loop(rt)
+      .catch((error) => { rt.lastError = this.diagnostics.error("contemplation", error, { pool }); })
+      .finally(() => {
+        rt.running = false;
+        rt.stage = "idle";
+        rt.stageCharacterId = null;
+        if (rt.forced.length) this.kick(pool);
+      });
+    return rt.promise;
+  }
+
+  // Waits until a pool's pipeline is idle (tests and diagnostics).
+  async idle(pool) {
+    while (this.runtime(pool).running || this.planningTimers.has(pool)) {
+      if (this.runtime(pool).running) await this.runtime(pool).promise;
+      else await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
+  async loop(rt) {
+    const pool = rt.pool;
+    for (;;) {
+      if (rt.forced.length) {
+        const op = rt.forced.shift();
+        try {
+          if (op.kind === "maintenance") await this.runMaintenance(rt, op.characterId);
+          else if (op.kind === "generation") await this.runGeneration(rt, op.characterId);
+          await this.planIfNeeded(rt, { force: op.kind === "experimentation" });
+        } catch (error) {
+          rt.lastError = this.diagnostics.error(`contemplation_${op.kind}`, error, { pool, characterId: op.characterId });
+        }
+        continue;
+      }
+      const characterId = this.nextPendingCharacter(rt);
+      if (characterId !== null) {
+        await this.runCycle(rt, characterId);
+        continue;
+      }
+      if ((rt.planningRequested || this.store.ensureInterpretationPool(pool).planningNeeded) && this.enabled()) {
+        rt.planningRequested = false;
+        try { await this.planIfNeeded(rt, {}); }
+        catch (error) {
+          // Leave planning_needed persisted; the next pool change, message, restart, or Force retries it.
+          rt.lastError = this.diagnostics.error("contemplation_experiment_planning", error, { pool });
+          return;
+        }
+        continue;
+      }
+      rt.planningRequested = false;
+      return;
+    }
+  }
+
+  nextPendingCharacter(rt) {
+    for (const characterId of rt.pendingCharacters) {
+      rt.pendingCharacters.delete(characterId);
+      const character = this.store.getCharacter(characterId);
+      // A chat that switched to another interpretation pool is evaluated by that pool instead.
+      if (!character || interpretationPoolOf(character) !== rt.pool || !this.enabled()) continue;
+      if (this.store.lastUserMessageId(characterId) > this.store.watermark(rt.pool, characterId)) return characterId;
+    }
+    return null;
+  }
+
+  // ---- context ------------------------------------------------------------------------------------------------
+
+  conversation(characterId) {
+    const character = this.store.getCharacter(characterId);
+    return { character: character.name, messages: this.store.activeMessages(characterId, CONTEMPLATION_HISTORY).map((message) => messageView(message, character.name)) };
+  }
+
+  interpretationViews(pool) { return this.store.interpretations(pool).map((entry) => ({ id: wireInterpretation(entry.id), text: entry.text })); }
+
+  experimentViews(pool) { return this.store.experiments(pool).map((entry) => ({ id: wireExperiment(entry.id), text: entry.text })); }
+
+  async retrieveMemory(characterId, conversation) {
+    const character = this.store.getCharacter(characterId);
+    const result = await this.memory.retrieve({ pool: memoryPoolOf(character), purpose: "contemplation_memory_retrieval", currentCharacterId: characterId,
+      situation: { conversation: { character: conversation.character, recentMessages: conversation.messages.slice(-RETRIEVAL_SITUATION_MESSAGES) } } });
+    return { shortTermMemories: result.shortTermMemories, longTermMemories: result.longTermMemories };
+  }
+
+  setStage(rt, stage, characterId = null) {
+    rt.stage = stage;
+    rt.stageCharacterId = characterId;
+    this.diagnostics.event({ type: "contemplation-stage", pool: rt.pool, stage, characterId });
+  }
+
+  // ---- stages -------------------------------------------------------------------------------------------------
+
+  // One full cycle for the newest evidence of one chat. The watermark advances only after the cycle succeeds; a
+  // failure leaves it so the next message (or a restart) re-evaluates all evidence since the last successful cycle.
+  async runCycle(rt, characterId) {
+    const pool = rt.pool;
+    const targetMessageId = this.store.lastUserMessageId(characterId);
+    const cycle = { characterId, targetMessageId, startedAt: new Date().toISOString(), flags: null, status: "running" };
+    rt.lastCycle = cycle;
+    try {
+      this.setStage(rt, "prefetch", characterId);
+      // Prefetch sees exactly the whole interpretation pool and the latest verbatim messages; no consolidated memory.
+      const payload = { interpretations: this.interpretationViews(pool), conversation: this.conversation(characterId), requiredResponseShape: { generation: false, maintenance: false } };
+      const { value: flags } = await this.llm.structured({ purpose: "contemplation_prefetch", messages: [{ role: "system", content: prefetchSystemPrompt() }, { role: "user", content: JSON.stringify(payload) }],
+        validate: validatePrefetch, context: { characterId, pool } });
+      cycle.flags = flags;
+      if (flags.maintenance && this.store.interpretations(pool).length) await this.runMaintenance(rt, characterId);
+      if (flags.generation) await this.runGeneration(rt, characterId);
+      this.store.setWatermark(pool, characterId, targetMessageId);
+      await this.planIfNeeded(rt, {});
+      cycle.status = "succeeded";
+      rt.cycles += 1;
+    } catch (error) {
+      cycle.status = "failed";
+      cycle.error = { code: error.code || "CONTEMPLATION_FAILED", message: error.message };
+      rt.lastError = this.diagnostics.error("contemplation_cycle", error, { pool, characterId });
+    } finally {
+      cycle.finishedAt = new Date().toISOString();
+      this.diagnostics.event({ type: "contemplation-cycle", pool, ...cycle });
+    }
+  }
+
+  async runMaintenance(rt, characterId) {
+    const pool = rt.pool;
+    const snapshot = this.store.interpretations(pool);
+    if (!snapshot.length) return { status: "empty" };
+    this.setStage(rt, "maintenance_retrieval", characterId);
+    const conversation = this.conversation(characterId);
+    const memory = await this.retrieveMemory(characterId, conversation);
+    const experiments = this.experimentViews(pool);
+    const experimentIds = new Set(experiments.map((entry) => entry.id));
+    this.setStage(rt, "maintenance", characterId);
+    rt.parallel = { total: snapshot.length, inFlight: 0 };
+    const results = await mapLimited(snapshot, this.maxParallel, async (interpretation) => {
+      rt.parallel.inFlight += 1;
+      try {
+        const payload = { interpretation: { id: wireInterpretation(interpretation.id), text: interpretation.text }, conversation, memory, activeExperiments: experiments,
+          requiredResponseShape: { action: "unchanged", text: null, completedExperimentIds: [] } };
+        const { value } = await this.llm.structured({ purpose: "contemplation_maintenance", messages: [{ role: "system", content: maintenanceSystemPrompt() }, { role: "user", content: JSON.stringify(payload) }],
+          validate: (raw) => validateMaintenance(raw, experimentIds), context: { characterId, pool, interpretationId: interpretation.id } });
+        return { interpretation, ...value };
+      } finally {
+        rt.parallel.inFlight -= 1;
+      }
+    }).finally(() => { rt.parallel = { total: 0, inFlight: 0 }; });
+    // All requests succeeded: apply the batch in one transaction. A result whose interpretation was edited or removed
+    // meanwhile (manual edit) is superseded by that newer state and skipped, never overwriting it.
+    const outcome = this.store.tx(() => {
+      let interpretationsChanged = 0;
+      let superseded = 0;
+      for (const result of results) {
+        const current = this.store.interpretations(pool).find((entry) => entry.id === result.interpretation.id);
+        if (result.action === "unchanged") continue;
+        if (!current || current.text !== result.interpretation.text) { superseded += 1; continue; }
+        if (result.action === "replace" && result.text !== current.text) interpretationsChanged += this.store.updateInterpretation(pool, current.id, result.text);
+        if (result.action === "delete") interpretationsChanged += this.store.deleteInterpretation(pool, current.id);
+      }
+      const completed = new Set(results.flatMap((result) => result.completedExperimentIds).map((id) => parseWire(id, "exp")));
+      let experimentsRemoved = 0;
+      for (const id of completed) experimentsRemoved += this.store.deleteExperiment(pool, id);
+      if (interpretationsChanged) this.store.bumpInterpretationRevision(pool);
+      if (experimentsRemoved) this.store.bumpExperimentRevision(pool);
+      return { interpretationsChanged, experimentsRemoved, superseded };
+    });
+    this.diagnostics.event({ type: "contemplation-maintenance", pool, characterId, requests: results.length, actions: results.map((r) => ({ id: r.interpretation.id, action: r.action, completed: r.completedExperimentIds })), ...outcome });
+    return outcome;
+  }
+
+  async runGeneration(rt, characterId) {
+    const pool = rt.pool;
+    this.setStage(rt, "generation_retrieval", characterId);
+    const conversation = this.conversation(characterId);
+    const memory = await this.retrieveMemory(characterId, conversation);
+    this.setStage(rt, "generation", characterId);
+    const interpretations = this.interpretationViews(pool);
+    const base = { interpretations, conversation, memory };
+    let feedback = null;
+    let candidate = null;
+    for (let attempt = 1; attempt <= 2 && !candidate; attempt += 1) {
+      const payload = { ...base, ...(feedback ? { previousCandidateRejected: feedback } : {}), requiredResponseShape: { decision: "add", text: "..." } };
+      const { value } = await this.llm.structured({ purpose: "contemplation_generation", messages: [{ role: "system", content: generationSystemPrompt() }, { role: "user", content: JSON.stringify(payload) }],
+        validate: validateGeneration, context: { characterId, pool } });
+      if (value.decision === "decline") break;
+      this.setStage(rt, "generation_review", characterId);
+      const { value: review } = await this.llm.structured({ purpose: "contemplation_generation_review",
+        messages: [{ role: "system", content: generationReviewSystemPrompt() }, { role: "user", content: JSON.stringify({ existingInterpretations: interpretations, candidate: value.text, conversation, memory, requiredResponseShape: { accept: true, problem: null } }) }],
+        validate: validateGenerationReview, context: { characterId, pool } });
+      if (review.accept) candidate = value.text;
+      else feedback = { text: value.text, problem: review.problem || "not distinct or not compatible with the facts" };
+    }
+    if (!candidate) {
+      this.diagnostics.event({ type: "contemplation-generation", pool, characterId, status: "declined", rejected: feedback });
+      return { status: "declined" };
+    }
+    const character = this.store.getCharacter(characterId);
+    const id = this.store.tx(() => {
+      const inserted = this.store.insertInterpretation(pool, candidate, { source: "generation", characterId, characterName: character.name });
+      this.store.bumpInterpretationRevision(pool);
+      return inserted;
+    });
+    this.diagnostics.event({ type: "contemplation-generation", pool, characterId, status: "added", interpretationId: id });
+    return { status: "added", id };
+  }
+
+  // Experiment planning sees only the interpretation pool and the active experiments. It runs once against the
+  // final committed pool after maintenance/generation; a result computed from an outdated revision is discarded.
+  async planIfNeeded(rt, { force = false }) {
+    const pool = rt.pool;
+    if (!force && !this.store.ensureInterpretationPool(pool).planningNeeded) return { status: "not_needed" };
+    for (let attempt = 1; attempt <= PLANNING_STALE_RETRIES; attempt += 1) {
+      this.setStage(rt, "experiment_planning");
+      const state = this.store.ensureInterpretationPool(pool);
+      const interpretations = this.interpretationViews(pool);
+      const experiments = this.experimentViews(pool);
+      const experimentIds = new Set(experiments.map((entry) => entry.id));
+      const { value } = await this.llm.structured({ purpose: "contemplation_experiment_planning",
+        messages: [{ role: "system", content: experimentPlanningSystemPrompt() }, { role: "user", content: JSON.stringify({ interpretations, activeExperiments: experiments, requiredResponseShape: { experiments: [{ id: null, text: "..." }] } }) }],
+        validate: (raw) => validatePlanning(raw, experimentIds), context: { pool } });
+      const committed = this.store.tx(() => {
+        const now = this.store.ensureInterpretationPool(pool);
+        if (now.interpretationRevision !== state.interpretationRevision || now.experimentRevision !== state.experimentRevision) return false;
+        const keep = new Set(value.filter((entry) => entry.id).map((entry) => parseWire(entry.id, "exp")));
+        for (const existing of this.store.experiments(pool)) if (!keep.has(existing.id)) this.store.deleteExperiment(pool, existing.id);
+        for (const entry of value) {
+          if (entry.id) this.store.updateExperiment(pool, parseWire(entry.id, "exp"), entry.text);
+          else this.store.insertExperiment(pool, entry.text);
+        }
+        this.store.bumpExperimentRevision(pool);
+        this.store.setPlanningNeeded(pool, false);
+        return true;
+      });
+      this.diagnostics.event({ type: "contemplation-experiment-planning", pool, attempt, status: committed ? "committed" : "stale", count: value.length });
+      if (committed) return { status: "committed", count: value.length };
+      if (!force && !this.store.ensureInterpretationPool(pool).planningNeeded) return { status: "superseded" };
+    }
+    throw coded("EXPERIMENT_PLANNING_STALE", "Experiment planning stayed stale after repeated pool changes; it will run again on the next change.");
+  }
+
+  // ---- manual edits (atomic, revision-bumping; interpretation edits trigger one experiment review) -------------
+
+  addInterpretation(pool, text, characterId = null) {
+    const clean = checkText(text, INTERPRETATION_MAX_CHARS, "Interpretation");
+    const character = characterId ? this.store.getCharacter(characterId) : null;
+    const id = this.store.tx(() => {
+      const inserted = this.store.insertInterpretation(pool, clean, { source: "manual", characterId: character?.id ?? null, characterName: character?.name ?? null });
+      this.store.bumpInterpretationRevision(pool);
+      return inserted;
+    });
+    this.afterManualInterpretationChange(pool);
+    return id;
+  }
+
+  editInterpretation(pool, id, text) {
+    const clean = checkText(text, INTERPRETATION_MAX_CHARS, "Interpretation");
+    const changed = this.store.tx(() => {
+      const count = this.store.updateInterpretation(pool, id, clean);
+      if (count) this.store.bumpInterpretationRevision(pool);
+      return count;
+    });
+    if (!changed) throw coded("NOT_FOUND", "Interpretation not found in this pool.");
+    this.afterManualInterpretationChange(pool);
+  }
+
+  deleteInterpretation(pool, id) {
+    const changed = this.store.tx(() => {
+      const count = this.store.deleteInterpretation(pool, id);
+      if (count) this.store.bumpInterpretationRevision(pool);
+      return count;
+    });
+    if (!changed) throw coded("NOT_FOUND", "Interpretation not found in this pool.");
+    this.afterManualInterpretationChange(pool);
+  }
+
+  afterManualInterpretationChange(pool) {
+    if (!this.enabled()) return;
+    this.runtime(pool).planningRequested = true;
+    clearTimeout(this.planningTimers.get(pool));
+    const handle = setTimeout(() => { this.planningTimers.delete(pool); this.kick(pool); }, this.planningDebounceMs);
+    handle.unref?.();
+    this.planningTimers.set(pool, handle);
+  }
+
+  // Manual experiment edits never trigger a contemplation cycle.
+  addExperiment(pool, text) {
+    const clean = checkText(text, EXPERIMENT_MAX_CHARS, "Experiment");
+    return this.store.tx(() => { const id = this.store.insertExperiment(pool, clean); this.store.bumpExperimentRevision(pool); return id; });
+  }
+
+  editExperiment(pool, id, text) {
+    const clean = checkText(text, EXPERIMENT_MAX_CHARS, "Experiment");
+    const changed = this.store.tx(() => { const count = this.store.updateExperiment(pool, id, clean); if (count) this.store.bumpExperimentRevision(pool); return count; });
+    if (!changed) throw coded("NOT_FOUND", "Experiment not found in this pool.");
+  }
+
+  deleteExperiment(pool, id) {
+    const changed = this.store.tx(() => { const count = this.store.deleteExperiment(pool, id); if (count) this.store.bumpExperimentRevision(pool); return count; });
+    if (!changed) throw coded("NOT_FOUND", "Experiment not found in this pool.");
+  }
+
+  // ---- status -------------------------------------------------------------------------------------------------
+
+  status(pool = null) {
+    const view = (rt) => ({
+      pool: rt.pool, running: rt.running, stage: rt.stage, stageCharacterId: rt.stageCharacterId, parallel: { ...rt.parallel },
+      queued: { pendingCharacterIds: [...rt.pendingCharacters], forced: rt.forced.map((op) => op.kind), planningRequested: rt.planningRequested || this.store.ensureInterpretationPool(rt.pool).planningNeeded },
+      lastError: rt.lastError ? { at: rt.lastError.at, stage: rt.lastError.stage, code: rt.lastError.code, message: rt.lastError.message } : null,
+      lastCycle: rt.lastCycle, cycles: rt.cycles
+    });
+    if (pool) return view(this.runtime(pool));
+    return [...this.pools.values()].map(view);
+  }
+}
+
+function checkText(text, max, label) {
+  if (typeof text !== "string" || !text.trim()) throw coded("TEXT_INVALID", `${label} text must not be empty.`);
+  if (text.trim().length > max) throw coded("TEXT_INVALID", `${label} text must be at most ${max} characters.`);
+  return text.trim();
+}
+

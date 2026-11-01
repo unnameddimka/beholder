@@ -1,0 +1,15 @@
+{
+  "name": "beholder",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local single-user AI roleplay companion PoC with an independent Contemplation process (Specification 0000).",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "check": "node scripts/check-syntax.js",
+    "test": "node scripts/check-syntax.js && node --test \"tests/*.test.js\""
+  }
+}
