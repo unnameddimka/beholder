@@ -46,21 +46,23 @@ SQLite (`data/beholder.sqlite`) and generated images (`data/images/`) survive co
 ## Testing Contemplation by hand
 
 1. Create a character and chat for a few messages. After each user message the header shows activity, and the
-   Contemplation model runs a cheap prefetch.
+   Contemplation model runs a cheap prefetch. It sees the interpretations, the last 100 messages and the active
+   experiments (never consolidated memory), and requests maintenance when an interpretation needs revisiting or an
+   experiment appears to have produced a result.
 2. Open **Contemplation** (from the chat header). It shows the current stage, the number of parallel maintenance
    requests, queued work, the last cycle's flags, and errors.
 3. Use **Force Generation** to get a first interpretation. An interpretation change triggers one experiment review, so
    active experiments appear shortly after.
 4. Keep chatting. The dialogue model receives the active experiments as private, optional intentions.
    **Force Maintenance** revises every interpretation against the recent evidence, one parallel request each, and can
-   retire experiments that have reached a result.
+   retire experiments that have reached a result. **Force Experimentation** runs one experiment review now.
 5. You can add, edit, or delete interpretations and experiments by hand. Interpretation edits trigger one experiment
    review. Experiment edits trigger nothing.
 6. To compare behavior, untick **Enable Contemplation** in Settings. Automatic contemplation stops and experiments are
    no longer sent to dialogue. Stored state and the Force actions remain.
 
-**Emergency Dump** (the red button, always in the header) downloads a sanitized ZIP of state and diagnostics. It works
-while the server is busy and never changes state.
+**Emergency Dump** (the red **Dump** button, always in the header) downloads a sanitized ZIP of state and diagnostics.
+It works while the server is busy and never changes state.
 
 ## Checks and tests
 
@@ -89,19 +91,23 @@ follow-up timers and races; asynchronous images; bounded retries; and HTTP safet
 - **Stack:** Node.js 24, plain `node:http`, built-in `node:sqlite` (`DatabaseSync`, WAL), vanilla JS frontend. No npm
   dependencies.
 - **Model selection:** curated defaults from Society's model list plus the live OpenRouter catalogue as suggestions.
-  Any model id is accepted. The temperature override is sent only when enabled and when the catalogue lists
-  `temperature` for the model. `max_tokens` is clamped to the catalogue's maximum completion tokens. No reasoning
-  controls are sent, so reasoning tokens count against `max_tokens`. A truncated output gets one compact retry.
+  Any model id is accepted. The temperature override is sent only when enabled, and is left out when the catalogue
+  lists the model without `temperature` (an uncatalogued model receives it). `max_tokens` is clamped to the
+  catalogue's maximum completion tokens. No reasoning controls are sent, so reasoning tokens count against
+  `max_tokens`. A truncated output gets one compact retry.
 - **Transport reliability:** 3 attempts per request for timeouts, network errors, 429 (honoring `Retry-After`, capped at
   30 s), 5xx, and empty or provider-error completions, with exponential backoff. 401 is never retried. The model is
   never switched.
-- **Structured output:** every structured purpose is parsed and validated. For Dialogue replies, OpenRouter
-  receives a strict JSON schema when the model catalogue advertises structured outputs, or JSON-object mode if only
-  `response_format` is supported. Such requests require a provider that honours the parameter; unsupported or
-  uncatalogued models keep prompt-only enforcement. A non-empty plain-text Dialogue reply is locally wrapped in the
-  envelope (with no follow-up or image request) without an extra model call. Broken JSON and invalid field types still
-  get up to 2 bounded LLM repairs, but Dialogue repairs see only the invalid output and format instructions, never
-  the full chat transcript. Invalid output is never committed.
+- **Structured output:** every structured purpose is parsed and validated. Invalid output gets up to 2 LLM repairs and
+  is never committed. Dialogue replies, follow-ups, and openers differ in three ways:
+  - OpenRouter receives a strict JSON schema when the catalogue lists `structured_outputs` for the Dialogue model, or
+    JSON-object mode when it lists only `response_format`. Such requests set `require_parameters`, so only providers
+    that honor the format are used. If the model is uncatalogued or the catalogue is unavailable, the format is
+    enforced by the prompt alone.
+  - A non-empty plain-text answer (one that does not start with `{`, `[`, or a backtick) is wrapped locally as the
+    message, with no follow-up or image request, and costs no extra model call. This also applies to a repair answer.
+  - A repair request contains only the invalid output, the validation errors, and the format instructions, never the
+    chat transcript.
 - **Memory retrieval:** Society's semantic selector runs before every dialogue reply when the memory pool is not empty
   (Dialogue model; limits: 12 STM, 8 LTM). Contemplation runs it with the Contemplation model. Divergence from
   Society: if the selector fails after retries, Beholder falls back to importance ranking (recorded in diagnostics)
@@ -125,17 +131,17 @@ follow-up timers and races; asynchronous images; bounded retries; and HTTP safet
   Generation is reviewed by a second Contemplation-model call (distinct and compatible?), with one retry using the
   reviewer's feedback, otherwise it declines. The candidate commits only if the interpretation pool revision is
   unchanged since the snapshot. If it changed, the candidate is re-reviewed against the current pool (at most twice)
-  and discarded if rejected. Experiment planning commits only
-  when neither the interpretation revision nor the experiment revision changed during the request. Otherwise it reruns
-  (up to 3 times). Manual interpretation edits are debounced by 200 ms so quick edits produce one review.
+  and discarded if rejected. Experiment planning commits only when neither the interpretation revision nor the
+  experiment revision changed during the request. Otherwise it reruns (up to 3 times). Manual interpretation edits are
+  debounced by 200 ms so quick edits produce one review.
   A per-(pool, chat) watermark of the last processed user message is persisted. It advances only after a successful
   cycle, so restarts and failures re-evaluate unprocessed evidence.
 - **Follow-ups:** presence is a 5-second heartbeat with a 20-second TTL plus a `sendBeacon` on page close. A hidden
   tab counts as away. The opener timer starts whenever an empty chat is opened. A canceled follow-up is never
   reinstated. Autonomous messages are discarded at commit if anything changed in the chat.
-- **Images:** the OpenRouter Images API as in Society. Only options that every endpoint advertises are sent (`n`,
-  `aspect_ratio: 1:1`, `quality: medium`, `output_format: webp`). Inline base64, data URIs, and temporary https URLs
-  are accepted. A temporary URL is downloaded at once: https on the default port only, no credentials, no redirects,
+- **Images:** the OpenRouter Images API as in Society. Only options that every endpoint advertises are sent (`n: 1`,
+  `aspect_ratio: 1:1`, `quality: medium`, `output_format: webp`, `stream: false`). Inline base64, data URIs, and
+  temporary https URLs are accepted. A temporary URL is downloaded at once: https on the default port only, no credentials, no redirects,
   and the host must not be local or resolve to a loopback, private, link-local, CGNAT, or other internal address. The
   body is read as a stream and aborted past the limit. PNG, JPEG, and WebP only, at most 16 MiB, signature checked. No
   re-encoding (Society's `sharp` normalization is omitted to stay dependency-free). Pending images resume after a
@@ -150,10 +156,6 @@ follow-up timers and races; asynchronous images; bounded retries; and HTTP safet
 - Because the key exists only in memory, model-backed background work after a restart (missed STM→LTM catch-up,
   contemplation recovery, pending images) starts when the key is entered, not at process start.
 - No live-provider evaluation has been run. Prompt quality is untested against real models.
-- Prefetch receives only the interpretations and recent messages, as spec 0000 defines, not the active experiments.
-  Its detection that an experiment has produced a result is therefore heuristic and may be missed; maintenance (which
-  does see the experiments) and Force Maintenance still retire completed experiments. Accepted by the owner in
-  review 0000 (SPEC-1).
 - The image URL check resolves DNS before the download; a DNS answer that changes between the check and the fetch is
   not defended against.
 - The browser UI has no automated tests; the navigation guard (review P2-2) is covered only by code review.
