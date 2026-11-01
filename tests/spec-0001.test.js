@@ -391,7 +391,10 @@ test("review 0001 P1: bracketed or backtick-led RP prose is accepted verbatim wi
 });
 
 test("review 0001 P1: malformed JSON arrays and code-fenced envelopes still go to repair", async () => {
-  const broken = ['[{"message": "half"', "\x60\x60\x60json\n{\"message\": \"half\"", 'Here: {"message": "half", "imageRequest": '];
+  const broken = ['[{"message": "half"', "\x60\x60\x60json\n{\"message\": \"half\"", 'Here: {"message": "half", "imageRequest": ',
+    // Re-review 0001: unbraced envelope fragments, bare and inside a json fence.
+    '"message": "Hello there", "followUpDelaySeconds": null, "imageRequest": null',
+    "\x60\x60\x60json\n\"message\": \"Hello there\", \"imageRequest\": null\n\x60\x60\x60"];
   let index = 0;
   const { app, mock } = await makeApp({ dialogue_reply: (body) => body.messages[0].content.startsWith("Repair only") ? reply(`Fixed ${index}.`) : broken[index], contemplation_prefetch: quietPrefetch });
   try {
@@ -401,7 +404,12 @@ test("review 0001 P1: malformed JSON arrays and code-fenced envelopes still go t
       app.dialogue.send(mira.id, `try ${index}`);
       await waitFor(() => lastCharacterText(app, mira.id) === `Fixed ${index}.`, { message: broken[index] });
       assert.equal(mock.byPurpose("dialogue_reply").length, before + 2, "original plus one isolated repair");
+      const repair = mock.byPurpose("dialogue_reply").at(-1).body.messages;
+      assert.deepEqual(repair.map((message) => message.role), ["system", "user"]);
+      assert.ok(repair[1].content.includes(broken[index]), "the repair sees the invalid output");
+      assert.doesNotMatch(JSON.stringify(repair), /try \d/, "the repair sees no chat history");
     }
+    assert.ok(app.store.transcript(mira.id).every((message) => !message.text.includes("followUpDelaySeconds")), "no raw envelope reaches the chat");
     assert.equal(app.diagnostics.events.some((entry) => entry.type === "dialogue-plain-text-normalized"), false);
   } finally { closeApp(app); }
 });

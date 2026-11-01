@@ -112,9 +112,10 @@ DST, and the UTC fallback).
   - A non-empty plain-text answer is accepted as the message as written, with no follow-up or image request, and costs
     no extra model call. A diagnostic event records it. This applies only to a complete answer generated from the full
     context (including the retry after a truncated output), never to a repair answer. Only an actual attempt at the
-    envelope goes to repair: text starting with `{`, with `[` followed by `{`, `[`, `"`, or `]`, or with a code fence
-    opening a JSON value, or containing an object literal with an envelope field. Prose such as
-    `[laughs softly] ...` is accepted as written.
+    envelope goes to repair: a code fence tagged `json`, or text (after any opening fence) starting with `{`, with `[`
+    followed by `{`, `[`, `"`, or `]`, with a `"message"` key and a string value, or with a `"followUpDelaySeconds"`
+    or `"imageRequest"` key, or containing an object literal with an envelope field. Prose such as
+    `[laughs softly] ...` or a sentence that quotes a field name is accepted as written.
   - A repair request contains only the invalid output, the validation errors, and the format instructions, never the
     chat transcript, self-description, memories, or experiments.
 - **Time awareness (spec 0001):** every Dialogue request (reply, Retry, follow-up, opener) states the current time,

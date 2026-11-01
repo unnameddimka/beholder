@@ -157,13 +157,16 @@ export class LlmClient {
   }
 }
 
-// An actual attempt at the envelope: a JSON object, a JSON array ("[" followed by "{", "[", a quote or "]"), a code
-// fence opening a JSON value, or an object literal with an envelope field. Prose such as "[laughs softly] ..." or a
-// sentence that merely quotes a field name is not an attempt.
+// An actual attempt at the envelope: a code fence tagged json, or (after any opening fence) a JSON object, a JSON
+// array ("[" followed by "{", "[", a quote or "]"), an unbraced envelope fragment (a leading "message" key with a
+// string value, or a leading "followUpDelaySeconds"/"imageRequest" key), or an object literal with an envelope field
+// anywhere. Prose such as "[laughs softly] ..." or a sentence that merely quotes a field name is not an attempt.
 export function looksLikeAttemptedJson(content) {
   const text = String(content || "").trim();
-  return !text || /^\{/.test(text) || /^\[\s*[{\["\]]/.test(text) || /^\x60{3}[A-Za-z]*\s*[{\[]/.test(text)
-    || /\{\s*"(message|followUpDelaySeconds|imageRequest)"\s*:/.test(text);
+  if (!text || /^\x60{3}\s*json\b/i.test(text)) return true;
+  const body = text.replace(/^\x60{3}[A-Za-z]*\s*/, "");
+  return /^\{/.test(body) || /^\[\s*[{\["\]]/.test(body) || /^"message"\s*:\s*"/.test(body)
+    || /^"(followUpDelaySeconds|imageRequest)"\s*:/.test(body) || /\{\s*"(message|followUpDelaySeconds|imageRequest)"\s*:/.test(text);
 }
 
 function dialogueResponseFormat(mode) {
