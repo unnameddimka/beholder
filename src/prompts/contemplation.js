@@ -4,7 +4,6 @@
 
 export const INTERPRETATION_MAX_CHARS = 4000;
 export const EXPERIMENT_MAX_CHARS = 1000;
-export const EXPERIMENTS_MAX = 50;
 
 const ROLE = [
   "You are part of the private Contemplation process behind a roleplay chat character. The human chatting with the character is called the user.",
@@ -71,6 +70,6 @@ export function experimentPlanningSystemPrompt() {
     "Experiments are intentions, not scripted questions and not dialogue lines. Good examples: explore whether the user appreciates unexpected tenderness; test how they respond to an absurd story; explore a contrast between two interpretations; show an image and observe the reaction.",
     "Prefer experiments that could tell interpretations apart, enrich a thin one, or check a speculative one; respect the user's dignity and never aim to manipulate or pressure them.",
     "Return the entire replacement list. Keep an existing experiment by repeating its id (with the same or edited text); drop experiments that are completed, obsolete, or no longer useful; add new ones with id null. There is no required count; an empty list is valid.",
-    `Return exactly {"experiments": [{"id": <supplied experiment id or null>, "text": <intention prose>}]}. Each text is at most ${EXPERIMENT_MAX_CHARS} characters; at most ${EXPERIMENTS_MAX} experiments. Return one JSON object only.`
+    `Return exactly {"experiments": [{"id": <supplied experiment id or null>, "text": <intention prose>}]}. Each text is at most ${EXPERIMENT_MAX_CHARS} characters. Return one JSON object only.`
   ].join(" ");
 }

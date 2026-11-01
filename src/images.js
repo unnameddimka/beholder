@@ -6,6 +6,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
+import net from "node:net";
+import dns from "node:dns/promises";
 import { coded, nowIso, sleep } from "./utils.js";
 import { sanitize } from "./sanitize.js";
 
@@ -96,19 +98,84 @@ async function timedFetch(fetchImpl, url, init, timeoutMs) {
   finally { clearTimeout(timer); }
 }
 
-// Temporary provider URLs are downloaded immediately, https only, with a byte ceiling; no redirects are followed.
-async function downloadImage(fetchImpl, url) {
-  const response = await timedFetch(fetchImpl, url, { redirect: "error", headers: { Accept: "image/png,image/jpeg,image/webp" } }, DOWNLOAD_TIMEOUT_MS);
-  if (!response.ok) throw coded("IMAGE_DOWNLOAD_FAILED", `Image download HTTP ${response.status}.`);
-  const length = Number(response.headers?.get?.("content-length"));
-  if (Number.isFinite(length) && length > IMAGE_MAX_BYTES) throw coded("IMAGE_TOO_LARGE", "Image exceeds the size limit.");
-  const bytes = Buffer.from(await response.arrayBuffer());
-  const type = response.headers?.get?.("content-type");
-  return { bytes, declared: type ? [type.split(";")[0]] : [] };
+// Destinations a provider-returned URL may never point at: loopback, private, link-local, CGNAT, unspecified,
+// multicast/reserved, and their IPv6 counterparts (including IPv4-mapped addresses).
+const BLOCKED_ADDRESSES = (() => {
+  const list = new net.BlockList();
+  for (const [prefix, bits] of [["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8], ["169.254.0.0", 16], ["172.16.0.0", 12], ["192.0.0.0", 24],
+    ["192.168.0.0", 16], ["198.18.0.0", 15], ["224.0.0.0", 3]]) list.addSubnet(prefix, bits, "ipv4");
+  for (const [prefix, bits] of [["::", 128], ["::1", 128], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8]]) list.addSubnet(prefix, bits, "ipv6");
+  return list;
+})();
+
+export function isBlockedAddress(address) {
+  const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address);
+  if (mapped) return BLOCKED_ADDRESSES.check(mapped[1], "ipv4");
+  const family = net.isIPv4(address) ? "ipv4" : net.isIPv6(address) ? "ipv6" : null;
+  return family === null || BLOCKED_ADDRESSES.check(address, family);
+}
+
+// Only public https hosts on the default port. The hostname is resolved first and refused if any address is internal.
+// (A DNS answer that changes between this check and the fetch is not defended against; acceptable for a LAN PoC.)
+export async function checkDownloadUrl(url, lookupImpl = dns.lookup) {
+  let parsed;
+  try { parsed = new URL(url); } catch { throw coded("IMAGE_URL_REFUSED", "Image URL is not a valid URL."); }
+  if (parsed.protocol !== "https:" || (parsed.port && parsed.port !== "443") || parsed.username || parsed.password) throw coded("IMAGE_URL_REFUSED", "Image URL must be a plain https URL.");
+  const host = parsed.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+  if (!host || host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local") || host.endsWith(".internal")) throw coded("IMAGE_URL_REFUSED", "Image URL points at a local host.");
+  if (net.isIP(host)) {
+    if (isBlockedAddress(host)) throw coded("IMAGE_URL_REFUSED", "Image URL points at an internal address.");
+    return;
+  }
+  let addresses;
+  try { addresses = await lookupImpl(host, { all: true, verbatim: true }); } catch { throw coded("IMAGE_DOWNLOAD_FAILED", "Image URL host could not be resolved."); }
+  if (!addresses.length || addresses.some((entry) => isBlockedAddress(entry.address))) throw coded("IMAGE_URL_REFUSED", "Image URL resolves to an internal address.");
+}
+
+// Temporary provider URLs are downloaded immediately: destination policy first, no redirects, and the body is read
+// as a stream that is aborted as soon as it exceeds the byte ceiling (Content-Length is not trusted). The timeout
+// covers the whole download, including the body.
+async function downloadImage(fetchImpl, url, lookupImpl) {
+  await checkDownloadUrl(url, lookupImpl);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), DOWNLOAD_TIMEOUT_MS);
+  try {
+    let response;
+    try { response = await fetchImpl(url, { redirect: "error", headers: { Accept: "image/png,image/jpeg,image/webp" }, signal: controller.signal }); }
+    catch (cause) { throw coded(controller.signal.aborted ? "IMAGE_TIMEOUT" : "IMAGE_NETWORK_ERROR", controller.signal.aborted ? "Image download timed out." : String(cause?.message || cause)); }
+    if (!response.ok) throw coded("IMAGE_DOWNLOAD_FAILED", `Image download HTTP ${response.status}.`);
+    const length = Number(response.headers?.get?.("content-length"));
+    if (Number.isFinite(length) && length > IMAGE_MAX_BYTES) throw coded("IMAGE_TOO_LARGE", "Image exceeds the size limit.");
+    if (!response.body) throw coded("IMAGE_DOWNLOAD_FAILED", "Image download returned no body.");
+    const chunks = [];
+    let size = 0;
+    const reader = response.body.getReader();
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        size += value.byteLength;
+        if (size > IMAGE_MAX_BYTES) {
+          controller.abort();
+          throw coded("IMAGE_TOO_LARGE", "Image exceeds the size limit.");
+        }
+        chunks.push(Buffer.from(value));
+      }
+    } catch (error) {
+      if (error.code) throw error;
+      throw coded(controller.signal.aborted ? "IMAGE_TIMEOUT" : "IMAGE_NETWORK_ERROR", controller.signal.aborted ? "Image download timed out." : String(error?.message || error));
+    } finally {
+      reader.releaseLock?.();
+    }
+    const type = response.headers?.get?.("content-type");
+    return { bytes: Buffer.concat(chunks), declared: type ? [type.split(";")[0]] : [] };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export class ImageService {
-  constructor({ store, settings, key, diagnostics, fetchImpl = fetch, imagesDir, backoffMs = 2000 }) {
+  constructor({ store, settings, key, diagnostics, fetchImpl = fetch, imagesDir, backoffMs = 2000, lookupImpl = dns.lookup }) {
     this.store = store;
     this.settings = settings;
     this.key = key;
@@ -116,6 +183,7 @@ export class ImageService {
     this.fetchImpl = fetchImpl;
     this.imagesDir = imagesDir;
     this.backoffMs = backoffMs;
+    this.lookupImpl = lookupImpl;
     this.inFlight = new Map();
     this.capabilities = new Map();
     this.generations = [];
@@ -187,7 +255,7 @@ export class ImageService {
           throw coded(response.status === 401 ? "AUTHENTICATION_FAILED" : retryable ? "IMAGE_PROVIDER_RETRYABLE" : "IMAGE_PROVIDER_ERROR", `Image provider HTTP ${response.status}: ${String(body?.error?.message || "").slice(0, 300)}`, { retryable });
         }
         const candidate = parseImageResponse(body);
-        const fetched = candidate.url ? await downloadImage(this.fetchImpl, candidate.url) : { bytes: decodeCanonicalBase64(candidate.base64), declared: candidate.declared };
+        const fetched = candidate.url ? await downloadImage(this.fetchImpl, candidate.url, this.lookupImpl) : { bytes: decodeCanonicalBase64(candidate.base64), declared: candidate.declared };
         const { bytes, mime } = verifiedRaster(fetched.bytes, [...candidate.declared, ...(fetched.declared || [])]);
         const file = `${crypto.randomBytes(16).toString("hex")}.${MIME_EXT[mime]}`;
         await fs.mkdir(this.imagesDir, { recursive: true });

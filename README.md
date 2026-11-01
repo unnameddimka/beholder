@@ -115,8 +115,12 @@ follow-up timers and races; asynchronous images; bounded retries; and HTTP safet
   keeps the remaining STM for the retry (15-minute backoff). Every STM present when the boundary runs is consolidated.
 - **Contemplation:** one serial pipeline per interpretation pool. Maintenance requests within a batch run in parallel
   (up to 16 at once). The batch applies all-or-nothing. A result for an interpretation that was edited by hand in the
-  meantime is skipped as superseded. Generation is reviewed by a second Contemplation-model call (distinct and
-  compatible?), with one retry using the reviewer's feedback, otherwise it declines. Experiment planning commits only
+  meantime is skipped as superseded, including the experiment completions it reported. A completion retires an
+  experiment only if its text is still exactly what the model examined, so a manual experiment edit is never lost.
+  Generation is reviewed by a second Contemplation-model call (distinct and compatible?), with one retry using the
+  reviewer's feedback, otherwise it declines. The candidate commits only if the interpretation pool revision is
+  unchanged since the snapshot. If it changed, the candidate is re-reviewed against the current pool (at most twice)
+  and discarded if rejected. Experiment planning commits only
   when neither the interpretation revision nor the experiment revision changed during the request. Otherwise it reruns
   (up to 3 times). Manual interpretation edits are debounced by 200 ms so quick edits produce one review.
   A per-(pool, chat) watermark of the last processed user message is persisted. It advances only after a successful
@@ -126,16 +130,28 @@ follow-up timers and races; asynchronous images; bounded retries; and HTTP safet
   reinstated. Autonomous messages are discarded at commit if anything changed in the chat.
 - **Images:** the OpenRouter Images API as in Society. Only options that every endpoint advertises are sent (`n`,
   `aspect_ratio: 1:1`, `quality: medium`, `output_format: webp`). Inline base64, data URIs, and temporary https URLs
-  (downloaded at once, no redirects) are accepted. PNG, JPEG, and WebP only, at most 16 MiB, signature checked. No
+  are accepted. A temporary URL is downloaded at once: https on the default port only, no credentials, no redirects,
+  and the host must not be local or resolve to a loopback, private, link-local, CGNAT, or other internal address. The
+  body is read as a stream and aborted past the limit. PNG, JPEG, and WebP only, at most 16 MiB, signature checked. No
   re-encoding (Society's `sharp` normalization is omitted to stay dependency-free). Pending images resume after a
   restart once the key is entered.
-- **Limits:** request bodies 256 KiB; messages 20,000 characters; interpretations 4,000; experiments 1,000 (at most 50).
+- **Limits:** request bodies 256 KiB; messages 20,000 characters; interpretations 4,000; each experiment 1,000. There is
+  no limit on the number of experiments (spec 5.4); an oversized planning request fails visibly rather than truncating.
+- **Browser navigation:** each navigation renders into its own root, guarded by an epoch counter, so a slow response
+  from an earlier route can never mount over the current one. Leaving a chat reports presence immediately.
 
 ## Known limitations
 
 - Because the key exists only in memory, model-backed background work after a restart (missed STM→LTM catch-up,
   contemplation recovery, pending images) starts when the key is entered, not at process start.
 - No live-provider evaluation has been run. Prompt quality is untested against real models.
+- Prefetch receives only the interpretations and recent messages, as spec 0000 defines, not the active experiments.
+  Its detection that an experiment has produced a result is therefore heuristic and may be missed; maintenance (which
+  does see the experiments) and Force Maintenance still retire completed experiments. Accepted by the owner in
+  review 0000 (SPEC-1).
+- The image URL check resolves DNS before the download; a DNS answer that changes between the check and the fetch is
+  not defended against.
+- The browser UI has no automated tests; the navigation guard (review P2-2) is covered only by code review.
 - The Emergency Dump ZIP is uncompressed (Society's stored-ZIP writer) and does not include image bytes.
 
 ## Society sources reused

@@ -46,10 +46,13 @@ export function mockOpenRouter(handlers = {}, { images = null, extra = null } = 
   return { fetchImpl, calls, byPurpose: (purpose) => calls.filter((entry) => entry.purpose === purpose) };
 }
 
+// Image download hosts resolve to a public documentation address unless a test overrides dnsLookup.
+export const publicDns = async () => [{ address: "93.184.216.34", family: 4 }];
+
 export async function makeApp(handlers = {}, options = {}) {
   const dataDir = options.dataDir || tempDir();
   const mock = options.mock || mockOpenRouter(handlers, options);
-  const app = new BeholderApp({ dataDir, fetchImpl: mock.fetchImpl, timeScaleMs: 1, backoffMs: 1, presenceTtlMs: 60_000, rootDir: ROOT, ...options.appOptions });
+  const app = new BeholderApp({ dataDir, fetchImpl: mock.fetchImpl, timeScaleMs: 1, backoffMs: 1, presenceTtlMs: 60_000, rootDir: ROOT, dnsLookup: publicDns, ...options.appOptions });
   if (options.key !== false) await app.setApiKey(TEST_KEY);
   return { app, mock, dataDir };
 }

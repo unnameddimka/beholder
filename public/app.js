@@ -123,25 +123,44 @@ function parseRoute() {
   return { kind: "home" };
 }
 
+// Each navigation renders into its own root. A slower, superseded navigation keeps writing only into its detached
+// root and never becomes the current view, so a late response cannot mount the wrong chat.
+let routeEpoch = 0;
+
+function setTitle(root, text) { if (root === els.root) els.title.textContent = text; }
+
 async function route() {
+  const epoch = ++routeEpoch;
   state.view?.dispose?.();
   state.view = null;
-  els.view.replaceChildren();
+  // Tell the server immediately that the previous chat is no longer open (cancels its follow-up timer).
+  sendPresence();
+  const root = h("div", { className: "view-root" });
+  els.root = root;
+  els.view.replaceChildren(root);
   const target = parseRoute();
   els.back.classList.toggle("hidden", target.kind === "home");
+  let view = null;
   try {
-    state.status = await api("/api/status");
-    if (!state.status.apiKeyConfigured) return renderKeyGate();
-    state.characters = await api("/api/characters");
-    if (target.kind === "home") state.view = renderHome();
-    else if (target.kind === "new") state.view = renderEditor(null);
-    else if (target.kind === "edit") state.view = renderEditor(target.characterId);
-    else if (target.kind === "chat") state.view = await renderChat(target.characterId);
-    else if (target.kind === "contemplation") state.view = await renderContemplation(target.characterId);
-    else if (target.kind === "settings") state.view = await renderSettings();
+    const status = await api("/api/status");
+    if (epoch !== routeEpoch) return;
+    state.status = status;
+    if (!state.status.apiKeyConfigured) { renderKeyGate(); return; }
+    const characters = await api("/api/characters");
+    if (epoch !== routeEpoch) return;
+    state.characters = characters;
+    if (target.kind === "home") view = renderHome();
+    else if (target.kind === "new") view = renderEditor(null);
+    else if (target.kind === "edit") view = renderEditor(target.characterId);
+    else if (target.kind === "chat") view = await renderChat(target.characterId);
+    else if (target.kind === "contemplation") view = await renderContemplation(target.characterId);
+    else if (target.kind === "settings") view = await renderSettings();
   } catch (error) {
-    els.view.append(h("div", { className: "card" }, h("h2", { text: "Something went wrong" }), h("p", { className: "muted", text: error.message }), h("a", { href: "#/", text: "Back to characters" })));
+    if (epoch !== routeEpoch) return;
+    root.append(h("div", { className: "card" }, h("h2", { text: "Something went wrong" }), h("p", { className: "muted", text: error.message }), h("a", { href: "#/", text: "Back to characters" })));
   }
+  if (epoch !== routeEpoch) { view?.dispose?.(); return; }
+  state.view = view;
   sendPresence();
 }
 
@@ -155,7 +174,8 @@ window.addEventListener("hashchange", route);
 // ---- key gate ------------------------------------------------------------------------------------------------
 
 function renderKeyGate() {
-  els.title.textContent = "API key";
+  const root = els.root;
+  setTitle(root, "API key");
   const input = h("input", { type: "password", autocomplete: "off", placeholder: "sk-or-v1-...", "aria-label": "OpenRouter API key" });
   const button = h("button", { className: "btn primary", type: "submit", text: "Use this key" });
   const form = h("form", { className: "card stack", onSubmit: async (event) => {
@@ -170,14 +190,15 @@ function renderKeyGate() {
   h("h2", { text: "Enter your OpenRouter API key" }),
   h("p", { className: "muted", text: "The key is kept only in the server's memory. It is never saved to disk, the database, this browser, logs, or dumps; after a server restart you enter it again." }),
   input, button);
-  els.view.append(form);
+  root.append(form);
   input.focus();
 }
 
 // ---- home ----------------------------------------------------------------------------------------------------
 
 function renderHome() {
-  els.title.textContent = "Characters";
+  const root = els.root;
+  setTitle(root, "Characters");
   const list = h("div");
   const fill = () => {
     list.replaceChildren(...(state.characters.length ? state.characters.map((character) => h("div", { className: "card" },
@@ -199,7 +220,7 @@ function renderHome() {
     try { await api("/api/user-description", { method: "PUT", body: { text: description.value } }); showBanner(""); saveDescription.textContent = "Saved"; setTimeout(() => { saveDescription.textContent = "Save"; }, 1500); }
     catch (error) { showBanner(error.message); }
   } });
-  els.view.append(
+  root.append(
     h("div", { className: "row spread" }, h("h2", { text: "Characters" }), h("a", { className: "btn primary", href: "#/new", text: "Add Character" })),
     list,
     h("div", { className: "card stack" },
@@ -216,15 +237,16 @@ function renderHome() {
 // ---- character editor ------------------------------------------------------------------------------------------
 
 function renderEditor(characterId) {
+  const root = els.root;
   const existing = characterId ? state.characters.find((character) => character.id === characterId) : null;
   if (characterId && !existing) throw new Error("Character not found.");
-  els.title.textContent = existing ? `Edit ${existing.name}` : "New character";
+  setTitle(root, existing ? `Edit ${existing.name}` : "New character");
   const name = h("input", { type: "text", maxLength: 100, value: existing?.name || "", required: true });
   const description = h("textarea", { rows: 10, value: existing?.description || "", placeholder: "Who is this character? Identity, personality, voice, situation..." });
   const sharedMemory = h("input", { type: "checkbox", checked: existing?.useSharedMemory || false });
   const sharedInterpretations = h("input", { type: "checkbox", checked: existing?.useSharedInterpretations || false });
   const save = h("button", { className: "btn primary", type: "submit", text: existing ? "Save" : "Create" });
-  els.view.append(h("form", { className: "card stack", onSubmit: async (event) => {
+  root.append(h("form", { className: "card stack", onSubmit: async (event) => {
     event.preventDefault();
     save.disabled = true;
     const body = { name: name.value, description: description.value, useSharedMemory: sharedMemory.checked, useSharedInterpretations: sharedInterpretations.checked };
@@ -246,9 +268,10 @@ function renderEditor(characterId) {
 // ---- chat ------------------------------------------------------------------------------------------------------
 
 async function renderChat(characterId) {
+  const root = els.root;
   const data = await api(`/api/characters/${characterId}/chat`);
   const character = data.character;
-  els.title.textContent = character.name;
+  setTitle(root, character.name);
   const messagesEl = h("div", { className: "messages", "aria-live": "polite" });
   const statusEl = h("div");
   const input = h("textarea", { rows: 2, placeholder: `Message ${character.name}...`, value: state.drafts.get(characterId) || "", "aria-label": "Message" });
@@ -329,7 +352,7 @@ async function renderChat(characterId) {
     state.drafts.set(characterId, input.value);
     if (input.value.trim() && Date.now() - state.typingSentAt > TYPING_THROTTLE_MS) { state.typingSentAt = Date.now(); sendPresence({ typingStarted: true }); }
   });
-  els.view.append(h("div", { className: "chat" },
+  root.append(h("div", { className: "chat" },
     h("div", { className: "row spread" }, h("span", { className: "muted", text: `${poolLabel(character.memoryPool)} memory, ${poolLabel(character.interpretationPool).toLowerCase()} interpretations` }),
       h("span", { className: "row" }, h("a", { className: "btn small", href: `#/contemplation/${characterId}`, text: "Contemplation" }), h("a", { className: "btn small", href: `#/edit/${characterId}`, text: "Edit" }))),
     messagesEl, statusEl, h("div", { className: "composer" }, input, sendButton)));
@@ -342,9 +365,10 @@ async function renderChat(characterId) {
 // ---- contemplation ---------------------------------------------------------------------------------------------
 
 async function renderContemplation(characterId) {
+  const root = els.root;
   const character = state.characters.find((entry) => entry.id === characterId);
   if (!character) throw new Error("Character not found.");
-  els.title.textContent = `Contemplation: ${character.name}`;
+  setTitle(root, `Contemplation: ${character.name}`);
   let data = await api(`/api/characters/${characterId}/contemplation`);
   const editing = new Set();
   const statusEl = h("div", { className: "card" });
@@ -412,7 +436,7 @@ async function renderContemplation(characterId) {
     listSection(interpretationsEl, "Interpretations", data.interpretations, "interpretations", "Add an interpretation of the user (free-form prose).");
     listSection(experimentsEl, "Active experiments", data.experiments, "experiments", "Add an experiment intention (what to learn, not a script).");
   };
-  els.view.append(statusEl, interpretationsEl, experimentsEl,
+  root.append(statusEl, interpretationsEl, experimentsEl,
     h("p", { className: "muted", text: "Only the active experiments reach the dialogue model; interpretations never do. Editing interpretations triggers one experiment review; editing experiments does not." }));
   renderAll();
   return {
@@ -425,10 +449,11 @@ async function renderContemplation(characterId) {
 // ---- settings --------------------------------------------------------------------------------------------------
 
 async function renderSettings() {
-  els.title.textContent = "Settings";
+  const root = els.root;
+  setTitle(root, "Settings");
   const settings = structuredClone(state.status.settings);
   const container = h("div");
-  els.view.append(container);
+  root.append(container);
   let models = null;
   api("/api/models").then((value) => { models = value; fillLists(); }).catch(() => {});
   const textList = h("datalist", { id: "text-models" });

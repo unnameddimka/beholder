@@ -23,7 +23,7 @@ function readJson(file, fallback) {
 
 export class BeholderApp {
   constructor({ dataDir, fetchImpl = fetch, now = () => new Date(), timeScaleMs = 1000, backoffMs = 1000, llmTimeouts = undefined, openerDelaySeconds = undefined,
-    presenceTtlMs = undefined, maxParallel = 16, stmRetryBackoffMs = undefined, ltmRetryBackoffMs = undefined, rootDir = process.cwd() }) {
+    presenceTtlMs = undefined, maxParallel = 16, dnsLookup = undefined, stmRetryBackoffMs = undefined, ltmRetryBackoffMs = undefined, rootDir = process.cwd() }) {
     this.dataDir = dataDir;
     this.imagesDir = path.join(dataDir, "images");
     this.fetchImpl = fetchImpl;
@@ -40,7 +40,7 @@ export class BeholderApp {
     this.memory = new MemoryEngine({ store: this.store, llm: this.llm, diagnostics: this.diagnostics, mutex: this.locks, now,
       ...(stmRetryBackoffMs !== undefined ? { stmRetryBackoffMs } : {}), ...(ltmRetryBackoffMs !== undefined ? { ltmRetryBackoffMs } : {}) });
     this.contemplation = new Contemplation({ store: this.store, llm: this.llm, memory: this.memory, settings: this.settings, diagnostics: this.diagnostics, maxParallel });
-    this.images = new ImageService({ store: this.store, settings: this.settings, key: this.key, diagnostics: this.diagnostics, fetchImpl, imagesDir: this.imagesDir, backoffMs: backoffMs * 2 });
+    this.images = new ImageService({ store: this.store, settings: this.settings, key: this.key, diagnostics: this.diagnostics, fetchImpl, imagesDir: this.imagesDir, backoffMs: backoffMs * 2, ...(dnsLookup ? { lookupImpl: dnsLookup } : {}) });
     this.dialogue = new Dialogue({ store: this.store, llm: this.llm, memory: this.memory, contemplation: this.contemplation, images: this.images, settings: this.settings,
       diagnostics: this.diagnostics, timeScaleMs, ...(openerDelaySeconds !== undefined ? { openerDelaySeconds } : {}), ...(presenceTtlMs !== undefined ? { presenceTtlMs } : {}) });
     this.timers = [];

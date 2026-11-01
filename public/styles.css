@@ -44,6 +44,7 @@ a { color: var(--accent); }
 .error-banner { background: var(--error); color: #fff; padding: 8px 12px; font-size: 14px; }
 .view { flex: 1; display: flex; flex-direction: column; width: 100%; max-width: 820px; margin: 0 auto; padding: 12px; min-height: 0; }
 
+.view-root { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; margin-bottom: 12px; }
 .card h2, .card h3 { margin: 0 0 8px; font-size: 17px; }
 .muted { color: var(--muted); font-size: 14px; }

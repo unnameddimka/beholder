@@ -7,12 +7,13 @@ import { coded, exactKeys, mapLimited } from "./utils.js";
 import { interpretationPoolOf, memoryPoolOf } from "./db.js";
 import { messageView } from "./memory.js";
 import {
-  INTERPRETATION_MAX_CHARS, EXPERIMENT_MAX_CHARS, EXPERIMENTS_MAX,
+  INTERPRETATION_MAX_CHARS, EXPERIMENT_MAX_CHARS,
   prefetchSystemPrompt, maintenanceSystemPrompt, generationSystemPrompt, generationReviewSystemPrompt, experimentPlanningSystemPrompt
 } from "./prompts/contemplation.js";
 
 export const CONTEMPLATION_HISTORY = 100;
 const PLANNING_STALE_RETRIES = 3;
+const GENERATION_REREVIEWS = 2;
 const RETRIEVAL_SITUATION_MESSAGES = 12;
 // Manual edits often come in quick succession; a short debounce lets them coalesce into one experiment review.
 const MANUAL_PLANNING_DEBOUNCE_MS = 200;
@@ -68,7 +69,6 @@ export function validateGenerationReview(raw) {
 export function validatePlanning(raw, experimentIds) {
   const errors = [];
   if (!exactKeys(raw, ["experiments"]) || !Array.isArray(raw.experiments)) return { ok: false, errors: ["response must be exactly {\"experiments\": [...]}."] };
-  if (raw.experiments.length > EXPERIMENTS_MAX) errors.push(`at most ${EXPERIMENTS_MAX} experiments are allowed.`);
   const seen = new Set();
   const value = [];
   raw.experiments.forEach((entry, index) => {
@@ -296,23 +296,33 @@ export class Contemplation {
       }
     }).finally(() => { rt.parallel = { total: 0, inFlight: 0 }; });
     // All requests succeeded: apply the batch in one transaction. A result whose interpretation was edited or removed
-    // meanwhile (manual edit) is superseded by that newer state and skipped, never overwriting it.
+    // meanwhile (manual edit) is superseded by that newer state and skipped entirely, including its experiment
+    // completions. A completion is applied only to an experiment whose text is still exactly what the model examined,
+    // so a manual experiment edit made during maintenance is never deleted.
+    const examinedExperiments = new Map(experiments.map((entry) => [entry.id, entry.text]));
     const outcome = this.store.tx(() => {
       let interpretationsChanged = 0;
       let superseded = 0;
+      const completed = new Set();
+      const currentInterpretations = new Map(this.store.interpretations(pool).map((entry) => [entry.id, entry]));
       for (const result of results) {
-        const current = this.store.interpretations(pool).find((entry) => entry.id === result.interpretation.id);
-        if (result.action === "unchanged") continue;
+        const current = currentInterpretations.get(result.interpretation.id);
         if (!current || current.text !== result.interpretation.text) { superseded += 1; continue; }
+        for (const id of result.completedExperimentIds) completed.add(id);
         if (result.action === "replace" && result.text !== current.text) interpretationsChanged += this.store.updateInterpretation(pool, current.id, result.text);
         if (result.action === "delete") interpretationsChanged += this.store.deleteInterpretation(pool, current.id);
       }
-      const completed = new Set(results.flatMap((result) => result.completedExperimentIds).map((id) => parseWire(id, "exp")));
+      const currentExperiments = new Map(this.store.experiments(pool).map((entry) => [wireExperiment(entry.id), entry]));
       let experimentsRemoved = 0;
-      for (const id of completed) experimentsRemoved += this.store.deleteExperiment(pool, id);
+      let experimentsKept = 0;
+      for (const id of completed) {
+        const current = currentExperiments.get(id);
+        if (!current || current.text !== examinedExperiments.get(id)) { experimentsKept += 1; continue; }
+        experimentsRemoved += this.store.deleteExperiment(pool, current.id);
+      }
       if (interpretationsChanged) this.store.bumpInterpretationRevision(pool);
       if (experimentsRemoved) this.store.bumpExperimentRevision(pool);
-      return { interpretationsChanged, experimentsRemoved, superseded };
+      return { interpretationsChanged, experimentsRemoved, superseded, staleCompletionsSkipped: experimentsKept };
     });
     this.diagnostics.event({ type: "contemplation-maintenance", pool, characterId, requests: results.length, actions: results.map((r) => ({ id: r.interpretation.id, action: r.action, completed: r.completedExperimentIds })), ...outcome });
     return outcome;
@@ -320,12 +330,22 @@ export class Contemplation {
 
   async runGeneration(rt, characterId) {
     const pool = rt.pool;
+    // The pool revision is captured with the snapshot before any model call, so a manual edit during retrieval,
+    // generation, or review is detected at commit.
+    let revision = this.store.ensureInterpretationPool(pool).interpretationRevision;
+    let interpretations = this.interpretationViews(pool);
     this.setStage(rt, "generation_retrieval", characterId);
     const conversation = this.conversation(characterId);
     const memory = await this.retrieveMemory(characterId, conversation);
     this.setStage(rt, "generation", characterId);
-    const interpretations = this.interpretationViews(pool);
     const base = { interpretations, conversation, memory };
+    const review = async (text) => {
+      this.setStage(rt, "generation_review", characterId);
+      const { value } = await this.llm.structured({ purpose: "contemplation_generation_review",
+        messages: [{ role: "system", content: generationReviewSystemPrompt() }, { role: "user", content: JSON.stringify({ existingInterpretations: interpretations, candidate: text, conversation, memory, requiredResponseShape: { accept: true, problem: null } }) }],
+        validate: validateGenerationReview, context: { characterId, pool } });
+      return value;
+    };
     let feedback = null;
     let candidate = null;
     for (let attempt = 1; attempt <= 2 && !candidate; attempt += 1) {
@@ -333,25 +353,40 @@ export class Contemplation {
       const { value } = await this.llm.structured({ purpose: "contemplation_generation", messages: [{ role: "system", content: generationSystemPrompt() }, { role: "user", content: JSON.stringify(payload) }],
         validate: validateGeneration, context: { characterId, pool } });
       if (value.decision === "decline") break;
-      this.setStage(rt, "generation_review", characterId);
-      const { value: review } = await this.llm.structured({ purpose: "contemplation_generation_review",
-        messages: [{ role: "system", content: generationReviewSystemPrompt() }, { role: "user", content: JSON.stringify({ existingInterpretations: interpretations, candidate: value.text, conversation, memory, requiredResponseShape: { accept: true, problem: null } }) }],
-        validate: validateGenerationReview, context: { characterId, pool } });
-      if (review.accept) candidate = value.text;
-      else feedback = { text: value.text, problem: review.problem || "not distinct or not compatible with the facts" };
+      const verdict = await review(value.text);
+      if (verdict.accept) candidate = value.text;
+      else feedback = { text: value.text, problem: verdict.problem || "not distinct or not compatible with the facts" };
     }
     if (!candidate) {
       this.diagnostics.event({ type: "contemplation-generation", pool, characterId, status: "declined", rejected: feedback });
       return { status: "declined" };
     }
     const character = this.store.getCharacter(characterId);
-    const id = this.store.tx(() => {
-      const inserted = this.store.insertInterpretation(pool, candidate, { source: "generation", characterId, characterName: character.name });
-      this.store.bumpInterpretationRevision(pool);
-      return inserted;
-    });
-    this.diagnostics.event({ type: "contemplation-generation", pool, characterId, status: "added", interpretationId: id });
-    return { status: "added", id };
+    // Commit only against the revision the approval was made for. If the pool changed meanwhile, the candidate is
+    // re-reviewed against the current pool (bounded); a rejection or repeated churn discards it.
+    for (let rereview = 0; ; rereview += 1) {
+      const id = this.store.tx(() => {
+        if (this.store.ensureInterpretationPool(pool).interpretationRevision !== revision) return null;
+        const inserted = this.store.insertInterpretation(pool, candidate, { source: "generation", characterId, characterName: character.name });
+        this.store.bumpInterpretationRevision(pool);
+        return inserted;
+      });
+      if (id !== null) {
+        this.diagnostics.event({ type: "contemplation-generation", pool, characterId, status: "added", interpretationId: id, rereviews: rereview });
+        return { status: "added", id };
+      }
+      if (rereview >= GENERATION_REREVIEWS) {
+        this.diagnostics.event({ type: "contemplation-generation", pool, characterId, status: "stale_discarded", rereviews: rereview });
+        return { status: "stale_discarded" };
+      }
+      revision = this.store.ensureInterpretationPool(pool).interpretationRevision;
+      interpretations = this.interpretationViews(pool);
+      const verdict = await review(candidate);
+      if (!verdict.accept) {
+        this.diagnostics.event({ type: "contemplation-generation", pool, characterId, status: "rejected_after_pool_change", problem: verdict.problem });
+        return { status: "rejected_after_pool_change" };
+      }
+    }
   }
 
   // Experiment planning sees only the interpretation pool and the active experiments. It runs once against the

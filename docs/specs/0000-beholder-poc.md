@@ -103,6 +103,8 @@ Its strict output is:
 
 Both Boolean fields are independent. `generation` means the model sees the possibility of a **substantially different way to explain the user's behavior**, not another rephrasing or an arbitrary extra description. It is a creative judgment, not a mechanical contradiction detector. `maintenance` means existing interpretations plausibly need checking or revising against incoming evidence, **or** an active experiment appears to have reached a meaningful result. Do not require lengthy explanations from the prefetch model. No work is needed if both are false.
 
+*Clarification (owner decision, review 0000 SPEC-1):* the prefetch input stays exactly as listed above and does not include the active experiments. Detecting that an experiment has reached a result is therefore a heuristic judgment from the conversation alone and may be missed; maintenance, which does receive the active experiments, remains the place where completed experiments are retired.
+
 ### 5.2 Maintenance
 
 When `maintenance` is true (or manually forced), run **one separate LLM request per existing interpretation, in parallel on the Node.js server**. Each request receives its own interpretation, recent relevant dialogue, and Society-style **retrieved relevant memory** from the character's selected memory scope; supply active experiment intentions when useful for recognizing completed experiments. It can return `unchanged`, `replace` (with revised arbitrary text), or `delete`.
