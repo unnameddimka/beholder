@@ -370,3 +370,76 @@ test("invariants: only Dialogue gets timestamps; no interpretation leaks; an ech
     assert.deepEqual(stripTimestampEcho("*waves* [sent 2026-11-01T07:12:40Z | x] inside stays"), { text: "*waves* [sent 2026-11-01T07:12:40Z | x] inside stays", stripped: false });
   } finally { closeApp(app); }
 });
+
+// ---- review 0001 regressions ------------------------------------------------------------------------------------
+
+test("review 0001 P1: bracketed or backtick-led RP prose is accepted verbatim with one request and no repair", async () => {
+  const texts = ["[laughs softly] You're impossible.", "\x60whispers\x60 Not here.\n[glances at the door]", "He wrote \"message\": come back. *folds the note*"];
+  const { app, mock } = await makeApp({ dialogue_reply: (body, { count }) => texts[count - 1], contemplation_prefetch: quietPrefetch });
+  try {
+    const mira = app.createCharacter(base);
+    app.dialogue.presence(CLIENT, { characterId: mira.id });
+    for (const [index, text] of texts.entries()) {
+      app.dialogue.send(mira.id, `line ${index}`);
+      await waitFor(() => lastCharacterText(app, mira.id) === text, { message: text });
+      assert.equal(mock.byPurpose("dialogue_reply").length, index + 1, "exactly one Dialogue request per reply");
+      assert.equal(app.dialogue.chatState(mira.id).timer, null);
+    }
+    assert.equal(app.diagnostics.events.filter((entry) => entry.type === "dialogue-plain-text-normalized").length, texts.length);
+    assert.equal(app.diagnostics.events.some((entry) => entry.type === "llm-repair"), false);
+  } finally { closeApp(app); }
+});
+
+test("review 0001 P1: malformed JSON arrays and code-fenced envelopes still go to repair", async () => {
+  const broken = ['[{"message": "half"', "\x60\x60\x60json\n{\"message\": \"half\"", 'Here: {"message": "half", "imageRequest": '];
+  let index = 0;
+  const { app, mock } = await makeApp({ dialogue_reply: (body) => body.messages[0].content.startsWith("Repair only") ? reply(`Fixed ${index}.`) : broken[index], contemplation_prefetch: quietPrefetch });
+  try {
+    const mira = app.createCharacter(base);
+    for (index = 0; index < broken.length; index += 1) {
+      const before = mock.byPurpose("dialogue_reply").length;
+      app.dialogue.send(mira.id, `try ${index}`);
+      await waitFor(() => lastCharacterText(app, mira.id) === `Fixed ${index}.`, { message: broken[index] });
+      assert.equal(mock.byPurpose("dialogue_reply").length, before + 2, "original plus one isolated repair");
+    }
+    assert.equal(app.diagnostics.events.some((entry) => entry.type === "dialogue-plain-text-normalized"), false);
+  } finally { closeApp(app); }
+});
+
+test("review 0001 P2: a schema-only model steps down straight to prompt-only and never receives JSON-object mode", async () => {
+  const { app, mock } = await makeApp({
+    dialogue_reply: (body) => body.response_format ? jsonResponse(404, { error: { message: "No endpoints found that can handle the requested parameters." } }) : completion(reply("Plain mode.")),
+    contemplation_prefetch: quietPrefetch
+  });
+  try {
+    await catalogue(app, [{ id: "test/schema-only", supportedParameters: ["structured_outputs"] }]);
+    useDialogueModel(app, "test/schema-only");
+    const mira = app.createCharacter(base);
+    app.dialogue.send(mira.id, "hi");
+    await waitFor(() => lastCharacterText(app, mira.id) === "Plain mode.");
+    app.dialogue.send(mira.id, "again");
+    await waitFor(() => mock.byPurpose("dialogue_reply").length === 3 && app.store.lastMessage(mira.id)?.role === "character");
+    const modes = mock.byPurpose("dialogue_reply").map((call) => call.body.response_format?.type ?? "prompt");
+    assert.deepEqual(modes, ["json_schema", "prompt", "prompt"]);
+    assert.ok(mock.byPurpose("dialogue_reply").every((call) => call.body.model === "test/schema-only"));
+    const downgrades = app.diagnostics.events.filter((entry) => entry.type === "dialogue-format-downgrade");
+    assert.deepEqual(downgrades.map((entry) => [entry.from, entry.to]), [["json_schema", "prompt"]]);
+  } finally { closeApp(app); }
+});
+
+test("review 0001 minor: a direct Send with an invalid zone uses UTC, not another session's zone", async () => {
+  const time = clock("2026-11-01T07:12:40Z");
+  const { app, mock } = await makeApp({ dialogue_reply: () => reply("ok"), contemplation_prefetch: quietPrefetch }, { appOptions: { now: time.now } });
+  try {
+    const mira = app.createCharacter(base);
+    app.dialogue.presence("client-other-0001", { characterId: mira.id, timeZone: "Asia/Tokyo" });
+    for (const timeZone of ["Not/AZone", null]) {
+      const before = mock.byPurpose("dialogue_reply").length;
+      app.dialogue.send(mira.id, `zone ${timeZone}`, { timeZone });
+      await waitFor(() => mock.byPurpose("dialogue_reply").length === before + 1 && app.store.lastMessage(mira.id)?.role === "character");
+      const system = mock.byPurpose("dialogue_reply").at(-1).body.messages[0].content;
+      assert.match(system, /07:12 UTC\)/);
+      assert.doesNotMatch(system, /Asia\/Tokyo/);
+    }
+  } finally { closeApp(app); }
+});

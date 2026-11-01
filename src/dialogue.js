@@ -115,7 +115,9 @@ export class Dialogue {
     progress.stage = "dialogue";
     const imagesByMessage = new Map(this.store.imagesForCharacter(characterId).map((image) => [image.messageId, image]));
     // "Now" is taken when the actual Dialogue request is assembled, after memory retrieval.
-    const clock = clockContext({ now: this.now(), timeZone: progress.timeZone || this.timeZoneFor(characterId),
+    // A direct Send/Retry uses only its own browser's zone (UTC when that is missing or invalid); autonomous
+    // messages use the most recently active session in the chat.
+    const clock = clockContext({ now: this.now(), timeZone: mode === "reply" ? progress.timeZone : this.timeZoneFor(characterId),
       lastMessageAt: history.at(-1)?.createdAt ?? null, previousMessageAt: history.at(-2)?.createdAt ?? null });
     const messages = buildDialogueMessages({ character, userDescription: this.settings.userDescription(), history, imagesByMessage, experiments,
       memories: { shortTermMemories: memories.shortTermMemories, longTermMemories: memories.longTermMemories }, imageEnabled: settings.imageEnabled, mode, clock });

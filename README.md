@@ -106,23 +106,26 @@ DST, and the UTC fallback).
     JSON-object mode when it lists only `response_format`. Such requests set `require_parameters`, so only providers
     that honor the format are used. If the model is uncatalogued or the catalogue is unavailable, the format is
     enforced by the prompt alone. If OpenRouter rejects the format because no endpoint supports it, the request steps
-    down one mode (schema, then JSON object, then prompt-only) and is retried with the same model. The step is
-    remembered for that model until restart. The chosen mode and every step are recorded in diagnostics.
+    down to the next mode the catalogue lists for the model (JSON object only if `response_format` is listed,
+    otherwise straight to prompt-only) and is retried with the same model. The step is remembered for that model
+    until restart. The chosen mode and every step are recorded in diagnostics.
   - A non-empty plain-text answer is accepted as the message as written, with no follow-up or image request, and costs
     no extra model call. A diagnostic event records it. This applies only to a complete answer generated from the full
-    context (including the retry after a truncated output), never to a repair answer. Text that starts with `{`, `[`,
-    or a backtick, or contains an envelope field name, is treated as attempted JSON and goes to repair.
+    context (including the retry after a truncated output), never to a repair answer. Only an actual attempt at the
+    envelope goes to repair: text starting with `{`, with `[` followed by `{`, `[`, `"`, or `]`, or with a code fence
+    opening a JSON value, or containing an object literal with an envelope field. Prose such as
+    `[laughs softly] ...` is accepted as written.
   - A repair request contains only the invalid output, the validation errors, and the format instructions, never the
     chat transcript, self-description, memories, or experiments.
 - **Time awareness (spec 0001):** every Dialogue request (reply, Retry, follow-up, opener) states the current time,
   taken when the request is assembled, and the user's time zone. Each history message starts with a
   `[sent <UTC instant> | <local time>]` marker built from its stored timestamp. The pinned self-description has none.
-  The time zone is the browser's IANA zone, sent with presence, Send, and Retry. Follow-ups and openers use the most
-  recently active session in that chat. Each instant is localized with its own offset, so DST is correct. The time
-  since the latest message, and its gap to the one before, are computed from instants. Without a valid browser zone,
-  all times are labeled UTC and the prompt says the zone is unknown; the server's own time zone is never used. A
-  marker that the model copies to the start of its reply is removed before commit and logged. Only Dialogue requests
-  carry time data.
+  The time zone is the browser's IANA zone, sent with presence, Send, and Retry. A Send or Retry uses only its own
+  browser's zone. Follow-ups and openers use the most recently active session in that chat. Each instant is localized
+  with its own offset, so DST is correct. The time since the latest message, and its gap to the one before, are
+  computed from instants. Without a valid browser zone, all times are labeled UTC and the prompt says the zone is
+  unknown; the server's own time zone is never used. A marker that the model copies to the start of its reply is
+  removed before commit and logged. Only Dialogue requests carry time data.
 - **Memory retrieval:** Society's semantic selector runs before every dialogue reply when the memory pool is not empty
   (Dialogue model; limits: 12 STM, 8 LTM). Contemplation runs it with the Contemplation model. Divergence from
   Society: if the selector fails after retries, Beholder falls back to importance ranking (recorded in diagnostics)
@@ -157,10 +160,10 @@ DST, and the UTC fallback).
 - **Images:** the OpenRouter Images API as in Society. Only options that every endpoint advertises are sent (`n: 1`,
   `aspect_ratio: 1:1`, `quality: medium`, `output_format: webp`, `stream: false`). Inline base64, data URIs, and
   temporary https URLs are accepted. A temporary URL is downloaded at once: https on the default port only, no
-  credentials, no redirects, and the host must not be local or resolve to a loopback, private, link-local, CGNAT, or other internal address. The
-  body is read as a stream and aborted past the limit. PNG, JPEG, and WebP only, at most 16 MiB, signature checked. No
-  re-encoding (Society's `sharp` normalization is omitted to stay dependency-free). Pending images resume after a
-  restart once the key is entered.
+  credentials, no redirects, and the host must not be local or resolve to a loopback, private, link-local, CGNAT, or
+  other internal address. The body is read as a stream and aborted past the limit. PNG, JPEG, and WebP only, at most
+  16 MiB, signature checked. No re-encoding (Society's `sharp` normalization is omitted to stay dependency-free).
+  Pending images resume after a restart once the key is entered.
 - **Limits:** request bodies 256 KiB; messages 20,000 characters; interpretations 4,000; each experiment 1,000. There is
   no limit on the number of experiments (spec 5.4); an oversized planning request fails visibly rather than truncating.
 - **Browser navigation:** each navigation renders into its own root, guarded by an epoch counter, so a slow response

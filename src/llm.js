@@ -71,15 +71,20 @@ export class LlmClient {
     });
   }
 
-  // Provider-enforced dialogue format, best first: strict JSON schema, JSON-object mode, then prompt-only. The
-  // catalogue is only a hint for the model as a whole, so a request that OpenRouter rejects because no endpoint
-  // supports the format steps down one mode and is retried with the same model; the step is kept until restart.
+  // Provider-enforced dialogue format, best first: strict JSON schema, JSON-object mode, then prompt-only. Only
+  // modes the catalogue advertises for the model are ever requested; prompt-only is always available. The catalogue
+  // is a hint for the model as a whole, so a request that OpenRouter rejects because no endpoint supports the format
+  // steps down to the next advertised mode with the same model; the step is kept until restart.
+  dialogueFormatModes(model) {
+    const parameters = this.catalog?.byId.get(model)?.supportedParameters || [];
+    return DIALOGUE_FORMAT_MODES.filter((mode) => mode === "prompt" || parameters.includes(mode === "json_schema" ? "structured_outputs" : "response_format"));
+  }
+
   async dialogueFormatMode() {
     try { await this.modelCatalog(); } catch {} // An unavailable catalogue means prompt-only enforcement.
     const model = this.requestParameters("dialogue").model;
-    const parameters = this.catalog?.byId.get(model)?.supportedParameters || [];
-    const advertised = parameters.includes("structured_outputs") ? 0 : parameters.includes("response_format") ? 1 : 2;
-    return DIALOGUE_FORMAT_MODES[Math.max(advertised, this.formatDowngrades.get(model) ?? 0)];
+    const floor = this.formatDowngrades.get(model) ?? 0;
+    return this.dialogueFormatModes(model).find((mode) => DIALOGUE_FORMAT_MODES.indexOf(mode) >= floor);
   }
 
   // Structured call: technical truncation retry once, then JSON parse + validate with up to REPAIR_ATTEMPTS repairs.
@@ -99,10 +104,11 @@ export class LlmClient {
           if (error?.exchangeId) trace.exchangeIds.push(error.exchangeId);
           if (!dialogue || formatMode === "prompt" || !isFormatRejection(error)) throw error;
           const model = this.requestParameters("dialogue").model;
-          const next = DIALOGUE_FORMAT_MODES.indexOf(formatMode) + 1;
-          this.formatDowngrades.set(model, Math.max(next, this.formatDowngrades.get(model) ?? 0));
-          this.diagnostics?.event({ type: "dialogue-format-downgrade", purpose, model, from: formatMode, to: DIALOGUE_FORMAT_MODES[next], httpStatus: error.httpStatus ?? null, ...context });
-          formatMode = DIALOGUE_FORMAT_MODES[next];
+          const current = DIALOGUE_FORMAT_MODES.indexOf(formatMode);
+          const next = this.dialogueFormatModes(model).find((mode) => DIALOGUE_FORMAT_MODES.indexOf(mode) > current);
+          this.formatDowngrades.set(model, Math.max(DIALOGUE_FORMAT_MODES.indexOf(next), this.formatDowngrades.get(model) ?? 0));
+          this.diagnostics?.event({ type: "dialogue-format-downgrade", purpose, model, from: formatMode, to: next, httpStatus: error.httpStatus ?? null, ...context });
+          formatMode = next;
           trace.formatMode = formatMode;
         }
       }
@@ -151,10 +157,13 @@ export class LlmClient {
   }
 }
 
-// Text that starts like JSON or a code fence, or carries an envelope field, was meant to be the envelope.
-function looksLikeAttemptedJson(content) {
+// An actual attempt at the envelope: a JSON object, a JSON array ("[" followed by "{", "[", a quote or "]"), a code
+// fence opening a JSON value, or an object literal with an envelope field. Prose such as "[laughs softly] ..." or a
+// sentence that merely quotes a field name is not an attempt.
+export function looksLikeAttemptedJson(content) {
   const text = String(content || "").trim();
-  return !text || /^[{\[\x60]/.test(text) || /"(message|followUpDelaySeconds|imageRequest)"\s*:/.test(text);
+  return !text || /^\{/.test(text) || /^\[\s*[{\["\]]/.test(text) || /^\x60{3}[A-Za-z]*\s*[{\[]/.test(text)
+    || /\{\s*"(message|followUpDelaySeconds|imageRequest)"\s*:/.test(text);
 }
 
 function dialogueResponseFormat(mode) {
