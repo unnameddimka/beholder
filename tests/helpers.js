@@ -28,7 +28,7 @@ export function mockOpenRouter(handlers = {}, { images = null, extra = null } = 
   const fetchImpl = async (url, init = {}) => {
     const target = String(url);
     if (target === "https://openrouter.ai/api/v1/key") return jsonResponse(200, { data: { label: "test" } });
-    if (target.startsWith("https://openrouter.ai/api/v1/models")) return jsonResponse(200, { data: [{ id: "test/dialogue", name: "Dialogue", supported_parameters: ["temperature", "max_tokens"], top_provider: { max_completion_tokens: 4096 }, architecture: { output_modalities: ["text"] } }] });
+    if (target.startsWith("https://openrouter.ai/api/v1/models")) return jsonResponse(200, { data: [{ id: "test/dialogue", name: "Dialogue", supported_parameters: ["temperature", "max_tokens", "response_format", "structured_outputs"], top_provider: { max_completion_tokens: 4096 }, architecture: { output_modalities: ["text"] } }] });
     if (target === OPENROUTER_ENDPOINT) {
       const purpose = init.headers["X-Beholder-Purpose"];
       const body = JSON.parse(init.body);
