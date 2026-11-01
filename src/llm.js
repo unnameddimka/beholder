@@ -5,6 +5,7 @@
 import { callOpenRouter, fetchModelCatalog } from "./openrouter.js";
 import { coded, parseModelJson } from "./utils.js";
 import { REPAIR_INSTRUCTION, TRUNCATION_RECOVERY_INSTRUCTION } from "./prompts/repair.js";
+import { DIALOGUE_RESPONSE_FORMAT } from "./prompts/dialogue.js";
 
 export const PURPOSE_ROLES = Object.freeze({
   dialogue_reply: "dialogue",
@@ -23,6 +24,7 @@ export const PURPOSE_ROLES = Object.freeze({
 });
 
 export const REPAIR_ATTEMPTS = 2;
+const DIALOGUE_ENVELOPE_PURPOSES = new Set(["dialogue_reply", "dialogue_followup", "dialogue_opener"]);
 const TIMEOUTS = { dialogue: 150_000, contemplation: 240_000 };
 const CATALOG_TTL_MS = 6 * 60 * 60 * 1000;
 
@@ -57,22 +59,35 @@ export class LlmClient {
     return { model, maxTokens, temperature };
   }
 
-  async call({ purpose, messages, context = {}, signal = null }) {
+  async call({ purpose, messages, context = {}, signal = null, responseFormat = null }) {
     const role = PURPOSE_ROLES[purpose];
     if (!role) throw coded("PURPOSE_UNKNOWN", `No model role is registered for ${purpose}.`);
     const { model, maxTokens, temperature } = this.requestParameters(role);
     return callOpenRouter({
       apiKey: this.key.get(), model, messages, maxTokens, temperature, timeoutMs: this.timeouts[role], fetchImpl: this.fetchImpl, diagnostics: this.diagnostics,
-      meta: { purpose, modelRole: role, ...context }, signal, backoffMs: this.backoffMs
+      meta: { purpose, modelRole: role, ...context }, signal, backoffMs: this.backoffMs, responseFormat
     });
+  }
+
+  // Enforce dialogue envelopes at the provider when supported, without rejecting user-selected models that
+  // lack structured outputs. OpenRouter's catalogue can be unavailable; prompt validation remains the fallback.
+  async dialogueResponseFormat() {
+    try { await this.modelCatalog(); } catch { return null; }
+    const entry = this.catalog?.byId.get(this.requestParameters("dialogue").model);
+    const parameters = entry?.supportedParameters || [];
+    if (parameters.includes("structured_outputs")) return DIALOGUE_RESPONSE_FORMAT;
+    if (parameters.includes("response_format")) return { type: "json_object" };
+    return null;
   }
 
   // Structured call: technical truncation retry once, then JSON parse + validate with up to REPAIR_ATTEMPTS repairs.
   // validate(raw) returns { ok: true, value } or { ok: false, errors: [...] }.
   async structured({ purpose, messages, validate, context = {}, signal = null }) {
-    const trace = { exchangeIds: [], repairs: 0, truncationRetry: false };
+    const dialogue = DIALOGUE_ENVELOPE_PURPOSES.has(purpose);
+    const responseFormat = dialogue ? await this.dialogueResponseFormat() : null;
+    const trace = { exchangeIds: [], repairs: 0, truncationRetry: false, normalizedPlainText: false };
     const call = async (callMessages) => {
-      const result = await this.call({ purpose, messages: callMessages, context, signal });
+      const result = await this.call({ purpose, messages: callMessages, context, signal, responseFormat });
       trace.exchangeIds.push(result.exchangeId);
       return result;
     };
@@ -87,16 +102,38 @@ export class LlmClient {
       try { return validate(parseModelJson(content)); }
       catch (error) { return { ok: false, errors: [`response is not valid JSON: ${error.message}`] }; }
     };
+    // A dialogue model sometimes returns valid roleplay text instead of the envelope. Wrapping it locally
+    // preserves the original words and avoids another model call that might repeat a previous turn.
+    const plainDialogue = (content) => {
+      if (!dialogue) return null;
+      const plain = String(content || "").trim();
+      if (!plain || /^[{\[\x60]/.test(plain)) return null; // Broken JSON or fenced JSON still needs repair.
+      const candidate = validate({ message: plain, followUpDelaySeconds: null, imageRequest: null });
+      return candidate.ok ? candidate : null;
+    };
     let validation = check(response.content);
+    if (!validation.ok) {
+      const normalized = plainDialogue(response.content);
+      if (normalized) { validation = normalized; trace.normalizedPlainText = true; }
+    }
     while (!validation.ok) {
       if (trace.repairs >= REPAIR_ATTEMPTS) {
         throw coded("AI_OUTPUT_INVALID", `${purpose} output stayed invalid after ${REPAIR_ATTEMPTS} repairs: ${validation.errors.slice(0, 8).join("; ")}`, { validationErrors: validation.errors, trace });
       }
       trace.repairs += 1;
       this.diagnostics?.event({ type: "llm-repair", purpose, attempt: trace.repairs, errors: validation.errors.slice(0, 20), ...context });
-      response = await call([...messages, { role: "assistant", content: String(response.content) },
-        { role: "system", content: `${REPAIR_INSTRUCTION}\nValidation errors: ${JSON.stringify(validation.errors.slice(0, 30))}` }]);
+      const errors = JSON.stringify(validation.errors.slice(0, 30));
+      const repairMessages = dialogue ? [
+        { role: "system", content: `${REPAIR_INSTRUCTION}\nRequired fields: message (non-empty string), followUpDelaySeconds (integer or null), imageRequest (string or null). Return exactly these three fields. Repair ONLY the supplied response. Never include or reconstruct previous conversation turns.` },
+        { role: "user", content: `Invalid response to repair (not a new dialogue turn):\n${String(response.content)}\nValidation errors: ${errors}` }
+      ] : [...messages, { role: "assistant", content: String(response.content) },
+        { role: "system", content: `${REPAIR_INSTRUCTION}\nValidation errors: ${errors}` }];
+      response = await call(repairMessages);
       validation = check(response.content);
+      if (!validation.ok) {
+        const normalized = plainDialogue(response.content);
+        if (normalized) { validation = normalized; trace.normalizedPlainText = true; }
+      }
     }
     return { value: validation.value, model: response.model, trace };
   }
