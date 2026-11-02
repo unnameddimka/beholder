@@ -8,7 +8,7 @@
 // Society's subjective temporal anchors, protected records, and reconsolidation are intentionally not ported; each
 // record keeps real source timestamps and conversation attribution instead.
 import { clone, coded, exactKeys, isObject, localDateString, stableFingerprint } from "./utils.js";
-import { memoryPoolOf } from "./db.js";
+import { poolOf } from "./db.js";
 import {
   MEMORY_LIMITS, FORGET_REASONS, MEMORY_EPISTEMIC_RULES, stmSystemPrompt, ltmSelectionSystemPrompt, ltmSystemPrompt, retrievalSystemPrompt,
   DIALOGUE_RETRIEVAL_PURPOSE, CONTEMPLATION_RETRIEVAL_PURPOSE
@@ -339,7 +339,7 @@ export class MemoryEngine {
     if (this.store.pendingUploadCount(characterId)) return null;
     const character = this.store.getCharacter(characterId);
     if (!character) return null;
-    const pool = memoryPoolOf(character);
+    const pool = poolOf(character);
     const entry = { status: "running", pool, startedAt: new Date().toISOString(), promise: null };
     this.stmJobs.set(characterId, entry);
     entry.promise = this.mutex.run(`memory:${pool}`, () => this.consolidateStm(characterId, pool))

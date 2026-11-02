@@ -6,7 +6,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { makeApp, closeApp, waitFor, reply, tempDir, seedMessages, jsonResponse, TEST_KEY } from "./helpers.js";
 import { createServer } from "../src/server.js";
-import { interpretationPoolOf, MIGRATIONS } from "../src/db.js";
+import { poolOf, MIGRATIONS } from "../src/db.js";
 import { defaultSettings } from "../src/settings.js";
 import { messageView } from "../src/memory.js";
 import { stmSystemPrompt } from "../src/prompts/memory.js";
@@ -15,7 +15,7 @@ import { validateObservation } from "../src/vision.js";
 import { parseMultipart, UPLOAD_MAX_BYTES } from "../src/uploads.js";
 import { historyMessages } from "../src/prompts/dialogue.js";
 
-const base = { name: "Mira", description: "Keeper.", useSharedMemory: false, useSharedInterpretations: false };
+const base = { name: "Mira", description: "Keeper." };
 const PNG = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==", "base64");
 const OBSERVATION = "The image shows a person with short dark hair and round glasses, smiling, in front of a bookshelf.";
 const quietPrefetch = () => ({ generation: false, maintenance: false });
@@ -117,7 +117,7 @@ test("selfie: upload, one observation before the reply, exact Vision inputs, typ
   try {
     app.settings.setUserDescription("SELF-DESCRIPTION-TEXT");
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     app.settings.update({ contemplationEnabled: false });
     app.contemplation.addInterpretation(pool, "INTERPRETATION-TEXT");
     app.contemplation.addExperiment(pool, "EXPERIMENT-TEXT");
@@ -301,12 +301,13 @@ test("an incompatible Vision model or an oversized context fails without a call 
   } finally { closeApp(app); }
 });
 
-test("disabled Contemplation: Vision runs with image and verbatim only; the shared pool's gestalt is used when selected", async () => {
+test("disabled Contemplation: Vision runs with image and verbatim only; enabled, it gets the character's own gestalt", async () => {
   const { app, mock } = await makeApp({ vision_observation: () => OBSERVATION, dialogue_reply: () => reply("ok") });
   try {
+    const other = app.createCharacter({ ...base, name: "Other" });
     const shared = app.createCharacter({ ...base, useSharedInterpretations: true });
-    app.store.setGestalt("shared", "SHARED-GESTALT", 0);
-    app.store.setGestalt(`character:${shared.id}`, "PRIVATE-GESTALT", 0);
+    app.store.setGestalt(`character:${other.id}`, "OTHER-GESTALT", 0);
+    app.store.setGestalt(`character:${shared.id}`, "OWN-GESTALT", 0);
     app.settings.update({ contemplationEnabled: false });
     await app.dialogue.sendImage(shared.id, "", { image: PNG });
     await waitFor(() => app.store.lastTurn(shared.id).role === "character");
@@ -315,7 +316,7 @@ test("disabled Contemplation: Vision runs with image and verbatim only; the shar
     app.contemplation.onUserMessage = () => null;
     await app.dialogue.sendImage(shared.id, "", { image: PNG });
     await waitFor(() => mock.byPurpose("dialogue_reply").length === 2);
-    assert.equal(visionText(mock.byPurpose("vision_observation")[1]).gestalt.text, "SHARED-GESTALT");
+    assert.equal(visionText(mock.byPurpose("vision_observation")[1]).gestalt.text, "OWN-GESTALT");
   } finally { closeApp(app); }
 });
 

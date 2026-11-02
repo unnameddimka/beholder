@@ -2,7 +2,7 @@
 // HTTP layer so tests can drive the whole application with a mocked fetch.
 import path from "node:path";
 import fs from "node:fs";
-import { Store, interpretationPoolOf, memoryPoolOf } from "./db.js";
+import { Store, poolOf } from "./db.js";
 import { SettingsStore, RuntimeKey, MODEL_ROLES } from "./settings.js";
 import { Diagnostics } from "./diagnostics.js";
 import { LlmClient } from "./llm.js";
@@ -103,8 +103,8 @@ export class BeholderApp {
     const description = typeof input?.description === "string" ? input.description : "";
     if (!name || name.length > NAME_MAX) throw coded("CHARACTER_INVALID", `Name must be 1 to ${NAME_MAX} characters.`, { status: 400 });
     if (description.length > DESCRIPTION_MAX) throw coded("CHARACTER_INVALID", `Description must be at most ${DESCRIPTION_MAX} characters.`, { status: 400 });
-    if (typeof input.useSharedMemory !== "boolean" || typeof input.useSharedInterpretations !== "boolean") throw coded("CHARACTER_INVALID", "Scope flags must be booleans.", { status: 400 });
-    return { name, description, useSharedMemory: input.useSharedMemory, useSharedInterpretations: input.useSharedInterpretations };
+    // Specification 0004: cognition is always character-owned; legacy scope fields are ignored and select nothing.
+    return { name, description };
   }
 
   createCharacter(input) {
@@ -121,13 +121,13 @@ export class BeholderApp {
   }
 
   ensurePools(character) {
-    this.store.ensureMemoryPool(memoryPoolOf(character));
-    this.store.ensureInterpretationPool(interpretationPoolOf(character));
+    this.store.ensureMemoryPool(poolOf(character));
+    this.store.ensureInterpretationPool(poolOf(character));
   }
 
   characterSummary(character) {
     const last = this.store.lastTurn(character.id);
-    return { ...character, memoryPool: memoryPoolOf(character), interpretationPool: interpretationPoolOf(character), messageCount: this.store.messageCount(character.id),
+    return { ...character, pool: poolOf(character), messageCount: this.store.messageCount(character.id),
       lastMessageAt: last?.createdAt || null, chat: this.dialogue.chatState(character.id) };
   }
 

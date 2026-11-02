@@ -1,50 +1,45 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { makeApp, closeApp } from "./helpers.js";
-import { SHARED_POOL, privatePool, memoryPoolOf, interpretationPoolOf } from "../src/db.js";
+import { characterPool, poolOf } from "../src/db.js";
 
-test("all four scope combinations select independent memory and interpretation pools", async () => {
+// Specification 0004 P1/P3: each character owns one memory pool and one interpretation pool; the legacy scope flags
+// are neither required nor able to select any other pool.
+test("every character owns its own pool; legacy scope fields are ignored on create and update", async () => {
   const { app } = await makeApp({});
   try {
     const combos = [[false, false], [true, false], [false, true], [true, true]];
     for (const [useSharedMemory, useSharedInterpretations] of combos) {
       const character = app.createCharacter({ name: `C${useSharedMemory}${useSharedInterpretations}`, description: "", useSharedMemory, useSharedInterpretations });
-      assert.equal(memoryPoolOf(character), useSharedMemory ? SHARED_POOL : privatePool(character.id));
-      assert.equal(interpretationPoolOf(character), useSharedInterpretations ? SHARED_POOL : privatePool(character.id));
+      assert.equal(poolOf(character), characterPool(character.id));
+      assert.deepEqual(Object.keys(character).sort(), ["createdAt", "description", "id", "name", "updatedAt"]);
+      const updated = app.updateCharacter(character.id, { name: "Renamed", description: "d", useSharedMemory: true, useSharedInterpretations: true });
+      assert.equal(poolOf(updated), characterPool(character.id));
     }
+    assert.deepEqual(app.store.memoryPools().map((row) => row.pool).sort(), app.store.listCharacters().map((c) => characterPool(c.id)).sort());
+    assert.deepEqual(app.store.interpretationPools().map((row) => row.pool).sort(), app.store.listCharacters().map((c) => characterPool(c.id)).sort());
   } finally { closeApp(app); }
 });
 
-test("switching a flag switches the active pool without merging, cloning, or deleting either pool", async () => {
+test("pools of different characters stay separate", async () => {
   const { app } = await makeApp({ contemplation_experiment_planning: () => ({ experiments: [] }) });
   try {
     app.settings.update({ contemplationEnabled: false });
-    const a = app.createCharacter({ name: "A", description: "", useSharedMemory: false, useSharedInterpretations: false });
-    const b = app.createCharacter({ name: "B", description: "", useSharedMemory: true, useSharedInterpretations: true });
-    app.contemplation.addInterpretation(interpretationPoolOf(a), "private to A");
-    app.contemplation.addInterpretation(interpretationPoolOf(b), "shared one");
-    app.store.insertMemory({ pool: memoryPoolOf(a), tier: "ltm", topic: "A private", summary: "s", retrievalBrief: "", importance: 0.5, sources: [] });
-    app.store.insertMemory({ pool: memoryPoolOf(b), tier: "ltm", topic: "shared", summary: "s", retrievalBrief: "", importance: 0.5, sources: [] });
-
-    const switched = app.updateCharacter(a.id, { name: "A", description: "", useSharedMemory: true, useSharedInterpretations: true });
-    assert.deepEqual(app.store.interpretations(interpretationPoolOf(switched)).map((entry) => entry.text), ["shared one"]);
-    assert.deepEqual(app.store.memoryRecords(memoryPoolOf(switched)).map((entry) => entry.topic), ["shared"]);
-    assert.deepEqual(app.store.interpretations(privatePool(a.id)).map((entry) => entry.text), ["private to A"], "private pool is kept intact");
-
-    const back = app.updateCharacter(a.id, { name: "A", description: "", useSharedMemory: false, useSharedInterpretations: true });
-    assert.deepEqual(app.store.memoryRecords(memoryPoolOf(back)).map((entry) => entry.topic), ["A private"]);
-    assert.deepEqual(app.store.interpretations(interpretationPoolOf(back)).map((entry) => entry.text), ["shared one"]);
-    // Shared pool updates are visible to every character that uses it; private pools stay separate.
-    app.contemplation.addInterpretation(SHARED_POOL, "added via B");
-    assert.equal(app.store.interpretations(interpretationPoolOf(back)).length, 2);
-    assert.equal(app.store.interpretations(privatePool(b.id)).length, 0);
+    const a = app.createCharacter({ name: "A", description: "" });
+    const b = app.createCharacter({ name: "B", description: "" });
+    app.contemplation.addInterpretation(poolOf(a), "about A's chat");
+    app.store.insertMemory({ pool: poolOf(a), tier: "ltm", topic: "A memory", summary: "s", retrievalBrief: "", importance: 0.5, sources: [] });
+    assert.deepEqual(app.store.interpretations(poolOf(b)), []);
+    assert.deepEqual(app.store.memoryRecords(poolOf(b)), []);
+    assert.deepEqual(app.store.interpretations(poolOf(a)).map((entry) => entry.text), ["about A's chat"]);
   } finally { closeApp(app); }
 });
 
 test("character validation rejects bad input", async () => {
   const { app } = await makeApp({});
   try {
-    assert.throws(() => app.createCharacter({ name: "", description: "", useSharedMemory: false, useSharedInterpretations: false }));
-    assert.throws(() => app.createCharacter({ name: "X", description: "", useSharedMemory: "yes", useSharedInterpretations: false }));
+    assert.throws(() => app.createCharacter({ name: "", description: "" }));
+    assert.throws(() => app.createCharacter({ name: "X".repeat(101), description: "" }));
+    assert.throws(() => app.createCharacter({ name: "X", description: "Y".repeat(20_001) }));
   } finally { closeApp(app); }
 });

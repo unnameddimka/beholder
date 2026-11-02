@@ -19,7 +19,7 @@ test("HTTP API: key gate, characters, chat round trip, and status never expose t
         return { status: response.status, body: await response.json() };
       };
       assert.equal((await json("/api/status")).body.apiKeyConfigured, false);
-      const created = await json("/api/characters", { method: "POST", body: JSON.stringify({ name: "Mira", description: "Keeper", useSharedMemory: false, useSharedInterpretations: true }) });
+      const created = await json("/api/characters", { method: "POST", body: JSON.stringify({ name: "Mira", description: "Keeper", useSharedMemory: true, useSharedInterpretations: true }) });
       assert.equal(created.status, 200);
       assert.equal((await json(`/api/characters/${created.body.id}/messages`, { method: "POST", body: JSON.stringify({ text: "hi" }) })).status, 409, "sending needs the key");
       const key = await json("/api/key", { method: "POST", body: JSON.stringify({ apiKey: "sk-or-v1-httptestkey00000000000000" }) });
@@ -31,7 +31,8 @@ test("HTTP API: key gate, characters, chat round trip, and status never expose t
       await waitFor(async () => (await json(`/api/characters/${created.body.id}/chat`)).body.messages.length === 2);
       const chat = (await json(`/api/characters/${created.body.id}/chat`)).body;
       assert.equal(chat.messages[0].text, "<script>alert(1)</script> *waves*", "text is stored verbatim; the client renders it as text");
-      assert.equal(chat.character.interpretationPool, "shared");
+      assert.equal(chat.character.pool, `character:${created.body.id}`, "legacy scope fields cannot select a shared pool");
+      assert.equal("useSharedMemory" in chat.character || "useSharedInterpretations" in chat.character || "memoryPool" in chat.character, false);
       const activity = await json("/api/activity");
       assert.equal(activity.status, 200);
       assert.ok("dialogue" in activity.body.roles && "contemplation" in activity.body.roles && "image" in activity.body.roles);

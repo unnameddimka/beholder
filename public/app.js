@@ -58,11 +58,27 @@ function formatTime(iso) {
   try { return new Date(iso).toLocaleString([], { dateStyle: "short", timeStyle: "short" }); } catch { return ""; }
 }
 
-function poolLabel(pool, characters = state.characters) {
-  if (pool === "shared") return "Shared pool";
-  const id = Number(String(pool).split(":")[1]);
-  const owner = characters.find((character) => character.id === id);
-  return `Private pool of ${owner ? owner.name : `character ${id}`}`;
+const SVG_NS = "http://www.w3.org/2000/svg";
+// A decorative stroke icon; the button that holds it carries the accessible name.
+function icon(d) {
+  const svg = document.createElementNS(SVG_NS, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("focusable", "false");
+  const path = document.createElementNS(SVG_NS, "path");
+  path.setAttribute("d", d);
+  svg.append(path);
+  return svg;
+}
+const ICON_PAPERCLIP = "M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48";
+const ICON_SEND = "M22 2 11 13M22 2l-7 20-4-9-9-4z";
+
+// Software keyboards: size the app to the visible viewport so the chat composer stays above the keyboard where the
+// browser does not resize the layout viewport itself.
+if (window.visualViewport) {
+  const fitViewport = () => document.documentElement.style.setProperty("--viewport-height", `${Math.round(window.visualViewport.height)}px`);
+  window.visualViewport.addEventListener("resize", fitViewport);
+  fitViewport();
 }
 
 window.addEventListener("error", (event) => reportFrontendError(event.message, event.error?.stack));
@@ -210,10 +226,7 @@ function renderHome() {
       h("a", { className: "character-item", href: `#/chat/${character.id}` },
         h("div", { className: "row spread" }, h("span", { className: "name", text: character.name }),
           character.chat.pending ? h("span", { className: "badge busy", text: "replying..." }) : null),
-        h("div", { className: "muted", text: character.lastMessageAt ? `${character.messageCount} messages, last ${formatTime(character.lastMessageAt)}` : "No messages yet" }),
-        h("div", { className: "badges" },
-          h("span", { className: "badge", text: character.useSharedMemory ? "shared memory" : "private memory" }),
-          h("span", { className: "badge", text: character.useSharedInterpretations ? "shared interpretations" : "private interpretations" }))),
+        h("div", { className: "muted", text: character.lastMessageAt ? `${character.messageCount} messages, last ${formatTime(character.lastMessageAt)}` : "No messages yet" })),
       h("div", { className: "row" },
         h("a", { className: "btn small", href: `#/edit/${character.id}`, text: "Edit" }),
         h("a", { className: "btn small", href: `#/contemplation/${character.id}`, text: "Contemplation" }))))
@@ -248,13 +261,11 @@ function renderEditor(characterId) {
   setTitle(root, existing ? `Edit ${existing.name}` : "New character");
   const name = h("input", { type: "text", maxLength: 100, value: existing?.name || "", required: true });
   const description = h("textarea", { rows: 10, value: existing?.description || "", placeholder: "Who is this character? Identity, personality, voice, situation..." });
-  const sharedMemory = h("input", { type: "checkbox", checked: existing?.useSharedMemory || false });
-  const sharedInterpretations = h("input", { type: "checkbox", checked: existing?.useSharedInterpretations || false });
   const save = h("button", { className: "btn primary", type: "submit", text: existing ? "Save" : "Create" });
   root.append(h("form", { className: "card stack", onSubmit: async (event) => {
     event.preventDefault();
     save.disabled = true;
-    const body = { name: name.value, description: description.value, useSharedMemory: sharedMemory.checked, useSharedInterpretations: sharedInterpretations.checked };
+    const body = { name: name.value, description: description.value };
     try {
       const saved = await api(existing ? `/api/characters/${existing.id}` : "/api/characters", { method: existing ? "PUT" : "POST", body });
       location.hash = `#/chat/${saved.id}`;
@@ -262,9 +273,6 @@ function renderEditor(characterId) {
   } },
   h("label", { className: "field" }, "Display name", name),
   h("label", { className: "field" }, "AI-facing description", description),
-  h("label", { className: "check" }, sharedMemory, h("span", {}, "Use shared memory", h("br"), h("span", { className: "muted", text: "Read and write the memory pool shared with other characters instead of this character's private pool." }))),
-  h("label", { className: "check" }, sharedInterpretations, h("span", {}, "Use shared interpretations", h("br"), h("span", { className: "muted", text: "Read and write the shared interpretation and experiment pool instead of the private one." }))),
-  existing ? h("p", { className: "muted", text: "Changing a flag only switches which pool is active. No pool is merged, copied, or deleted." }) : null,
   h("div", { className: "row" }, save, h("a", { className: "btn", href: existing ? `#/chat/${existing.id}` : "#/", text: "Cancel" }))));
   name.focus();
   return { kind: "editor" };
@@ -279,11 +287,13 @@ async function renderChat(characterId) {
   setTitle(root, character.name);
   const messagesEl = h("div", { className: "messages", "aria-live": "polite" });
   const statusEl = h("div");
-  const input = h("textarea", { rows: 2, placeholder: `Message ${character.name}...`, value: state.drafts.get(characterId) || "", "aria-label": "Message" });
-  const sendButton = h("button", { className: "btn primary", type: "button", text: "Send" });
+  // Specification 0004 U1/U2: a growing multiline field between two compact icon buttons. Enter always inserts a
+  // newline; only the Send button sends.
+  const input = h("textarea", { rows: 1, placeholder: `Message ${character.name}...`, value: state.drafts.get(characterId) || "", "aria-label": "Message", enterkeyhint: "enter" });
+  const sendButton = h("button", { className: "composer-button primary", type: "button", "aria-label": "Send message", title: "Send message" }, icon(ICON_SEND));
   // One attached image per message (Specification 0003 U1), validated again by the server.
   const fileInput = h("input", { type: "file", accept: "image/png,image/jpeg,image/webp", className: "hidden", "aria-hidden": "true" });
-  const attachButton = h("button", { className: "btn", type: "button", text: "Attach Image", title: "Attach one image (PNG, JPEG, or WebP)", onClick: () => fileInput.click() });
+  const attachButton = h("button", { className: "composer-button", type: "button", "aria-label": "Attach image", title: "Attach image (PNG, JPEG, or WebP)", onClick: () => fileInput.click() }, icon(ICON_PAPERCLIP));
   const previewEl = h("div", { className: "attachment-preview hidden" });
   const nodes = new Map();
   let lastId = 0;
@@ -391,6 +401,7 @@ async function renderChat(characterId) {
       if (attachment) await sendWithImage();
       else await api(`/api/characters/${characterId}/messages`, { method: "POST", body: { text: input.value, timeZone: browserTimeZone() } });
       input.value = "";
+      fitInput();
       setAttachment(null);
       state.drafts.delete(characterId);
       await refresh();
@@ -399,18 +410,21 @@ async function renderChat(characterId) {
     finally { sending = false; renderStatus(); }
   };
   sendButton.addEventListener("click", submit);
-  input.addEventListener("keydown", (event) => {
-    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); submit(); }
-  });
+  // Grows with its lines up to the CSS max-height, then scrolls inside.
+  const fitInput = () => {
+    input.style.height = "auto";
+    input.style.height = `${input.scrollHeight + input.offsetHeight - input.clientHeight}px`;
+  };
   // Typing (not only Send) cancels any pending follow-up timer on the server.
   input.addEventListener("input", () => {
+    fitInput();
     state.drafts.set(characterId, input.value);
     if (input.value.trim() && Date.now() - state.typingSentAt > TYPING_THROTTLE_MS) { state.typingSentAt = Date.now(); sendPresence({ typingStarted: true }); }
   });
   root.append(h("div", { className: "chat" },
-    h("div", { className: "row spread" }, h("span", { className: "muted", text: `${poolLabel(character.memoryPool)} memory, ${poolLabel(character.interpretationPool).toLowerCase()} interpretations` }),
-      h("span", { className: "row" }, h("a", { className: "btn small", href: `#/contemplation/${characterId}`, text: "Contemplation" }), h("a", { className: "btn small", href: `#/edit/${characterId}`, text: "Edit" }))),
+    h("div", { className: "row chat-links" }, h("a", { className: "btn small", href: `#/contemplation/${characterId}`, text: "Contemplation" }), h("a", { className: "btn small", href: `#/edit/${characterId}`, text: "Edit" })),
     messagesEl, statusEl, previewEl, h("div", { className: "composer" }, attachButton, fileInput, input, sendButton)));
+  fitInput();
   applyMessages(data.messages);
   messagesEl.scrollTop = messagesEl.scrollHeight;
   renderStatus();
@@ -435,7 +449,6 @@ async function renderContemplation(characterId) {
     const s = data.status;
     const roles = state.activity?.roles?.contemplation;
     const rows = [
-      ["Pool", poolLabel(data.pool)],
       ["Contemplation", data.contemplationEnabled ? "enabled" : "disabled (no automatic contemplation; gestalt and experiments are not sent to dialogue)"],
       ["Stage", s.running ? `${s.stage}${s.stageCharacterId ? ` (chat ${state.characters.find((c) => c.id === s.stageCharacterId)?.name || s.stageCharacterId})` : ""}` : "idle"],
       ["Parallel", s.parallel.total ? `${s.parallel.inFlight} running of ${s.parallel.total} maintenance requests` : "-"],

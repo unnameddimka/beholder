@@ -7,7 +7,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { BeholderApp } from "./app.js";
 import { CURATED_TEXT_MODELS, CURATED_VISION_MODELS, DEFAULT_IMAGE_MODEL } from "./settings.js";
-import { interpretationPoolOf } from "./db.js";
+import { poolOf } from "./db.js";
 import { buildEmergencyDump } from "./dump.js";
 import { IMAGE_FILE_PATTERN } from "./images.js";
 import { readBoundedBody, parseMultipart, UPLOAD_BODY_LIMIT, UPLOAD_MAX_BYTES } from "./uploads.js";
@@ -75,7 +75,7 @@ function messagesWithImages(app, characterId, afterId) {
 }
 
 function contemplationView(app, character) {
-  const pool = interpretationPoolOf(character);
+  const pool = poolOf(character);
   return {
     pool,
     poolState: app.store.ensureInterpretationPool(pool),
@@ -142,37 +142,37 @@ export function createServer(app) {
     ["POST", /^\/api\/characters\/(\d+)\/contemplation\/force$/, async (req, url, m) => {
       const character = mustCharacter(app, m[1]);
       if (!app.key.configured()) throw coded("API_KEY_MISSING", "Enter the OpenRouter API key first.");
-      app.contemplation.force(interpretationPoolOf(character), (await readJsonBody(req)).kind, character.id);
+      app.contemplation.force(poolOf(character), (await readJsonBody(req)).kind, character.id);
       return contemplationView(app, character);
     }],
     ["POST", /^\/api\/characters\/(\d+)\/interpretations$/, async (req, url, m) => {
       const character = mustCharacter(app, m[1]);
-      app.contemplation.addInterpretation(interpretationPoolOf(character), (await readJsonBody(req)).text, character.id);
+      app.contemplation.addInterpretation(poolOf(character), (await readJsonBody(req)).text, character.id);
       return contemplationView(app, character);
     }],
     ["PUT", /^\/api\/characters\/(\d+)\/interpretations\/(\d+)$/, async (req, url, m) => {
       const character = mustCharacter(app, m[1]);
-      app.contemplation.editInterpretation(interpretationPoolOf(character), idParam(m[2]), (await readJsonBody(req)).text);
+      app.contemplation.editInterpretation(poolOf(character), idParam(m[2]), (await readJsonBody(req)).text);
       return contemplationView(app, character);
     }],
     ["DELETE", /^\/api\/characters\/(\d+)\/interpretations\/(\d+)$/, (req, url, m) => {
       const character = mustCharacter(app, m[1]);
-      app.contemplation.deleteInterpretation(interpretationPoolOf(character), idParam(m[2]));
+      app.contemplation.deleteInterpretation(poolOf(character), idParam(m[2]));
       return contemplationView(app, character);
     }],
     ["POST", /^\/api\/characters\/(\d+)\/experiments$/, async (req, url, m) => {
       const character = mustCharacter(app, m[1]);
-      app.contemplation.addExperiment(interpretationPoolOf(character), (await readJsonBody(req)).text);
+      app.contemplation.addExperiment(poolOf(character), (await readJsonBody(req)).text);
       return contemplationView(app, character);
     }],
     ["PUT", /^\/api\/characters\/(\d+)\/experiments\/(\d+)$/, async (req, url, m) => {
       const character = mustCharacter(app, m[1]);
-      app.contemplation.editExperiment(interpretationPoolOf(character), idParam(m[2]), (await readJsonBody(req)).text);
+      app.contemplation.editExperiment(poolOf(character), idParam(m[2]), (await readJsonBody(req)).text);
       return contemplationView(app, character);
     }],
     ["DELETE", /^\/api\/characters\/(\d+)\/experiments\/(\d+)$/, (req, url, m) => {
       const character = mustCharacter(app, m[1]);
-      app.contemplation.deleteExperiment(interpretationPoolOf(character), idParam(m[2]));
+      app.contemplation.deleteExperiment(poolOf(character), idParam(m[2]));
       return contemplationView(app, character);
     }],
     ["GET", /^\/api\/activity$/, () => app.activity()],

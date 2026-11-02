@@ -67,7 +67,7 @@ export function dialogueSystemPrompt({ character, gestalt = null, experiments, m
   if (memories && (memories.longTermMemories.length || memories.shortTermMemories.length)) {
     parts.push([
       "REMEMBERED CONTEXT: consolidated memory records of earlier conversation that no longer fits in the verbatim history.",
-      "Each record names the conversation it comes from. A record from another character's conversation (shared memory) is something you know about, not something that happened between you and the user; do not claim you were present.",
+      "Each record names the conversation it comes from.",
       "Records are recollection, not certainty: what someone said is a claim, not proof.",
       JSON.stringify(memories)
     ].join("\n"));
@@ -80,7 +80,7 @@ export function dialogueSystemPrompt({ character, gestalt = null, experiments, m
       "Its claims are possible perspectives. Several may coexist or conflict, and you do not have to decide which one is correct.",
       "The real user remains one whole person, fundamentally unknown and more than any representation, including this one. Do not reduce them to a type or a set of traits.",
       "You may draw on it to sense the user's complexity, notice connections, find new angles, or naturally talk about your own impressions and uncertainties with the user. You are not required to cite, recite, list or announce it.",
-      "Keep it apart from remembered facts and from what the user actually said. It may reflect observations from conversations the user had with other characters; do not claim you personally had those interactions.",
+      "Keep it apart from remembered facts and from what the user actually said.",
       "It is not an experiment script, a required intervention, or a goal for changing the user's behavior.",
       gestalt
     ].join("\n"));

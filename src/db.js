@@ -5,10 +5,107 @@ import fs from "node:fs";
 import path from "node:path";
 import { nowIso } from "./utils.js";
 
-export const SHARED_POOL = "shared";
-export function privatePool(characterId) { return `character:${characterId}`; }
-export function memoryPoolOf(character) { return character.useSharedMemory ? SHARED_POOL : privatePool(character.id); }
-export function interpretationPoolOf(character) { return character.useSharedInterpretations ? SHARED_POOL : privatePool(character.id); }
+// Specification 0004 P1: every character owns exactly one memory pool and one interpretation pool, both keyed by
+// this technical identity. There is no shared pool and no user-selectable scope.
+export function characterPool(characterId) { return `character:${characterId}`; }
+export function poolOf(character) { return characterPool(character.id); }
+
+// The key of the retired shared pools (Specifications 0000-0003); it appears only in the 0004 migration.
+const LEGACY_SHARED_POOL = "shared";
+
+function migrationBlocked(message) {
+  return Object.assign(new Error(`Specification 0004 migration stopped; the database was not changed. ${message} Restore a backup or resolve the legacy shared pool manually (see README).`), { code: "MIGRATION_BLOCKED" });
+}
+
+// Specification 0004 P2: moves the legacy shared cognitive state to the single character that used it, keeping
+// every row (ids, text, timestamps, provenance) and its pool state (revisions, planning flag, gestalt, LTM date,
+// watermarks). Only the pool key changes. Each cognitive kind moves as a whole: the interpretation kind carries its
+// interpretations, experiments, gestalt, revisions and Contemplation watermarks together. Anything ambiguous throws
+// inside the migration transaction, so nothing is applied.
+function migrateToCharacterOwnedPools(db) {
+  const shared = LEGACY_SHARED_POOL;
+  const characters = db.prepare("SELECT id, use_shared_memory, use_shared_interpretations FROM characters ORDER BY id").all();
+  const count = (sql, ...args) => db.prepare(sql).get(...args).n;
+  const kinds = [
+    {
+      label: "memory",
+      flag: "use_shared_memory",
+      meaningful: (pool) => count("SELECT COUNT(*) AS n FROM memory_records WHERE pool = ?", pool) > 0,
+      // Contributions from another chat: record scope, record provenance, or messages consolidated into the pool.
+      foreignContributors: (ownerId) => {
+        const ids = new Set();
+        for (const row of db.prepare("SELECT scope_character_id, sources FROM memory_records WHERE pool = ?").all(shared)) {
+          if (row.scope_character_id !== null && row.scope_character_id !== ownerId) ids.add(row.scope_character_id);
+          for (const source of JSON.parse(row.sources || "[]")) if (source?.characterId != null && source.characterId !== ownerId) ids.add(source.characterId);
+        }
+        for (const row of db.prepare("SELECT DISTINCT character_id FROM messages WHERE consolidated_pool = ? AND character_id != ?").all(shared, ownerId)) ids.add(row.character_id);
+        return ids;
+      },
+      drop: (pool) => {
+        db.prepare("DELETE FROM memory_pools WHERE pool = ?").run(pool);
+      },
+      move: (ownerId, target) => {
+        db.prepare("UPDATE memory_records SET pool = ? WHERE pool = ?").run(target, shared);
+        db.prepare("UPDATE memory_pools SET pool = ? WHERE pool = ?").run(target, shared);
+        db.prepare("UPDATE messages SET consolidated_pool = ? WHERE consolidated_pool = ? AND character_id = ?").run(target, shared, ownerId);
+      }
+    },
+    {
+      label: "interpretation",
+      flag: "use_shared_interpretations",
+      meaningful: (pool) => count("SELECT COUNT(*) AS n FROM interpretations WHERE pool = ?", pool) > 0
+        || count("SELECT COUNT(*) AS n FROM experiments WHERE pool = ?", pool) > 0
+        || count("SELECT COUNT(*) AS n FROM interpretation_pools WHERE pool = ? AND gestalt IS NOT NULL", pool) > 0,
+      // Contributions from another chat: interpretation origins and Contemplation watermarks of other chats.
+      foreignContributors: (ownerId) => {
+        const ids = new Set();
+        for (const row of db.prepare("SELECT origin FROM interpretations WHERE pool = ?").all(shared)) {
+          const characterId = JSON.parse(row.origin || "{}")?.characterId;
+          if (characterId != null && characterId !== ownerId) ids.add(characterId);
+        }
+        for (const row of db.prepare("SELECT character_id FROM contemplation_watermarks WHERE pool = ? AND character_id != ?").all(shared, ownerId)) ids.add(row.character_id);
+        return ids;
+      },
+      drop: (pool) => {
+        db.prepare("DELETE FROM interpretation_pools WHERE pool = ?").run(pool);
+        db.prepare("DELETE FROM contemplation_watermarks WHERE pool = ?").run(pool);
+      },
+      move: (ownerId, target) => {
+        db.prepare("UPDATE interpretations SET pool = ? WHERE pool = ?").run(target, shared);
+        db.prepare("UPDATE experiments SET pool = ? WHERE pool = ?").run(target, shared);
+        db.prepare("UPDATE interpretation_pools SET pool = ? WHERE pool = ?").run(target, shared);
+        db.prepare("UPDATE contemplation_watermarks SET pool = ? WHERE pool = ? AND character_id = ?").run(target, shared, ownerId);
+        db.prepare("DELETE FROM contemplation_watermarks WHERE pool = ?").run(shared);
+      }
+    }
+  ];
+  for (const kind of kinds) {
+    const users = characters.filter((character) => character[kind.flag] === 1);
+    const sharedMeaningful = kind.meaningful(shared);
+    if (sharedMeaningful && users.length !== 1) {
+      throw migrationBlocked(`The legacy shared ${kind.label} pool holds data, but ${users.length} characters use it (${users.map((c) => c.id).join(", ") || "none"}); its owner cannot be inferred.`);
+    }
+    const owner = users.length === 1 ? users[0] : null;
+    if (sharedMeaningful) {
+      const foreign = kind.foreignContributors(owner.id);
+      if (foreign.size) throw migrationBlocked(`The legacy shared ${kind.label} pool contains contributions from other characters (${[...foreign].join(", ")}); it cannot be assigned to character ${owner.id} alone.`);
+      if (kind.meaningful(characterPool(owner.id))) {
+        throw migrationBlocked(`Character ${owner.id} has both a nonempty shared and a nonempty personal ${kind.label} pool; they cannot be merged without choosing between their states.`);
+      }
+    }
+    // The owner's personal pool state is replaced only when it holds nothing meaningful; its counters then belong
+    // to an empty pool that the character no longer used.
+    if (owner && !kind.meaningful(characterPool(owner.id))) {
+      kind.drop(characterPool(owner.id));
+      kind.move(owner.id, characterPool(owner.id));
+    }
+    kind.drop(shared);
+  }
+  for (const table of ["memory_records", "interpretations", "experiments"]) {
+    if (count(`SELECT COUNT(*) AS n FROM ${table} WHERE pool = ?`, shared)) throw migrationBlocked(`Rows of ${table} would remain in the legacy shared pool.`);
+  }
+  db.exec("ALTER TABLE characters DROP COLUMN use_shared_memory; ALTER TABLE characters DROP COLUMN use_shared_interpretations;");
+}
 
 export const MIGRATIONS = [
   `
@@ -143,7 +240,9 @@ export const MIGRATIONS = [
     updated_at TEXT NOT NULL
   );
   CREATE INDEX uploads_pending ON uploads (status, id);
-  `
+  `,
+  // Specification 0004: character-owned cognition; the shared pools and both scope flags are retired.
+  migrateToCharacterOwnedPools
 ];
 
 // Message rows carry their upload (a user message) or their source message (an observation) for every consumer.
@@ -154,11 +253,7 @@ const MESSAGE_SELECT = `SELECT m.*, u.id AS upload_id, u.file AS upload_file, u.
   LEFT JOIN messages src ON src.id = m.source_message_id`;
 
 function characterRow(row) {
-  return row ? {
-    id: row.id, name: row.name, description: row.description,
-    useSharedMemory: row.use_shared_memory === 1, useSharedInterpretations: row.use_shared_interpretations === 1,
-    createdAt: row.created_at, updatedAt: row.updated_at
-  } : null;
+  return row ? { id: row.id, name: row.name, description: row.description, createdAt: row.created_at, updatedAt: row.updated_at } : null;
 }
 
 function messageRow(row) {
@@ -198,7 +293,8 @@ export class Store {
     this.file = file;
     this.db = new DatabaseSync(file);
     this.db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
-    this.migrate();
+    try { this.migrate(); }
+    catch (error) { this.db.close(); throw error; }
   }
 
   // Foreign keys are off while migrating (a table rebuild drops and renames a referenced table) and every
@@ -210,7 +306,9 @@ export class Store {
     try {
       for (let index = version; index < MIGRATIONS.length; index += 1) {
         this.tx(() => {
-          this.db.exec(MIGRATIONS[index]);
+          const migration = MIGRATIONS[index];
+          if (typeof migration === "function") migration(this.db);
+          else this.db.exec(migration);
           const violations = this.db.prepare("PRAGMA foreign_key_check").all();
           if (violations.length) throw new Error(`Migration ${index + 1} left ${violations.length} foreign key violation(s).`);
           this.db.exec(`PRAGMA user_version = ${index + 1}`);
@@ -257,17 +355,14 @@ export class Store {
 
   getCharacter(id) { return characterRow(this.db.prepare("SELECT * FROM characters WHERE id = ?").get(id)); }
 
-  createCharacter({ name, description, useSharedMemory, useSharedInterpretations }) {
+  createCharacter({ name, description }) {
     const at = nowIso();
-    const result = this.db.prepare("INSERT INTO characters (name, description, use_shared_memory, use_shared_interpretations, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(name, description, useSharedMemory ? 1 : 0, useSharedInterpretations ? 1 : 0, at, at);
+    const result = this.db.prepare("INSERT INTO characters (name, description, created_at, updated_at) VALUES (?, ?, ?, ?)").run(name, description, at, at);
     return this.getCharacter(Number(result.lastInsertRowid));
   }
 
-  // Changing a scope flag only switches which pool is active; no pool is merged, cloned, or deleted.
-  updateCharacter(id, { name, description, useSharedMemory, useSharedInterpretations }) {
-    this.db.prepare("UPDATE characters SET name = ?, description = ?, use_shared_memory = ?, use_shared_interpretations = ?, updated_at = ? WHERE id = ?")
-      .run(name, description, useSharedMemory ? 1 : 0, useSharedInterpretations ? 1 : 0, nowIso(), id);
+  updateCharacter(id, { name, description }) {
+    this.db.prepare("UPDATE characters SET name = ?, description = ?, updated_at = ? WHERE id = ?").run(name, description, nowIso(), id);
     return this.getCharacter(id);
   }
 

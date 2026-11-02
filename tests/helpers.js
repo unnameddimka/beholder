@@ -85,6 +85,12 @@ export function seedMessages(app, characterId, count, { startRole = "user" } = {
 
 export function emptyRetrieval() { return { stmIds: [], ltmIds: [] }; }
 
+// A consolidation that keeps every supplied interpretation as its own distinct hypothesis, unchanged.
+export function identityConsolidation(body) {
+  const { interpretations } = JSON.parse(body.messages[1].content);
+  return { interpretations: interpretations.map((entry) => ({ id: entry.id, sourceIds: [entry.id], text: entry.text })) };
+}
+
 export function closeApp(app) {
   app.stop();
   app.store.close();

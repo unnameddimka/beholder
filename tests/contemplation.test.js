@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { makeApp, closeApp, waitFor, reply, seedMessages, sleep } from "./helpers.js";
-import { interpretationPoolOf, SHARED_POOL } from "../src/db.js";
+import { makeApp, closeApp, waitFor, reply, seedMessages, sleep, identityConsolidation } from "./helpers.js";
+import { poolOf } from "../src/db.js";
 import { validatePrefetch, validatePlanning } from "../src/contemplation.js";
 
-const base = { name: "Mira", description: "Keeper.", useSharedMemory: false, useSharedInterpretations: false };
+const base = { name: "Mira", description: "Keeper." };
 
 test("prefetch receives exactly the whole interpretation pool, the last 100 verbatim messages and the active experiments, no memory", async () => {
   const { app, mock } = await makeApp({
@@ -15,7 +15,7 @@ test("prefetch receives exactly the whole interpretation pool, the last 100 verb
   });
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     app.settings.update({ contemplationEnabled: false });
     app.contemplation.addInterpretation(pool, "Interpretation A");
     app.contemplation.addInterpretation(pool, "Interpretation B");
@@ -46,6 +46,7 @@ test("prefetch chooses maintenance from an experiment the latest message bears o
       return { generation: false, maintenance: payload.activeExperiments.some((entry) => latest.includes("lighthouse") && entry.text.includes("lighthouse")) };
     },
     contemplation_memory_retrieval: () => ({ stmIds: [], ltmIds: [] }),
+    contemplation_consolidation: identityConsolidation,
     contemplation_maintenance: (body) => {
       const payload = JSON.parse(body.messages[1].content);
       return { action: "replace", text: "Fears the dark, but loves the lighthouse.", completedExperimentIds: payload.activeExperiments.map((entry) => entry.id) };
@@ -55,7 +56,7 @@ test("prefetch chooses maintenance from an experiment the latest message bears o
   });
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     app.settings.update({ contemplationEnabled: false });
     app.contemplation.addInterpretation(pool, "Fears the dark.");
     app.contemplation.addExperiment(pool, "Mention the old lighthouse and watch how the user reacts.");
@@ -78,7 +79,7 @@ test("prefetch receives an empty experiment array when none are active", async (
   });
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     app.dialogue.send(mira.id, "hello");
     await waitFor(() => mock.byPurpose("contemplation_prefetch").length === 1);
     await app.contemplation.idle(pool);
@@ -103,6 +104,7 @@ test("both flags: parallel maintenance per interpretation, generation sees the p
   const { app, mock } = await makeApp({
     contemplation_prefetch: () => { order.push("prefetch"); return { generation: true, maintenance: true }; },
     contemplation_memory_retrieval: () => ({ stmIds: [], ltmIds: [] }),
+    contemplation_consolidation: identityConsolidation,
     contemplation_maintenance: async (body) => {
       order.push("maintenance");
       inFlight += 1; peak = Math.max(peak, inFlight);
@@ -132,7 +134,7 @@ test("both flags: parallel maintenance per interpretation, generation sees the p
   });
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     app.settings.update({ contemplationEnabled: false });
     for (const text of ["Old A", "Old B", "Old C"]) app.contemplation.addInterpretation(pool, text);
     app.contemplation.addExperiment(pool, "Finished probe");
@@ -155,12 +157,13 @@ test("a failed maintenance request applies nothing from the batch", async () => 
   const { app } = await makeApp({
     contemplation_prefetch: () => ({ generation: false, maintenance: true }),
     contemplation_memory_retrieval: () => ({ stmIds: [], ltmIds: [] }),
+    contemplation_consolidation: identityConsolidation,
     contemplation_maintenance: (body) => JSON.parse(body.messages[1].content).interpretation.text === "One" ? { action: "replace", text: "Changed", completedExperimentIds: [] } : "not json at all",
     dialogue_reply: () => reply("ok")
   });
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     app.settings.update({ contemplationEnabled: false });
     app.contemplation.addInterpretation(pool, "One");
     app.contemplation.addInterpretation(pool, "Two");
@@ -181,7 +184,7 @@ test("messages during a slow cycle are coalesced into one later cycle covering a
   });
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     app.dialogue.send(mira.id, "one");
     await waitFor(() => mock.byPurpose("contemplation_prefetch").length === 1);
     for (const text of ["two", "three", "four"]) {
@@ -216,7 +219,7 @@ test("a stale experiment-planning result never overwrites a newer experiment rev
   });
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     app.contemplation.addInterpretation(pool, "Something");
     await waitFor(() => calls === 1);
     app.contemplation.addExperiment(pool, "Manual experiment added meanwhile");
@@ -232,7 +235,7 @@ test("manual experiment edits do not trigger contemplation; interpretation edits
   const { app, mock } = await makeApp({ contemplation_experiment_planning: (body) => ({ experiments: JSON.parse(body.messages[1].content).activeExperiments }) });
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     const id = app.contemplation.addExperiment(pool, "e1");
     app.contemplation.editExperiment(pool, id, "e1 edited");
     await app.contemplation.idle(pool);
@@ -254,7 +257,7 @@ test("generation may decline, and a reviewer rejection leads to one retry then d
   });
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     seedMessages(app, mira.id, 4);
     await app.contemplation.force(pool, "generation", mira.id);
     await app.contemplation.idle(pool);
@@ -265,8 +268,8 @@ test("generation may decline, and a reviewer rejection leads to one retry then d
   } finally { closeApp(app); }
 });
 
-test("shared interpretation pool collects evidence from several chats with attribution", async () => {
-  const { app } = await makeApp({
+test("each chat's evidence goes only to its own character's interpretation pool (Specification 0004)", async () => {
+  const { app, mock } = await makeApp({
     contemplation_prefetch: () => ({ generation: true, maintenance: false }),
     contemplation_memory_retrieval: () => ({ stmIds: [], ltmIds: [] }),
     contemplation_generation: (body) => ({ decision: "add", text: `From ${JSON.parse(body.messages[1].content).conversation.character}` }),
@@ -278,12 +281,15 @@ test("shared interpretation pool collects evidence from several chats with attri
     const a = app.createCharacter({ ...base, name: "Ash", useSharedInterpretations: true });
     const b = app.createCharacter({ ...base, name: "Birch", useSharedInterpretations: true });
     app.dialogue.send(a.id, "hi Ash");
-    await waitFor(() => app.store.interpretations(SHARED_POOL).length === 1);
-    await app.contemplation.idle(SHARED_POOL);
+    await waitFor(() => app.store.interpretations(poolOf(a)).length === 1);
+    await app.contemplation.idle(poolOf(a));
     app.dialogue.send(b.id, "hi Birch");
-    await waitFor(() => app.store.interpretations(SHARED_POOL).length === 2);
-    const origins = app.store.interpretations(SHARED_POOL).map((entry) => entry.origin.characterName);
-    assert.deepEqual(origins, ["Ash", "Birch"]);
+    await waitFor(() => app.store.interpretations(poolOf(b)).length === 1);
+    await app.contemplation.idle(poolOf(b));
+    assert.deepEqual(app.store.interpretations(poolOf(a)).map((entry) => entry.text), ["From Ash"], "legacy scope fields select nothing");
+    assert.deepEqual(app.store.interpretations(poolOf(b)).map((entry) => entry.text), ["From Birch"]);
+    const generation = mock.byPurpose("contemplation_generation").map((call) => JSON.parse(call.body.messages[1].content).interpretations);
+    assert.deepEqual(generation, [[], []], "Birch's generation never sees Ash's interpretations");
   } finally { closeApp(app); }
 });
 

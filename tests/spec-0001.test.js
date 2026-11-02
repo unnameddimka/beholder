@@ -2,10 +2,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { makeApp, closeApp, waitFor, reply, completion, jsonResponse, sleep } from "./helpers.js";
-import { interpretationPoolOf } from "../src/db.js";
+import { poolOf } from "../src/db.js";
 import { stripTimestampEcho, validTimeZone } from "../src/clock.js";
 
-const base = { name: "Mira", description: "A sardonic lighthouse keeper.", useSharedMemory: false, useSharedInterpretations: false };
+const base = { name: "Mira", description: "A sardonic lighthouse keeper." };
 const CLIENT = "client-spec-0001";
 const quietPrefetch = () => ({ generation: false, maintenance: false });
 
@@ -62,7 +62,7 @@ test("malformed JSON repair sees only the invalid output, contract and errors: n
     app.settings.setUserDescription("PINNED-NURSE-DESCRIPTION");
     app.settings.update({ contemplationEnabled: false });
     const mira = app.createCharacter(base);
-    app.contemplation.addExperiment(interpretationPoolOf(mira), "EXPERIMENT-ABSURD-STORY");
+    app.contemplation.addExperiment(poolOf(mira), "EXPERIMENT-ABSURD-STORY");
     app.store.insertMemory({ pool: `character:${mira.id}`, tier: "ltm", topic: "MEMORY-TOPIC", summary: "MEMORY-SUMMARY", retrievalBrief: "x", importance: 0.5, sources: [] });
     app.settings.update({ contemplationEnabled: true });
     app.store.addMessage({ characterId: mira.id, role: "character", kind: "reply", text: "HISTORY-DARLING-SPEECH" });
@@ -217,8 +217,8 @@ test("isolation: plain text from a non-dialogue purpose still goes through stric
     const mira = app.createCharacter(base);
     app.dialogue.send(mira.id, "hi");
     await waitFor(() => mock.byPurpose("contemplation_prefetch").length === 2);
-    await app.contemplation.idle(interpretationPoolOf(mira));
-    assert.equal(app.contemplation.status(interpretationPoolOf(mira)).lastCycle.status, "succeeded");
+    await app.contemplation.idle(poolOf(mira));
+    assert.equal(app.contemplation.status(poolOf(mira)).lastCycle.status, "succeeded");
     assert.equal("response_format" in mock.byPurpose("contemplation_prefetch")[0].body, false);
     assert.equal(app.diagnostics.events.some((entry) => entry.type === "dialogue-plain-text-normalized"), false);
   } finally { closeApp(app); }
@@ -357,11 +357,11 @@ test("invariants: only Dialogue gets timestamps; no interpretation leaks; an ech
   }, { appOptions: { now: time.now } });
   try {
     const mira = app.createCharacter(base);
-    app.contemplation.addInterpretation(interpretationPoolOf(mira), "SECRET-INTERPRETATION");
-    await app.contemplation.idle(interpretationPoolOf(mira)).catch(() => {});
+    app.contemplation.addInterpretation(poolOf(mira), "SECRET-INTERPRETATION");
+    await app.contemplation.idle(poolOf(mira)).catch(() => {});
     app.dialogue.send(mira.id, "hi", { timeZone: "Europe/Kyiv" });
     await waitFor(() => lastCharacterText(app, mira.id) === "*smiles* Hi.");
-    await app.contemplation.idle(interpretationPoolOf(mira));
+    await app.contemplation.idle(poolOf(mira));
     assert.doesNotMatch(JSON.stringify(mock.byPurpose("dialogue_reply")[0].body), /SECRET-INTERPRETATION/);
     for (const call of mock.calls.filter((entry) => !entry.purpose.startsWith("dialogue_") || entry.purpose === "dialogue_memory_retrieval")) {
       assert.doesNotMatch(JSON.stringify(call.body), /\[sent \d{4}|it is now/, `${call.purpose} gets no temporal annotation`);

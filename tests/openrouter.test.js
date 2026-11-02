@@ -39,7 +39,7 @@ test("temperature is sent only when enabled; max_tokens follows the per-role bud
   const { app, mock } = await makeApp({ dialogue_reply: () => reply("ok"), contemplation_prefetch: () => ({ generation: false, maintenance: false }) });
   try {
     await app.llm.modelCatalog();
-    const mira = app.createCharacter({ name: "M", description: "", useSharedMemory: false, useSharedInterpretations: false });
+    const mira = app.createCharacter({ name: "M", description: "" });
     app.dialogue.send(mira.id, "a");
     await waitFor(() => app.store.lastMessage(mira.id).role === "character");
     assert.equal("temperature" in mock.byPurpose("dialogue_reply")[0].body, false);
@@ -58,7 +58,7 @@ test("a truncated structured output gets one compact retry instead of being comm
     contemplation_prefetch: () => ({ generation: false, maintenance: false })
   });
   try {
-    const mira = app.createCharacter({ name: "M", description: "", useSharedMemory: false, useSharedInterpretations: false });
+    const mira = app.createCharacter({ name: "M", description: "" });
     app.dialogue.send(mira.id, "a");
     await waitFor(() => app.store.lastMessage(mira.id).role === "character");
     assert.equal(app.store.lastMessage(mira.id).text, "complete");

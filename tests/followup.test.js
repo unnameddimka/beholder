@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { makeApp, closeApp, waitFor, reply, sleep } from "./helpers.js";
 
 // timeScaleMs = 1 in tests: one "second" of delay is one millisecond. openerDelaySeconds is overridden per test.
-const base = { name: "Mira", description: "Keeper.", useSharedMemory: false, useSharedInterpretations: false };
+const base = { name: "Mira", description: "Keeper." };
 const CLIENT = "client-test-0001";
 
 async function setup(handlers, appOptions = {}) {

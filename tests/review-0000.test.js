@@ -1,12 +1,12 @@
 // Regression tests for docs/review/0000-beholder-review-9adf254.md findings P1-1, P1-2, P2-1 and P2-3.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { makeApp, closeApp, waitFor, reply, seedMessages, jsonResponse } from "./helpers.js";
-import { interpretationPoolOf } from "../src/db.js";
+import { makeApp, closeApp, waitFor, reply, seedMessages, jsonResponse, identityConsolidation } from "./helpers.js";
+import { poolOf } from "../src/db.js";
 import { validatePlanning } from "../src/contemplation.js";
 import { checkDownloadUrl, isBlockedAddress } from "../src/images.js";
 
-const base = { name: "Mira", description: "Keeper.", useSharedMemory: false, useSharedInterpretations: false };
+const base = { name: "Mira", description: "Keeper." };
 
 function gated() {
   let release;
@@ -24,6 +24,7 @@ test("P1-1: a stale maintenance completion never deletes an experiment edited du
   const { gate, release } = gated();
   const { app } = await makeApp({
     contemplation_memory_retrieval: () => ({ stmIds: [], ltmIds: [] }),
+    contemplation_consolidation: identityConsolidation,
     contemplation_maintenance: async (body) => {
       await gate;
       const payload = JSON.parse(body.messages[1].content);
@@ -32,7 +33,7 @@ test("P1-1: a stale maintenance completion never deletes an experiment edited du
   });
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     app.settings.update({ contemplationEnabled: false });
     app.contemplation.addInterpretation(pool, "Theory");
     const edited = app.contemplation.addExperiment(pool, "Original experiment");
@@ -51,6 +52,7 @@ test("P1-1: completions from a superseded interpretation result are not applied"
   const { gate, release } = gated();
   const { app } = await makeApp({
     contemplation_memory_retrieval: () => ({ stmIds: [], ltmIds: [] }),
+    contemplation_consolidation: identityConsolidation,
     contemplation_maintenance: async (body) => {
       await gate;
       const payload = JSON.parse(body.messages[1].content);
@@ -59,7 +61,7 @@ test("P1-1: completions from a superseded interpretation result are not applied"
   });
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     app.settings.update({ contemplationEnabled: false });
     const interpretation = app.contemplation.addInterpretation(pool, "Theory");
     app.contemplation.addExperiment(pool, "Probe");
@@ -88,7 +90,7 @@ test("P1-2: generation re-reviews against the current pool after a concurrent ed
   });
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     app.settings.update({ contemplationEnabled: false });
     app.contemplation.addInterpretation(pool, "Old theory");
     seedMessages(app, mira.id, 2);
@@ -110,7 +112,7 @@ test("P1-2: a candidate still commits after a pool change when the re-review acc
   });
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     app.settings.update({ contemplationEnabled: false });
     seedMessages(app, mira.id, 2);
     await forceAndWait(app, pool, "generation", mira.id, "generation");

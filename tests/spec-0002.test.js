@@ -4,13 +4,13 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { makeApp, closeApp, waitFor, reply, tempDir, completion, ROOT, TEST_KEY } from "./helpers.js";
-import { interpretationPoolOf, MIGRATIONS, SHARED_POOL } from "../src/db.js";
+import { makeApp, closeApp, waitFor, reply, tempDir, completion, ROOT, TEST_KEY, identityConsolidation } from "./helpers.js";
+import { poolOf, MIGRATIONS } from "../src/db.js";
 import { PROVIDER_IGNORE } from "../src/openrouter.js";
 import { PURPOSE_ROLES } from "../src/llm.js";
 import { gestaltizationSystemPrompt } from "../src/prompts/contemplation.js";
 
-const base = { name: "Mira", description: "Keeper.", useSharedMemory: false, useSharedInterpretations: false };
+const base = { name: "Mira", description: "Keeper." };
 const quietPrefetch = () => ({ generation: false, maintenance: false });
 const payloadOf = (call) => JSON.parse(call.body.messages[1].content);
 
@@ -70,7 +70,7 @@ test("prompt carries the section 1 semantics; input is every interpretation plus
     contemplation_experiment_planning: () => ({ experiments: [] }) });
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     seedPool(app, pool, ["Seeks closeness.", "Studies the experience of closeness.", "Hides behind humor."]);
     app.store.insertMemory({ pool, tier: "ltm", topic: "MEMORY-TOPIC", summary: "MEMORY-SUMMARY", retrievalBrief: "x", importance: 0.5, sources: [] });
     app.contemplation.addExperiment(pool, "EXPERIMENT-TEXT");
@@ -110,7 +110,7 @@ test("an empty pool has no gestalt; a pool that becomes empty reconsiders its pr
   });
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     app.dialogue.send(mira.id, "hello");
     await waitFor(() => app.contemplation.status(pool).lastCycle?.status === "succeeded");
     await app.contemplation.idle(pool);
@@ -133,6 +133,7 @@ test("one cycle with maintenance and generation synthesizes once, after generati
   const { app, mock } = await makeApp({
     contemplation_prefetch: () => ({ generation: busy, maintenance: busy }),
     contemplation_memory_retrieval: () => ({ stmIds: [], ltmIds: [] }),
+    contemplation_consolidation: identityConsolidation,
     contemplation_maintenance: (body) => ({ action: "replace", text: `${payloadOf({ body }).interpretation.text} Revised.`, completedExperimentIds: [] }),
     contemplation_generation: () => ({ decision: "add", text: "A new angle." }),
     contemplation_generation_review: () => ({ accept: true, problem: null }),
@@ -142,7 +143,7 @@ test("one cycle with maintenance and generation synthesizes once, after generati
   });
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     seedPool(app, pool, ["One.", "Two."]);
     app.store.setGestalt(pool, "Earlier.", app.store.ensureInterpretationPool(pool).interpretationRevision);
     app.dialogue.send(mira.id, "news");
@@ -183,7 +184,7 @@ test("race: a gestalt computed for an outdated revision is discarded and the new
   });
   try {
     const mira = app.createCharacter(base);
-    pool = interpretationPoolOf(mira);
+    pool = poolOf(mira);
     seedPool(app, pool, ["Original."]);
     app.contemplation.recover();
     await waitFor(() => app.contemplation.gestaltView(pool).status === "current", { message: "current gestalt" });
@@ -206,7 +207,7 @@ test("failure keeps the last valid gestalt, does not block planning or dialogue,
   });
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     seedPool(app, pool, ["One."]);
     app.store.setGestalt(pool, "Valid old gestalt.", app.store.ensureInterpretationPool(pool).interpretationRevision);
     app.contemplation.addInterpretation(pool, "Two.");
@@ -231,7 +232,7 @@ test("context limit: an interpretation set that cannot fit is refused without a 
   const { app, mock } = await makeApp({ contemplation_gestaltization: () => ({ gestalt: "never" }), contemplation_experiment_planning: () => ({ experiments: [] }) });
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     await app.llm.modelCatalog();
     const model = app.settings.get().models.contemplation;
     app.llm.catalog.byId.set(model, { id: model, contextLength: 17_000, supportedParameters: null, maxCompletionTokens: null });
@@ -247,7 +248,7 @@ test("restart: the persisted gestalt survives and an outdated one is updated onc
   const dataDir = tempDir();
   let first = await makeApp({ contemplation_gestaltization: () => ({ gestalt: "Before restart." }), contemplation_experiment_planning: () => ({ experiments: [] }) }, { dataDir });
   const mira = first.app.createCharacter(base);
-  const pool = interpretationPoolOf(mira);
+  const pool = poolOf(mira);
   seedPool(first.app, pool, ["One."]);
   first.app.contemplation.recover();
   await waitFor(() => first.app.store.ensureInterpretationPool(pool).gestalt === "Before restart.");
@@ -278,7 +279,7 @@ test("dialogue: every mode gets the gestalt with its semantics and never interpr
   });
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     seedPool(app, pool, ["INTERPRETATION-SECRET"]);
     app.contemplation.addExperiment(pool, "EXPERIMENT-INTENTION");
     app.store.setGestalt(pool, "GESTALT-TEXT one person, many views.", app.store.ensureInterpretationPool(pool).interpretationRevision);
@@ -298,7 +299,6 @@ test("dialogue: every mode gets the gestalt with its semantics and never interpr
       assert.match(system, /possible perspectives/);
       assert.match(system, /fundamentally unknown/);
       assert.match(system, /not an experiment script/);
-      assert.match(system, /other characters/);
       assert.match(system, /EXPERIMENT-INTENTION/);
       assert.doesNotMatch(JSON.stringify(call.body), /INTERPRETATION-SECRET/);
     }
@@ -317,37 +317,24 @@ test("dialogue: every mode gets the gestalt with its semantics and never interpr
   } finally { closeApp(app); }
 });
 
-test("scope: shared characters share one gestalt, private ones keep their own, and switching the flag switches gestalt and experiments together", async () => {
+test("ownership: each character's Dialogue gets only its own gestalt and experiments (Specification 0004)", async () => {
   const { app, mock } = await makeApp({ dialogue_opener: () => reply("hello") });
   try {
     app.settings.update({ contemplationEnabled: false });
     const a = app.createCharacter({ ...base, name: "A", useSharedInterpretations: true });
     const b = app.createCharacter({ ...base, name: "B", useSharedInterpretations: true });
-    const c = app.createCharacter({ ...base, name: "C" });
-    app.store.setGestalt(SHARED_POOL, "SHARED-GESTALT", 0);
-    app.contemplation.addExperiment(SHARED_POOL, "SHARED-EXPERIMENT");
-    app.store.setGestalt(interpretationPoolOf(c), "PRIVATE-GESTALT", 0);
-    app.contemplation.addExperiment(interpretationPoolOf(c), "PRIVATE-EXPERIMENT");
+    app.store.setGestalt(poolOf(a), "A-GESTALT", 0);
+    app.contemplation.addExperiment(poolOf(a), "A-EXPERIMENT");
     app.settings.update({ contemplationEnabled: true });
     const systemFor = async (character) => {
       await app.dialogue.generate(character.id, "opener");
       return mock.byPurpose("dialogue_opener").at(-1).body.messages[0].content;
     };
-    for (const character of [a, b]) {
-      const system = await systemFor(character);
-      assert.match(system, /SHARED-GESTALT/);
-      assert.match(system, /SHARED-EXPERIMENT/);
-    }
-    let system = await systemFor(c);
-    assert.match(system, /PRIVATE-GESTALT/);
-    assert.match(system, /PRIVATE-EXPERIMENT/);
-    assert.doesNotMatch(system, /SHARED-/);
-    app.updateCharacter(c.id, { ...base, name: "C", useSharedInterpretations: true });
-    system = await systemFor(app.store.getCharacter(c.id));
-    assert.match(system, /SHARED-GESTALT/);
-    assert.match(system, /SHARED-EXPERIMENT/);
-    assert.doesNotMatch(system, /PRIVATE-/);
-    assert.equal(app.store.ensureInterpretationPool(interpretationPoolOf({ id: c.id, useSharedInterpretations: false })).gestalt, "PRIVATE-GESTALT", "nothing copied or deleted");
+    let system = await systemFor(a);
+    assert.match(system, /A-GESTALT/);
+    assert.match(system, /A-EXPERIMENT/);
+    system = await systemFor(b);
+    assert.doesNotMatch(system, /A-GESTALT|A-EXPERIMENT|IMPRESSION OF THE USER/, "a new character starts with empty cognition");
   } finally { closeApp(app); }
 });
 
@@ -355,7 +342,7 @@ test("disabled: interpretation changes schedule no synthesis; the page view stil
   const { app, mock } = await makeApp({});
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     app.settings.update({ contemplationEnabled: false });
     app.store.setGestalt(pool, "Stored.", 0);
     app.contemplation.addInterpretation(pool, "New.");
@@ -414,7 +401,7 @@ test("Baidu: every text request, including gestaltization, repair and truncation
   });
   try {
     const mira = app.createCharacter(base);
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     app.dialogue.send(mira.id, "hello");
     await waitFor(() => app.store.ensureInterpretationPool(pool).gestalt === "Whole.", { message: "gestalt" });
     await app.contemplation.idle(pool);

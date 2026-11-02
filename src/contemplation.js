@@ -1,15 +1,17 @@
-// Contemplation: an independent background process per interpretation pool (Specification 0000 section 5).
-// One serial pipeline per pool: prefetch -> maintenance (parallel per interpretation, all-or-nothing batch) ->
+// Contemplation: an independent background process per interpretation pool (Specification 0000 section 5); each
+// character owns exactly one pool (Specification 0004).
+// One serial pipeline per pool: prefetch -> maintenance (one consolidation of the whole pool, then a parallel check
+// per consolidated interpretation, all-or-nothing commit) ->
 // generation (with an LLM review of the candidate) -> gestaltization (Specification 0002) -> at most one
 // experiment-planning pass against the final pool.
 // User messages arriving during a cycle are coalesced through a persisted per-(pool, chat) watermark. Writes are
 // atomic SQLite transactions guarded by revisions/snapshots, so stale results never overwrite newer state.
 import { coded, exactKeys, mapLimited } from "./utils.js";
-import { interpretationPoolOf, memoryPoolOf } from "./db.js";
+import { poolOf } from "./db.js";
 import { messageView } from "./memory.js";
 import {
   INTERPRETATION_MAX_CHARS, EXPERIMENT_MAX_CHARS, GESTALT_MAX_CHARS,
-  prefetchSystemPrompt, maintenanceSystemPrompt, generationSystemPrompt, generationReviewSystemPrompt, gestaltizationSystemPrompt, experimentPlanningSystemPrompt
+  prefetchSystemPrompt, consolidationSystemPrompt, maintenanceSystemPrompt, generationSystemPrompt, generationReviewSystemPrompt, gestaltizationSystemPrompt, experimentPlanningSystemPrompt
 } from "./prompts/contemplation.js";
 
 export const CONTEMPLATION_HISTORY = 100;
@@ -48,6 +50,39 @@ export function validateMaintenance(raw, experimentIds) {
   else for (const id of raw.completedExperimentIds) if (!experimentIds.has(id)) errors.push(`completedExperimentIds contains unknown id ${id}.`);
   if (errors.length) return { ok: false, errors };
   return { ok: true, value: { action: raw.action, text: raw.action === "replace" ? raw.text.trim() : null, completedExperimentIds: [...new Set(raw.completedExperimentIds)] } };
+}
+
+// Specification 0004 C3: every supplied id is accounted for exactly once, by a representative that is itself one of
+// the supplied ids and lists its own id among its sources. Anything partial, invented, or overlapping is invalid.
+export function validateConsolidation(raw, suppliedIds) {
+  if (!exactKeys(raw, ["interpretations"]) || !Array.isArray(raw.interpretations)) return { ok: false, errors: ["response must be exactly {\"interpretations\": [...]}."] };
+  if (!raw.interpretations.length) return { ok: false, errors: ["interpretations must not be empty; every supplied interpretation must be accounted for."] };
+  const errors = [];
+  const supplied = new Set(suppliedIds);
+  const representatives = new Set();
+  const accountedBy = new Map();
+  const value = [];
+  raw.interpretations.forEach((entry, index) => {
+    const path = `interpretations[${index}]`;
+    if (!exactKeys(entry, ["id", "sourceIds", "text"])) { errors.push(`${path} must contain exactly id, sourceIds and text.`); return; }
+    if (!supplied.has(entry.id)) errors.push(`${path}.id must be a supplied interpretation id.`);
+    else if (representatives.has(entry.id)) errors.push(`${path}.id repeats ${entry.id}.`);
+    representatives.add(entry.id);
+    if (!Array.isArray(entry.sourceIds) || !entry.sourceIds.length) errors.push(`${path}.sourceIds must be a non-empty array of supplied ids.`);
+    else {
+      for (const id of entry.sourceIds) {
+        if (!supplied.has(id)) errors.push(`${path}.sourceIds contains unknown id ${JSON.stringify(id)}.`);
+        else if (accountedBy.has(id)) errors.push(`${path}.sourceIds: ${id} is already accounted for by interpretations[${accountedBy.get(id)}].`);
+        else accountedBy.set(id, index);
+      }
+      if (!entry.sourceIds.includes(entry.id)) errors.push(`${path}.sourceIds must include its own id ${entry.id}.`);
+    }
+    if (typeof entry.text !== "string" || !entry.text.trim()) errors.push(`${path}.text must be non-empty text.`);
+    else if (entry.text.trim().length > INTERPRETATION_MAX_CHARS) errors.push(`${path}.text must be at most ${INTERPRETATION_MAX_CHARS} characters.`);
+    else value.push({ id: entry.id, sourceIds: [...entry.sourceIds], text: entry.text.trim() });
+  });
+  for (const id of suppliedIds) if (!accountedBy.has(id)) errors.push(`supplied interpretation ${id} is not accounted for.`);
+  return errors.length ? { ok: false, errors } : { ok: true, value };
 }
 
 export function validateGeneration(raw) {
@@ -133,7 +168,7 @@ export class Contemplation {
     if (!this.enabled()) return null;
     const character = this.store.getCharacter(characterId);
     if (!character) return null;
-    const pool = interpretationPoolOf(character);
+    const pool = poolOf(character);
     this.runtime(pool).pendingCharacters.add(characterId);
     return this.kick(pool);
   }
@@ -156,7 +191,7 @@ export class Contemplation {
   recover() {
     if (!this.enabled()) return;
     for (const character of this.store.listCharacters()) {
-      const pool = interpretationPoolOf(character);
+      const pool = poolOf(character);
       // A chat whose image is still being perceived is triggered by Dialogue once the turn is complete.
       if (this.store.pendingUploadCount(character.id)) continue;
       if (this.store.lastUserMessageId(character.id) > this.store.watermark(pool, character.id)) this.runtime(pool).pendingCharacters.add(character.id);
@@ -237,8 +272,7 @@ export class Contemplation {
     for (const characterId of rt.pendingCharacters) {
       rt.pendingCharacters.delete(characterId);
       const character = this.store.getCharacter(characterId);
-      // A chat that switched to another interpretation pool is evaluated by that pool instead.
-      if (!character || interpretationPoolOf(character) !== rt.pool || !this.enabled()) continue;
+      if (!character || poolOf(character) !== rt.pool || !this.enabled()) continue;
       if (this.store.lastUserMessageId(characterId) > this.store.watermark(rt.pool, characterId)) return characterId;
     }
     return null;
@@ -257,7 +291,7 @@ export class Contemplation {
 
   async retrieveMemory(characterId, conversation) {
     const character = this.store.getCharacter(characterId);
-    const result = await this.memory.retrieve({ pool: memoryPoolOf(character), purpose: "contemplation_memory_retrieval", currentCharacterId: characterId,
+    const result = await this.memory.retrieve({ pool: poolOf(character), purpose: "contemplation_memory_retrieval", currentCharacterId: characterId,
       situation: { conversation: { character: conversation.character, recentMessages: conversation.messages.slice(-RETRIEVAL_SITUATION_MESSAGES) } } });
     return { shortTermMemories: result.shortTermMemories, longTermMemories: result.longTermMemories };
   }
@@ -303,60 +337,105 @@ export class Contemplation {
     }
   }
 
+  // Specification 0004 C1/C4: one consolidation of the whole pool, then the existing per-interpretation check of
+  // every consolidated candidate, then one all-or-nothing commit. Consolidated text is never persisted unverified,
+  // and a failure at any stage leaves the stored interpretations and experiments exactly as they were.
   async runMaintenance(rt, characterId) {
     const pool = rt.pool;
+    const before = this.store.ensureInterpretationPool(pool);
     const snapshot = this.store.interpretations(pool);
     if (!snapshot.length) return { status: "empty" };
-    this.setStage(rt, "maintenance_retrieval", characterId);
-    const conversation = this.conversation(characterId);
-    const memory = await this.retrieveMemory(characterId, conversation);
-    const experiments = this.experimentViews(pool);
-    const experimentIds = new Set(experiments.map((entry) => entry.id));
-    this.setStage(rt, "maintenance", characterId);
-    rt.parallel = { total: snapshot.length, inFlight: 0 };
-    const results = await mapLimited(snapshot, this.maxParallel, async (interpretation) => {
-      rt.parallel.inFlight += 1;
-      try {
-        const payload = { interpretation: { id: wireInterpretation(interpretation.id), text: interpretation.text }, conversation, memory, activeExperiments: experiments,
-          requiredResponseShape: { action: "unchanged", text: null, completedExperimentIds: [] } };
-        const { value } = await this.llm.structured({ purpose: "contemplation_maintenance", messages: [{ role: "system", content: maintenanceSystemPrompt() }, { role: "user", content: JSON.stringify(payload) }],
-          validate: (raw) => validateMaintenance(raw, experimentIds), context: { characterId, pool, interpretationId: interpretation.id } });
-        return { interpretation, ...value };
-      } finally {
-        rt.parallel.inFlight -= 1;
-      }
-    }).finally(() => { rt.parallel = { total: 0, inFlight: 0 }; });
-    // All requests succeeded: apply the batch in one transaction. A result whose interpretation was edited or removed
-    // meanwhile (manual edit) is superseded by that newer state and skipped entirely, including its experiment
-    // completions. A completion is applied only to an experiment whose text is still exactly what the model examined,
-    // so a manual experiment edit made during maintenance is never deleted.
-    const examinedExperiments = new Map(experiments.map((entry) => [entry.id, entry.text]));
-    const outcome = this.store.tx(() => {
-      let interpretationsChanged = 0;
-      let superseded = 0;
-      const completed = new Set();
-      const currentInterpretations = new Map(this.store.interpretations(pool).map((entry) => [entry.id, entry]));
-      for (const result of results) {
-        const current = currentInterpretations.get(result.interpretation.id);
-        if (!current || current.text !== result.interpretation.text) { superseded += 1; continue; }
-        for (const id of result.completedExperimentIds) completed.add(id);
-        if (result.action === "replace" && result.text !== current.text) interpretationsChanged += this.store.updateInterpretation(pool, current.id, result.text);
-        if (result.action === "delete") interpretationsChanged += this.store.deleteInterpretation(pool, current.id);
-      }
-      const currentExperiments = new Map(this.store.experiments(pool).map((entry) => [wireExperiment(entry.id), entry]));
-      let experimentsRemoved = 0;
-      let experimentsKept = 0;
-      for (const id of completed) {
-        const current = currentExperiments.get(id);
-        if (!current || current.text !== examinedExperiments.get(id)) { experimentsKept += 1; continue; }
-        experimentsRemoved += this.store.deleteExperiment(pool, current.id);
-      }
-      if (interpretationsChanged) this.store.bumpInterpretationRevision(pool);
-      if (experimentsRemoved) this.store.bumpExperimentRevision(pool);
-      return { interpretationsChanged, experimentsRemoved, superseded, staleCompletionsSkipped: experimentsKept };
-    });
-    this.diagnostics.event({ type: "contemplation-maintenance", pool, characterId, requests: results.length, actions: results.map((r) => ({ id: r.interpretation.id, action: r.action, completed: r.completedExperimentIds })), ...outcome });
-    return outcome;
+    const report = { type: "contemplation-maintenance", pool, characterId, considered: snapshot.length };
+    let stage = "consolidation";
+    try {
+      this.setStage(rt, "maintenance_consolidation", characterId);
+      const candidates = await this.consolidate(characterId, pool, snapshot);
+      report.candidates = candidates.length;
+      report.merged = snapshot.length - candidates.length;
+      stage = "verification";
+      this.setStage(rt, "maintenance_retrieval", characterId);
+      const conversation = this.conversation(characterId);
+      const memory = await this.retrieveMemory(characterId, conversation);
+      const experiments = this.experimentViews(pool);
+      const experimentIds = new Set(experiments.map((entry) => entry.id));
+      this.setStage(rt, "maintenance", characterId);
+      rt.parallel = { total: candidates.length, inFlight: 0 };
+      const results = await mapLimited(candidates, this.maxParallel, async (candidate) => {
+        rt.parallel.inFlight += 1;
+        try {
+          const payload = { interpretation: { id: wireInterpretation(candidate.id), text: candidate.text }, conversation, memory, activeExperiments: experiments,
+            requiredResponseShape: { action: "unchanged", text: null, completedExperimentIds: [] } };
+          const { value } = await this.llm.structured({ purpose: "contemplation_maintenance", messages: [{ role: "system", content: maintenanceSystemPrompt() }, { role: "user", content: JSON.stringify(payload) }],
+            validate: (raw) => validateMaintenance(raw, experimentIds), context: { characterId, pool, interpretationId: candidate.id } });
+          return { candidate, ...value };
+        } finally {
+          rt.parallel.inFlight -= 1;
+        }
+      }).finally(() => { rt.parallel = { total: 0, inFlight: 0 }; });
+      report.verified = results.length;
+      report.actions = results.map((r) => ({ id: r.candidate.id, sourceIds: r.candidate.sourceIds, action: r.action, completed: r.completedExperimentIds }));
+      stage = "commit";
+      // Every request succeeded: commit the whole verified set only if the pool is still exactly the snapshot the
+      // consolidation read (same revision, ids and texts); otherwise the newer state wins and a later run retries.
+      // A completion is applied only to an experiment whose text is still exactly what the model examined, so a
+      // manual experiment edit made during maintenance is never deleted.
+      const examinedExperiments = new Map(experiments.map((entry) => [entry.id, entry.text]));
+      const original = new Map(snapshot.map((entry) => [entry.id, entry.text]));
+      const outcome = this.store.tx(() => {
+        const current = this.store.interpretations(pool);
+        if (this.store.ensureInterpretationPool(pool).interpretationRevision !== before.interpretationRevision || current.length !== snapshot.length
+          || current.some((entry) => original.get(entry.id) !== entry.text)) {
+          return { applied: false, stale: true, interpretationsChanged: 0, experimentsRemoved: 0 };
+        }
+        let interpretationsChanged = 0;
+        const completed = new Set();
+        for (const { candidate, action, text, completedExperimentIds } of results) {
+          for (const id of candidate.sourceIds) if (id !== candidate.id) interpretationsChanged += this.store.deleteInterpretation(pool, id);
+          for (const id of completedExperimentIds) completed.add(id);
+          if (action === "delete") interpretationsChanged += this.store.deleteInterpretation(pool, candidate.id);
+          else {
+            const finalText = action === "replace" ? text : candidate.text;
+            if (finalText !== original.get(candidate.id)) interpretationsChanged += this.store.updateInterpretation(pool, candidate.id, finalText);
+          }
+        }
+        const currentExperiments = new Map(this.store.experiments(pool).map((entry) => [wireExperiment(entry.id), entry]));
+        let experimentsRemoved = 0;
+        let experimentsKept = 0;
+        for (const id of completed) {
+          const experiment = currentExperiments.get(id);
+          if (!experiment || experiment.text !== examinedExperiments.get(id)) { experimentsKept += 1; continue; }
+          experimentsRemoved += this.store.deleteExperiment(pool, experiment.id);
+        }
+        if (interpretationsChanged) this.store.bumpInterpretationRevision(pool);
+        if (experimentsRemoved) this.store.bumpExperimentRevision(pool);
+        return { applied: true, stale: false, interpretationsChanged, experimentsRemoved, staleCompletionsSkipped: experimentsKept };
+      });
+      this.diagnostics.event({ ...report, status: outcome.applied ? "applied" : "stale", ...outcome });
+      return { status: outcome.applied ? "applied" : "stale", ...outcome };
+    } catch (error) {
+      this.diagnostics.event({ ...report, status: "failed", stage, code: error.code || null });
+      throw error;
+    }
+  }
+
+  // The consolidation request (Specification 0004 C2/C3) sees the complete pool at once. A pool that cannot fit the
+  // Contemplation model's context, or whose unmerged rewrite cannot fit its output budget, is refused, never truncated.
+  async consolidate(characterId, pool, snapshot) {
+    const interpretations = snapshot.map((entry) => ({ id: wireInterpretation(entry.id), text: entry.text }));
+    const messages = [{ role: "system", content: consolidationSystemPrompt() },
+      { role: "user", content: JSON.stringify({ interpretations, requiredResponseShape: { interpretations: [{ id: "int_1", sourceIds: ["int_1"], text: "..." }] } }) }];
+    try { await this.llm.modelCatalog(); } catch {}
+    const fit = this.llm.contextFit("contemplation", messages);
+    if (fit && !fit.fits) {
+      throw coded("CONSOLIDATION_CONTEXT_EXCEEDED", `The ${snapshot.length} interpretations do not fit the Contemplation model's context (estimated ${fit.estimatedTokens} of ${fit.contextLength} tokens including the system prompt and output budget); maintenance was skipped and nothing changed.`);
+    }
+    const output = this.llm.outputFit("contemplation", JSON.stringify(interpretations).length);
+    if (!output.fits) {
+      throw coded("CONSOLIDATION_OUTPUT_EXCEEDED", `Consolidating the ${snapshot.length} interpretations may need about ${output.estimatedTokens} output tokens, above the Contemplation max tokens setting (${output.maxTokens}); maintenance was skipped and nothing changed.`);
+    }
+    const { value } = await this.llm.structured({ purpose: "contemplation_consolidation", messages, validate: (raw) => validateConsolidation(raw, interpretations.map((entry) => entry.id)),
+      context: { characterId, pool, interpretationCount: snapshot.length } });
+    return value.map((entry) => ({ id: parseWire(entry.id, "int"), sourceIds: entry.sourceIds.map((id) => parseWire(id, "int")), text: entry.text }));
   }
 
   async runGeneration(rt, characterId) {

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { makeApp, closeApp, waitFor, reply, TEST_KEY, tempDir, mockOpenRouter } from "./helpers.js";
 import { buildEmergencyDump } from "../src/dump.js";
-import { interpretationPoolOf } from "../src/db.js";
+import { poolOf } from "../src/db.js";
 
 function filesContain(dir, needle) {
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -18,7 +18,7 @@ function filesContain(dir, needle) {
 test("the API key lives only in process memory: not in SQLite, data files, dumps, or diagnostics; restart forgets it", async () => {
   const dataDir = tempDir();
   const { app } = await makeApp({ dialogue_reply: () => reply("Hello there."), contemplation_prefetch: () => ({ generation: false, maintenance: false }) }, { dataDir });
-  const mira = app.createCharacter({ name: "Mira", description: "Keeper", useSharedMemory: false, useSharedInterpretations: false });
+  const mira = app.createCharacter({ name: "Mira", description: "Keeper" });
   app.dialogue.send(mira.id, "hello");
   await waitFor(() => app.store.lastMessage(mira.id).role === "character");
   const { zip } = buildEmergencyDump(app);
@@ -39,8 +39,8 @@ test("Emergency Dump works while work is in flight and contains useful sanitized
   const gate = new Promise((resolve) => { release = resolve; });
   const { app } = await makeApp({ dialogue_reply: async () => { await gate; return reply("done"); }, contemplation_prefetch: async () => { await gate; return { generation: false, maintenance: false }; } });
   try {
-    const mira = app.createCharacter({ name: "Mira", description: "Keeper", useSharedMemory: false, useSharedInterpretations: false });
-    app.contemplation.addExperiment(interpretationPoolOf(mira), "probe");
+    const mira = app.createCharacter({ name: "Mira", description: "Keeper" });
+    app.contemplation.addExperiment(poolOf(mira), "probe");
     app.dialogue.send(mira.id, "hello");
     await waitFor(() => app.diagnostics.pendingExchanges().some((entry) => entry.purpose === "dialogue_reply"));
     const { zip, manifest } = buildEmergencyDump(app);

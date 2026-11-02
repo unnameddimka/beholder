@@ -9,8 +9,9 @@ context of the chat, and the character reacts to that observation.
 
 Full requirements: [docs/specs/0000-beholder-poc.md](docs/specs/0000-beholder-poc.md), amended by
 [0001](docs/specs/0001-dialogue-response-reliability-and-time-awareness.md),
-[0002](docs/specs/0002-gestaltization-readonly-contemplation-baidu.md), and
-[0003](docs/specs/0003-contextual-vision-image-observations.md).
+[0002](docs/specs/0002-gestaltization-readonly-contemplation-baidu.md),
+[0003](docs/specs/0003-contextual-vision-image-observations.md), and
+[0004](docs/specs/0004-interpretation-consolidation-personal-cognition-mobile-composer.md).
 
 > **Trusted LAN only.** Plain HTTP, no authentication, no HTTPS. Never expose the port to the internet.
 
@@ -45,11 +46,10 @@ SQLite (`data/beholder.sqlite`), generated images (`data/images/`), and images y
    Contemplation, 4,096 for Vision). Image generation is off by default; it does not affect attaching your own images.
    Contemplation is on by default. Save.
 4. On the home page, optionally fill in **About you**. It is pinned as the first user message for every character.
-5. **Add Character**: a display name, an AI-facing description, and the two scope flags:
-   - *Use shared memory*: reads and writes the shared memory pool instead of the character's private pool.
-   - *Use shared interpretations*: reads and writes the shared interpretation and experiment pool.
-
-   Changing a flag later only switches which pool is active. Nothing is merged, copied, or deleted.
+5. **Add Character**: a display name and an AI-facing description. Each character owns its cognition (spec 0004):
+   its own short- and long-term memory, interpretations, gestalt, experiments, and Contemplation progress. A new
+   character starts with all of them empty; nothing is shared or copied between characters. (Older versions had
+   *Use shared memory* / *Use shared interpretations* flags; they are gone, and the API ignores them if sent.)
 
 ## Testing Contemplation by hand
 
@@ -57,6 +57,9 @@ SQLite (`data/beholder.sqlite`), generated images (`data/images/`), and images y
    Contemplation model runs a cheap prefetch. It sees the interpretations, the last 100 messages and the active
    experiments (never consolidated memory), and requests maintenance when an interpretation needs revisiting or an
    experiment appears to have produced a result.
+   Maintenance first consolidates the whole interpretation set in one request (duplicates merge, distinct and
+   conflicting hypotheses stay separate), then checks each consolidated interpretation against the conversation,
+   and saves the result only if every step succeeded.
    When the prefetch sees a genuinely new angle, generation adds an interpretation.
 2. Open **Contemplation** (from the chat header). The page is read-only. It shows the gestalt (with "Not formed yet" or
    "Update pending" when that applies), the interpretations, the active experiments, the current stage, the number of
@@ -70,11 +73,15 @@ SQLite (`data/beholder.sqlite`), generated images (`data/images/`), and images y
 
 ## Attaching an image
 
-Use **Attach Image** (left of the message field) to pick one PNG, JPEG, or WebP file of at most 10 MiB. A preview
-appears above the field; **Remove** takes it off again. Send it with or without text. The chat shows the image in
+Use the paperclip button (**Attach image**, left of the message field) to pick one PNG, JPEG, or WebP file of at most
+10 MiB. A preview appears above the field; **Remove** takes it off again. Send it with or without text. The chat shows the image in
 your message with a small note: "Viewing..." while the Vision model looks at it, then a collapsed **What <name> saw**
 with the observation, or "Could not be viewed". The character's reply waits for the observation. If Vision fails, the
 reply knows only that an image could not be viewed and never pretends to have seen it.
+
+The message field grows with its lines up to about a third of the screen, then scrolls. **Enter always inserts a
+new line** (with or without Shift, Ctrl, or an input method); only the Send button (the paper plane, right of the
+field) sends.
 
 **Emergency Dump** (the red **Dump** button, always in the header) downloads a sanitized ZIP of state and diagnostics.
 It works while the server is busy and never changes state.
@@ -86,7 +93,7 @@ npm test        # node --check on every .js file, then node --test with a mocked
 ```
 
 The tests cover the acceptance scenarios that can be automated: key secrecy across restarts, dumps, and data files;
-scope flags; context assembly (pinned self-description, gestalt and experiments in, interpretations out); envelope
+character-owned pools; context assembly (pinned self-description, gestalt and experiments in, interpretations out); envelope
 repair; Retry
 without duplication; the 100/20/80 Verbatim→STM threshold and failure safety; daily STM→LTM catch-up without double
 consolidation; prefetch inputs; both-flags ordering with concurrent maintenance; coalescing; stale-result protection;
@@ -98,14 +105,20 @@ disabled state, the gestalt in every Dialogue mode and scope, the read-only page
 request); and the spec 0003 scenarios (settings and schema migration, the exact Vision inputs, perception before the
 reply, typed observations in Dialogue, Contemplation and STM, the failure fallback, incompatible models and oversized
 context, Retry and restart without duplicates, upload validation and serving, file reconciliation, the STM batch
-boundary, and no image data in diagnostics or dumps). Whether a live model writes a good gestalt or an accurate,
+boundary, and no image data in diagnostics or dumps); and the spec 0004 scenarios (one consolidation of the whole
+pool before verification, the verifier seeing consolidated text, the ID-mapping validator, all-or-nothing and stale
+commits, no revision bump for an unchanged set, the context and output-budget refusal, empty cognition for a new
+character, the shared-pool migration with its revisions, gestalt and watermarks, restart idempotence, refusal of
+ambiguous legacy states, and a source scan of the composer contract). Whether a live model writes a good gestalt or an accurate,
 non-interpretive observation is a manual judgment, not something the tests can certify.
 
 ### Manual smoke procedure (Android / LAN)
 
 1. Start with Compose and open `http://<lan-ip>:3000` in Chrome on Android. Enter the key.
-2. Create two characters with different flag combinations. Send a message containing `*waves*`: it shows in italics
-   without asterisks. While the reply is pending, keep typing: Send and Enter stay disabled, and the draft is kept.
+2. Create a character. Send a message containing `*waves*`: it shows in italics without asterisks. While the reply
+   is pending, keep typing: Send stays disabled, and the draft is kept. Enter inserts new lines and never sends.
+   In portrait (320-400 px wide), with the keyboard open, the field spans the width between the two icon buttons,
+   grows to its limit, then scrolls; the composer stays visible above the keyboard.
 3. Open an empty chat and wait 60 s without typing: one opener arrives. Start typing in another case: nothing arrives.
 4. Enable images, then ask a character to show you something: the text appears first, the picture later.
 5. Restart the container (`docker compose restart`): the key is required again, and chats and images are still there.
@@ -161,17 +174,33 @@ non-interpretive observation is a manual judgment, not something the tests can c
   repartition rules, LTM selector + writer with exhaustive retirement groups, and size partitioning are ported. Society's
   fictional-calendar temporal anchors, protected records, and old-LTM reconsolidation are not. Records keep real
   source timestamps (period) and conversation attribution (character name and message ids) instead. Records are written
-  in neutral third person so they work in shared pools.
+  in neutral third person.
 - **Verbatim→STM:** triggered when a chat has 100 active messages. The 20 oldest are consumed and the other 80 are
-  read-only context. Writable STM is limited to records from the same chat in the same pool, so another character's
-  conversation is never rewritten. On failure, the sources stay active and an automatic retry waits 5 minutes (the
+  read-only context. On failure, the sources stay active and an automatic retry waits 5 minutes (the
   next qualifying message after that retries).
 - **STM→LTM:** checked at startup, every minute, and at local midnight. Each pool records its own last successful
   date. The global date advances only when every pool succeeds. Each LTM job commits atomically, so a later failure
   keeps the remaining STM for the retry (15-minute backoff). Every STM present when the boundary runs is consolidated.
-- **Contemplation:** one serial pipeline per interpretation pool. Maintenance requests within a batch run in parallel
-  (up to 16 at once). The batch applies all-or-nothing. A result for an interpretation that was edited through the
-  API in the meantime is skipped as superseded, including the experiment completions it reported. A completion
+- **Character-owned cognition (spec 0004):** every character has exactly one memory pool and one interpretation pool,
+  keyed internally as `character:<id>`. Every subsystem (dialogue retrieval, prefetch, maintenance, generation,
+  gestaltization, experiment planning, Vision's gestalt, STM and daily LTM consolidation, watermarks, recovery, the
+  dump) uses that pool. Schema migration 4 moves the legacy `shared` pools to the one character that used them,
+  keeping every row's id, text, timestamps and provenance and the pool state (revisions, planning flag, gestalt and
+  its revision, memory revision and LTM date, watermarks); only the pool key changes. It then drops the two flag
+  columns. It refuses, without changing anything, when the owner is ambiguous: nonempty shared data used by zero or
+  several characters, contributions from another character's chat, or a character with both a nonempty shared and a
+  nonempty personal pool. The server then does not start; restore a backup or move the legacy rows by hand.
+- **Contemplation:** one serial pipeline per interpretation pool. Maintenance (spec 0004) starts with one
+  consolidation request that sees the whole pool at once and returns groups by stable id (a surviving id, the ids it
+  represents, the new text). It is semantic deduplication only: no plausibility judgment, no target count, no new
+  hypotheses. The result must account for every id exactly once; otherwise it is repaired or fails. Each consolidated
+  interpretation then gets the existing check against the conversation, memory and experiments, in parallel (up to
+  16 at once). Only when every request succeeded is the final set committed in one transaction: merged-away ids
+  deleted, verified text written, completions applied, and the interpretation revision bumped once if anything
+  changed. If the pool changed during the requests (an edit through the API), the whole result is discarded and a
+  later run retries. If the pool would not fit the model's context (system prompt, interpretations and output
+  budget, estimated at 3 characters per token) or its unmerged rewrite would not fit the max output tokens setting,
+  maintenance is skipped and recorded; the set is never truncated. A completion
   retires an experiment only if its text is still exactly what the model examined, so an experiment edit made through
   the API is never lost. Generation is reviewed by a second Contemplation-model call (distinct and compatible?), with
   one retry using the reviewer's feedback, otherwise it declines. The candidate commits only if the interpretation
@@ -181,8 +210,7 @@ non-interpretive observation is a manual judgment, not something the tests can c
   Interpretation edits through the API are debounced by 200 ms so quick edits produce one review.
   A per-(pool, chat) watermark of the last processed user message is persisted. It advances only after a successful
   cycle, so restarts and failures re-evaluate unprocessed evidence.
-- **Gestalt (spec 0002):** one gestalt per interpretation pool, so a shared pool has one gestalt shared by its
-  characters. It is stored in SQLite with the interpretation revision it reflects and its update time. Order in a
+- **Gestalt (spec 0002):** one gestalt per interpretation pool, so one per character. It is stored in SQLite with the interpretation revision it reflects and its update time. Order in a
   cycle: prefetch, maintenance, generation, gestaltization, experiment review. Gestaltization runs only when the
   interpretation revision changed (generation, maintenance, or an edit through the API), once per cycle against the
   final interpretations. Experiment changes and messages that change no interpretation cost no gestalt call. The
@@ -252,6 +280,12 @@ non-interpretive observation is a manual judgment, not something the tests can c
   not defended against.
 - The browser UI has no automated tests; the navigation guard (review P2-2) is covered only by code review. The
   read-only Contemplation page is checked only by a source scan for mutation requests and controls.
+- Consolidation quality (merging true duplicates while keeping distinct and conflicting hypotheses) needs real-model
+  inspection; the tests check the prompt, inputs, ID mapping and commit rules, not semantic judgment. Its size checks
+  are estimates like the gestalt's.
+- The mobile composer is checked by a source scan only. Behavior with real software keyboards (Android and iOS) needs a
+  manual check on devices; iOS Safari does not resize the layout for the keyboard, so the page follows the visual
+  viewport height instead.
 - The gestalt's context check is an estimate. A model whose tokenizer is less efficient than 3 characters per token can
   still reject an oversized request; that also fails visibly and keeps the previous gestalt.
 - The interpretation and experiment edit routes and the Force route remain on the server for compatibility (spec 0002

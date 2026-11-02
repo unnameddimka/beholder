@@ -7,7 +7,7 @@ import { parseImageResponse, detectRasterMime, selectImageOptions } from "../src
 
 // A minimal valid PNG signature followed by padding (signature checks only; no decoder is used).
 const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(64, 1)]);
-const base = { name: "Mira", description: "Keeper.", useSharedMemory: false, useSharedInterpretations: false };
+const base = { name: "Mira", description: "Keeper." };
 
 function imageApi({ gate = null, viaUrl = false } = {}) {
   const seen = [];

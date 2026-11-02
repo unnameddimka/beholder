@@ -3,7 +3,7 @@
 // perceived by Vision (Specification 0003); the reply then sees the observation, or knows the image was not seen. It sees a snapshot of the pool's gestalt and
 // active experiment intentions (never interpretation texts) and Society-style retrieved memory.
 import { coded } from "./utils.js";
-import { interpretationPoolOf, memoryPoolOf } from "./db.js";
+import { poolOf } from "./db.js";
 import { messageView } from "./memory.js";
 import { dialogueSystemPrompt, historyMessages, pinnedSelfDescriptionMessage, validateDialogueEnvelope, MESSAGE_MAX_CHARS } from "./prompts/dialogue.js";
 import { VERBATIM_WINDOW } from "./memory.js";
@@ -169,12 +169,12 @@ export class Dialogue {
     const settings = this.settings.get();
     const history = this.store.activeMessages(characterId, VERBATIM_WINDOW);
     // Snapshot of the gestalt and experiment intentions at request start; later updates apply to the next request only.
-    // Both come from the character's current interpretation pool and only while Contemplation is enabled.
-    const pool = interpretationPoolOf(character);
+    // Both come from the character's own interpretation pool and only while Contemplation is enabled.
+    const pool = poolOf(character);
     const gestalt = settings.contemplationEnabled ? this.store.ensureInterpretationPool(pool).gestalt : null;
     const experiments = settings.contemplationEnabled ? this.store.experiments(pool) : [];
     progress.stage = "retrieval";
-    const memories = await this.memory.retrieve({ pool: memoryPoolOf(character), purpose: "dialogue_memory_retrieval", currentCharacterId: characterId,
+    const memories = await this.memory.retrieve({ pool, purpose: "dialogue_memory_retrieval", currentCharacterId: characterId,
       situation: { character: character.name, mode, recentMessages: history.slice(-RETRIEVAL_SITUATION_MESSAGES).map((message) => messageView(message, character.name)) } });
     progress.stage = "dialogue";
     const imagesByMessage = new Map(this.store.imagesForCharacter(characterId).map((image) => [image.messageId, image]));

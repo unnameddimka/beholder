@@ -17,6 +17,7 @@ export const PURPOSE_ROLES = Object.freeze({
   memory_ltm_consolidation: "dialogue",
   contemplation_prefetch: "contemplation",
   contemplation_memory_retrieval: "contemplation",
+  contemplation_consolidation: "contemplation",
   contemplation_maintenance: "contemplation",
   contemplation_generation: "contemplation",
   contemplation_generation_review: "contemplation",
@@ -78,6 +79,13 @@ export class LlmClient {
     const images = parts.filter((part) => part.type === "image_url").length;
     const estimatedTokens = Math.ceil(characters / CHARS_PER_TOKEN_ESTIMATE) + images * IMAGE_TOKEN_ALLOWANCE + maxTokens;
     return { fits: estimatedTokens <= contextLength, estimatedTokens, contextLength };
+  }
+
+  // Pre-flight estimate of whether an output of about this many characters fits the role's output token budget.
+  outputFit(role, characters) {
+    const { maxTokens } = this.requestParameters(role);
+    const estimatedTokens = Math.ceil(characters / CHARS_PER_TOKEN_ESTIMATE);
+    return { fits: estimatedTokens <= maxTokens, estimatedTokens, maxTokens };
   }
 
   // Whether the catalogue says a model accepts image input and returns text. Unknown (uncatalogued) is not refused.

@@ -5,8 +5,8 @@ folder's file describes a different project (a SugarCube RPG) and does not apply
 
 ## Scope
 
-- The authoritative requirements are `docs/specs/0000-beholder-poc.md`, amended by specs 0001, 0002, and 0003 in
-  `docs/specs/`. Implement only what an approved spec says. Scope expansion needs a new, explicitly approved spec.
+- The authoritative requirements are `docs/specs/0000-beholder-poc.md`, amended by specs 0001, 0002, 0003, and 0004
+  in `docs/specs/`. Implement only what an approved spec says. Scope expansion needs a new, explicitly approved spec.
 - Society (`../society/society`) is a read-only implementation donor. Never modify it.
 
 ## Invariants
@@ -30,6 +30,14 @@ folder's file describes a different project (a SugarCube RPG) and does not apply
 - Uploaded originals live in `data/uploaded-images` under random names and are served only by a recorded name.
 - The prefetch input is exactly the whole interpretation pool, up to the last 100 verbatim messages of the
   triggering chat, and the pool's active experiment intentions (possibly empty). No consolidated memory.
+- Each character owns exactly one memory pool and one interpretation pool (`poolOf(character)`, key
+  `character:<id>`), with its STM/LTM, interpretations, gestalt, experiments, revisions and watermarks. There is no
+  shared pool and no scope flag; never add a lookup path that reads another character's cognition. A new character
+  starts empty.
+- Maintenance is: one consolidation request over the complete interpretation pool (semantic deduplication by stable
+  ids, never plausibility filtering, no count target, never truncated), then the per-interpretation check of each
+  consolidated candidate, then one transaction guarded by the snapshot it read. Nothing intermediate is persisted.
+- In the chat composer, Enter always inserts a newline; only the Send button sends.
 - Experiment planning input is only the interpretation pool and the active experiment array. Its output replaces the
   whole array atomically, guarded by interpretation and experiment revisions.
 - A maintenance batch applies all-or-nothing. Maintenance, then generation, then gestaltization (only when the

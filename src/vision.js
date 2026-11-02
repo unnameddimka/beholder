@@ -3,7 +3,7 @@
 // never throws to its caller: a failure is recorded on the upload, and Dialogue then knows the image was not seen.
 import fs from "node:fs/promises";
 import { coded } from "./utils.js";
-import { interpretationPoolOf } from "./db.js";
+import { poolOf } from "./db.js";
 import { messageView, VERBATIM_WINDOW } from "./memory.js";
 import { detectRasterMime } from "./images.js";
 import { visionSystemPrompt, VISION_OBSERVATION_MAX_CHARS } from "./prompts/vision.js";
@@ -83,7 +83,7 @@ export class Vision {
       const capability = this.llm.visionCapability(model);
       if (!capability.ok) throw coded("VISION_MODEL_INCOMPATIBLE", `The Vision model ${model} does not accept image input with text output according to the OpenRouter catalogue; choose an image-capable model in Settings.`);
       const settings = this.settings.get();
-      const gestalt = settings.contemplationEnabled ? this.store.ensureInterpretationPool(interpretationPoolOf(character)).gestalt : null;
+      const gestalt = settings.contemplationEnabled ? this.store.ensureInterpretationPool(poolOf(character)).gestalt : null;
       const history = this.store.activeMessages(upload.characterId, VERBATIM_WINDOW);
       const messages = this.buildMessages({ character, history, gestalt, messageId: upload.messageId, dataUrl: `data:${upload.mime};base64,${bytes.toString("base64")}` });
       const fit = this.llm.contextFit("vision", messages);

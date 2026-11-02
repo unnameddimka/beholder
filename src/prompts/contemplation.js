@@ -15,7 +15,7 @@ const ROLE = [
 
 const EVIDENCE_RULES = [
   "Evidence: conversation.messages are verbatim chat messages between the user and the named character, oldest first; text between *asterisks* is roleplay action or narration.",
-  "memory records, when supplied, are consolidated recollection from the selected memory pool; each names the conversation it comes from. A record from another character's conversation is real evidence about the user but was not an interaction with the current character.",
+  "memory records, when supplied, are the character's own consolidated recollection; each names the conversation it comes from.",
   "What the user says is evidence of what they said and chose to present, not proof that it is literally true.",
   "An entry with type image_observation is not speech: it is the character's perception of an image the user attached to the message named in imageAttachedTo, describing only what the image visibly shows. That the user showed the image, and what they said about it, is evidence; what they claim about it (for example that it is their selfie) remains their claim. A message whose attachedImage could not be viewed has unknown content."
 ].join(" ");
@@ -28,6 +28,23 @@ export function prefetchSystemPrompt() {
     "maintenance = true if any existing interpretation plausibly needs checking or revising against the newest evidence (it may be contradicted, strengthened, enriched, or outdated), or if the newest evidence plausibly completes or materially advances one of the activeExperiments (the character's current intentions to learn something about the user; the list may be empty). With no interpretations, maintenance is false.",
     "Both may be false; both may be true.",
     "Return exactly {\"generation\": true|false, \"maintenance\": true|false} and nothing else. No explanation."
+  ].join(" ");
+}
+
+// Specification 0004 C2: the first stage of Maintenance. Semantic deduplication only; truth, evidence and plausibility
+// are judged afterwards by the per-interpretation maintenance check.
+export function consolidationSystemPrompt() {
+  return [
+    ROLE,
+    "You consolidate the interpretation pool. You see every current interpretation at once, each with its id. Over time several interpretations can come to tell the same explanation, or to retell the same incidents; the pool should instead hold a set of different, competing explanatory hypotheses about the user, not a fragmented chat history.",
+    "This is deduplication, NOT verification. You have no evidence and must not judge whether any interpretation is true, well supported, plausible, likely, or sensible. Never drop, weaken, or merge an interpretation because it is unusual, implausible, speculative, unproven, or in conflict with another one; that is decided later by a separate check against the actual conversation.",
+    "Merge interpretations that express the same underlying explanation: paraphrases, differently worded versions of one idea, entries that differ only in recent anecdotes or incidental details, and entries that repeat the same chronology of the dialogue.",
+    "When one interpretation is a narrower version of another, keep its meaningful distinctive nuance inside the single merged interpretation instead of copying the common explanation into several.",
+    "Keep genuinely different explanations separate, including different explanations of the same events and openly conflicting or mutually incompatible hypotheses. Each resulting interpretation must express a distinct explanatory hypothesis, not a summary of a different part of the conversation.",
+    "In every resulting text, strip excessive retelling of the dialogue and of evidence to the minimum needed to state the hypothesis; detailed event history belongs to ordinary memory, not here. Keep the free-form, imaginative prose and the language of the original.",
+    "Do not invent new hypotheses that none of the inputs expresses. There is no target, minimum, or maximum number of interpretations: the result follows only from how many genuinely different explanations exist. If all of them are distinct, return all of them.",
+    "Account for every supplied id exactly once. Each output entry has id (the id of one of the interpretations it represents; keep that interpretation's own id when it stands alone), sourceIds (every supplied id this entry represents, including its own id; more than one only for a merge) and text (the resulting interpretation).",
+    `Return exactly {"interpretations": [{"id": <supplied id>, "sourceIds": [<supplied ids>], "text": <interpretation prose>}]}. Each text is non-empty and at most ${INTERPRETATION_MAX_CHARS} characters. Return one JSON object only.`
   ].join(" ");
 }
 

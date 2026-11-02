@@ -1,9 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { makeApp, closeApp, waitFor, reply, completion, jsonResponse, sleep } from "./helpers.js";
-import { interpretationPoolOf } from "../src/db.js";
+import { poolOf } from "../src/db.js";
 
-const character = (overrides = {}) => ({ name: "Mira", description: "A sardonic lighthouse keeper.", useSharedMemory: false, useSharedInterpretations: false, ...overrides });
+const character = (overrides = {}) => ({ name: "Mira", description: "A sardonic lighthouse keeper.", ...overrides });
 
 test("dialogue context: character prompt, pinned self-description first, experiments yes, interpretations never", async () => {
   const { app, mock } = await makeApp({
@@ -13,7 +13,7 @@ test("dialogue context: character prompt, pinned self-description first, experim
   try {
     app.settings.setUserDescription("I am a night-shift nurse who likes puzzles.");
     const mira = app.createCharacter(character());
-    const pool = interpretationPoolOf(mira);
+    const pool = poolOf(mira);
     app.contemplation.addInterpretation(pool, "SECRET-INTERPRETATION: the user is testing the character.");
     app.contemplation.addExperiment(pool, "Explore whether the user enjoys an absurd story.");
     await app.contemplation.idle(pool).catch(() => {});
@@ -39,7 +39,7 @@ test("contemplation disabled omits experiments from dialogue and schedules no pr
   const { app, mock } = await makeApp({ dialogue_reply: () => reply("Okay.") });
   try {
     const mira = app.createCharacter(character());
-    app.contemplation.addExperiment(interpretationPoolOf(mira), "Show unexpected tenderness.");
+    app.contemplation.addExperiment(poolOf(mira), "Show unexpected tenderness.");
     app.settings.update({ contemplationEnabled: false });
     app.dialogue.send(mira.id, "hello");
     await waitFor(() => app.store.lastMessage(mira.id)?.role === "character");
