@@ -44,10 +44,11 @@ export class Vision {
     this.inFlight = new Map();
   }
 
-  // At most one perception per upload at a time; a repeated call joins the running one.
-  observe(uploadId) {
+  // At most one perception per upload at a time; a repeated call joins the running one. profile is the frozen
+  // snapshot of the reply job this perception belongs to (review 0005 P2-A).
+  observe(uploadId, profile = null) {
     if (!this.inFlight.has(uploadId)) {
-      const job = this.run(uploadId).finally(() => this.inFlight.delete(uploadId));
+      const job = this.run(uploadId, profile).finally(() => this.inFlight.delete(uploadId));
       this.inFlight.set(uploadId, job);
     }
     return this.inFlight.get(uploadId);
@@ -68,14 +69,15 @@ export class Vision {
     ];
   }
 
-  async run(uploadId) {
+  async run(uploadId, profile = null) {
     const upload = this.store.getUpload(uploadId);
     if (!upload || upload.status !== "pending") return { status: upload?.status ?? "missing" };
     const startedMs = Date.now();
     const context = { characterId: upload.characterId, messageId: upload.messageId, uploadId };
-    // The owning character's Vision configuration and descriptions, frozen for this perception.
-    const owner = this.store.getCharacter(upload.characterId);
-    const character = owner ? profileOf(owner) : null;
+    // The owning character's Vision configuration and descriptions: the reply job's snapshot when it has one for
+    // this character, otherwise one frozen now for this perception.
+    const owner = profile?.characterId === upload.characterId ? null : this.store.getCharacter(upload.characterId);
+    const character = profile?.characterId === upload.characterId ? profile : owner ? profileOf(owner) : null;
     const model = character?.config.models.vision ?? null;
     try {
       if (!character) throw coded("CHARACTER_NOT_FOUND", "Character not found.");

@@ -573,10 +573,11 @@ test("F2/24/26: Force queues the existing stages once per kind and keeps each ch
     const b = app.createCharacter({ name: "B" });
     const pool = seedPool(app, a, ["One."]);
     seedMessages(app, a.id, 2);
-    assert.deepEqual(app.contemplation.force(pool, "maintenance", a.id), { queued: true });
-    assert.deepEqual(app.contemplation.force(pool, "maintenance", a.id), { queued: false, reason: "running" });
-    assert.deepEqual(app.contemplation.force(pool, "generation", a.id), { queued: true });
-    assert.deepEqual(app.contemplation.force(pool, "generation", a.id), { queued: false, reason: "already_queued" });
+    // Review 0005 P2-B: each accepted request has an id; a duplicate click names the request it joined.
+    assert.deepEqual(app.contemplation.force(pool, "maintenance", a.id), { queued: true, requestId: 1 });
+    assert.deepEqual(app.contemplation.force(pool, "maintenance", a.id), { queued: false, reason: "running", requestId: 1 });
+    assert.deepEqual(app.contemplation.force(pool, "generation", a.id), { queued: true, requestId: 2 });
+    assert.deepEqual(app.contemplation.force(pool, "generation", a.id), { queued: false, reason: "already_queued", requestId: 2 });
     assert.throws(() => app.contemplation.force(pool, "maintenance", b.id), /A character is required/);
     const status = app.contemplation.status(pool);
     assert.equal(status.maintenance, "running");
@@ -591,7 +592,7 @@ test("F2/24/26: Force queues the existing stages once per kind and keeps each ch
     const { server, url } = await listen(app);
     try {
       const view = await (await fetch(`${url}/api/characters/${a.id}/contemplation/force`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind: "experimentation" }) })).json();
-      assert.deepEqual(view.force, { queued: true });
+      assert.deepEqual(view.force, { queued: true, requestId: 3 });
       assert.equal(view.status.lastMaintenance.source, "forced");
     } finally { server.close(); }
   } finally { closeApp(app); }
@@ -704,4 +705,156 @@ test("4/30/31: Ctrl+Enter alone runs the Send handler; IME composition, repeats,
   // submit is the Send button's handler and already refuses empty, pending or in-flight sends.
   assert.match(source, /sendButton\.addEventListener\("click", submit\)/);
   assert.match(source, /if \(\(!text && !attachment\) \|\| chatState\.pending \|\| sending\) return;\s*sending = true;/);
+});
+
+// ---- review 0005 regressions ----------------------------------------------------------------------------------------
+
+test("review 0005 P2-A: a reply with an image keeps the profile it started with through Vision, retrieval, the reply and its image", async () => {
+  const { gate, release } = gated();
+  const seenImages = [];
+  const images = async (url, init) => {
+    if (url.endsWith("/endpoints")) return jsonResponse(200, { data: { endpoints: [] } });
+    seenImages.push(JSON.parse(init.body));
+    return jsonResponse(200, { data: [{ b64_json: PNG.toString("base64"), media_type: "image/png" }] });
+  };
+  const nameOf = (body) => /You are (\w+),/.exec(body.messages[0].content)?.[1];
+  const { app, mock } = await makeApp({
+    vision_observation: async (body, ctx) => { if (ctx.count === 1) await gate; return "The image shows a small square of color."; },
+    dialogue_memory_retrieval: () => ({ stmIds: [], ltmIds: [] }),
+    dialogue_reply: (body) => reply(`hi from ${nameOf(body)}`, { imageRequest: nameOf(body) === "A" ? "a lighthouse" : null }),
+    contemplation_prefetch: quietPrefetch
+  }, { images });
+  try {
+    const a = app.createCharacter({ name: "A", ...described, config: { models: { dialogue: "vendor/a-before", vision: "vendor/a-vision-before", image: "vendor/a-image-before" }, imageEnabled: true } });
+    const b = app.createCharacter({ name: "B", ...described, config: { models: { dialogue: "vendor/b-dialogue" } } });
+    for (const character of [a, b]) app.store.insertMemory({ pool: poolOf(character), tier: "ltm", topic: "t", summary: "s", retrievalBrief: "", importance: 0.5, sources: [] });
+    const idleA = () => !app.dialogue.chat(a.id).pending && app.store.lastMessage(a.id)?.role === "character" && app.store.allImages().every((image) => image.status === "ready");
+    await app.dialogue.sendImage(a.id, "look", { image: PNG });
+    await waitFor(() => mock.byPurpose("vision_observation").length === 1, { message: "Vision in flight" });
+    app.updateCharacter(a.id, { sceneDescription: "NEW-SCENE", userDescription: "NEW-USER",
+      config: { models: { dialogue: "vendor/a-after", vision: "vendor/a-vision-after", image: "vendor/a-image-after" } } });
+    app.dialogue.send(b.id, "meanwhile");
+    await waitFor(() => app.store.lastMessage(b.id)?.role === "character" && !app.dialogue.chat(b.id).pending);
+    release();
+    await waitFor(() => idleA() && app.store.allImages().length === 1);
+
+    const visionContext = (call) => JSON.parse(call.body.messages[1].content[0].text).characterContext;
+    const forA = (purpose) => mock.byPurpose(purpose).filter((call) => (purpose === "dialogue_reply" ? nameOf(call.body) : payloadOf(call).characterContext.characterName) === "A");
+    const [vision] = mock.byPurpose("vision_observation");
+    assert.deepEqual([vision.body.model, visionContext(vision).sceneDescription, visionContext(vision).userDescription], ["vendor/a-vision-before", "SCENE-DESC", "USER-DESC"]);
+    const [retrieval] = forA("dialogue_memory_retrieval");
+    assert.deepEqual([retrieval.body.model, payloadOf(retrieval).characterContext.sceneDescription, payloadOf(retrieval).characterContext.userDescription], ["vendor/a-before", "SCENE-DESC", "USER-DESC"]);
+    const [dialogue] = forA("dialogue_reply");
+    assert.equal(dialogue.body.model, "vendor/a-before");
+    assert.match(JSON.stringify(dialogue.body.messages), /SCENE-DESC[\s\S]*USER-DESC|USER-DESC[\s\S]*SCENE-DESC/);
+    assert.doesNotMatch(JSON.stringify(dialogue.body.messages), /NEW-SCENE|NEW-USER/);
+    assert.equal(seenImages[0].model, "vendor/a-image-before", "the image queued by that reply uses the same snapshot");
+    assert.doesNotMatch(seenImages[0].prompt, /NEW-SCENE|NEW-USER/);
+    assert.deepEqual(mock.byPurpose("dialogue_reply").filter((call) => nameOf(call.body) === "B").map((call) => call.body.model), ["vendor/b-dialogue"], "the concurrent character keeps its own values");
+
+    // A newly started job takes the edited values everywhere.
+    await app.dialogue.sendImage(a.id, "again", { image: PNG });
+    await waitFor(() => forA("dialogue_reply").length === 2 && idleA() && app.store.allImages().length === 2);
+    const vision2 = mock.byPurpose("vision_observation")[1];
+    assert.deepEqual([vision2.body.model, visionContext(vision2).sceneDescription, visionContext(vision2).userDescription], ["vendor/a-vision-after", "NEW-SCENE", "NEW-USER"]);
+    assert.equal(forA("dialogue_memory_retrieval")[1].body.model, "vendor/a-after");
+    assert.equal(forA("dialogue_reply")[1].body.model, "vendor/a-after");
+    assert.match(JSON.stringify(forA("dialogue_reply")[1].body.messages), /NEW-SCENE/);
+    assert.equal(seenImages[1].model, "vendor/a-image-after");
+    await app.contemplation.idle(poolOf(a));
+    await app.contemplation.idle(poolOf(b));
+  } finally { closeApp(app); }
+});
+
+test("review 0005 P2-B: Force Generation and Experimentation each report queued, running, then completed or failed, per character", async () => {
+  const gates = { maintenance: gated(), generation: gated(), experimentation: gated() };
+  let fail = false;
+  const failing = () => jsonResponse(400, { error: { message: "provider refused" } });
+  const { app } = await makeApp({
+    contemplation_consolidation: async (body) => { await gates.maintenance.gate; return identityConsolidation(body); },
+    contemplation_memory_retrieval: () => ({ stmIds: [], ltmIds: [] }),
+    contemplation_maintenance: unchanged,
+    contemplation_generation: async () => { await gates.generation.gate; return fail ? failing() : { decision: "decline", text: null }; },
+    contemplation_gestaltization: () => ({ gestalt: "Whole." }),
+    contemplation_experiment_planning: async () => { await gates.experimentation.gate; return fail ? failing() : { experiments: [{ id: null, text: "Ask about the sea." }] }; }
+  });
+  try {
+    const a = app.createCharacter({ name: "A" });
+    const b = app.createCharacter({ name: "B" });
+    const pool = seedPool(app, a, ["One."]);
+    seedMessages(app, a.id, 2);
+    const force = (kind) => app.contemplation.force(pool, kind, a.id);
+    const forceStatus = () => app.contemplation.status(pool).force;
+    const states = () => Object.fromEntries(Object.entries(forceStatus()).map(([kind, entry]) => [kind, entry.state]));
+    const untouched = Object.fromEntries(["maintenance", "generation", "experimentation"].map((kind) => [kind, { state: "idle", requestId: null, last: null }]));
+
+    assert.deepEqual(force("maintenance"), { queued: true, requestId: 1 });
+    assert.deepEqual(force("generation"), { queued: true, requestId: 2 });
+    assert.deepEqual(force("experimentation"), { queued: true, requestId: 3 });
+    assert.deepEqual(states(), { maintenance: "running", generation: "queued", experimentation: "queued" });
+    assert.deepEqual(forceStatus().generation, { state: "queued", requestId: 2, last: null }, "accepted is never shown as completed");
+    assert.deepEqual(app.contemplation.status(poolOf(b)).force, untouched);
+
+    gates.maintenance.release();
+    await waitFor(() => states().generation === "running");
+    assert.deepEqual([forceStatus().maintenance.last.status, forceStatus().maintenance.last.result], ["completed", "unchanged"]);
+    assert.equal(app.contemplation.status(pool).lastMaintenance.status, "unchanged", "the persisted Maintenance record is unchanged");
+    assert.deepEqual(force("generation"), { queued: false, reason: "running", requestId: 2 });
+
+    gates.generation.release();
+    await waitFor(() => states().experimentation === "running");
+    const generation = forceStatus().generation;
+    assert.deepEqual([generation.state, generation.last.requestId, generation.last.status, generation.last.result, generation.last.characterId], ["idle", 2, "completed", "declined", a.id]);
+    assert.ok(generation.last.queuedAt && generation.last.startedAt && generation.last.finishedAt);
+
+    gates.experimentation.release();
+    await app.contemplation.idle(pool);
+    const experimentation = forceStatus().experimentation.last;
+    assert.deepEqual([experimentation.requestId, experimentation.status, experimentation.result], [3, "completed", "committed"]);
+    assert.deepEqual(app.store.experiments(pool).map((entry) => entry.text), ["Ask about the sea."]);
+
+    // Failing runs: the new request shows the previous outcome only as previous, then its own failure with a reason.
+    fail = true;
+    gates.generation = gated();
+    gates.experimentation = gated();
+    assert.deepEqual(force("generation"), { queued: true, requestId: 4 });
+    assert.deepEqual(force("experimentation"), { queued: true, requestId: 5 });
+    const running = forceStatus().generation;
+    assert.deepEqual([running.state, running.requestId, running.last.requestId, running.last.status], ["running", 4, 2, "completed"]);
+    gates.generation.release();
+    gates.experimentation.release();
+    await app.contemplation.idle(pool);
+    for (const [kind, id] of [["generation", 4], ["experimentation", 5]]) {
+      const entry = forceStatus()[kind];
+      assert.deepEqual([entry.state, entry.last.requestId, entry.last.status], ["idle", id, "failed"], kind);
+      assert.ok(entry.last.code && entry.last.reason, `${kind} failure has a code and a reason`);
+      assert.equal(entry.last.result, undefined);
+    }
+    assert.deepEqual(app.store.experiments(pool).map((entry) => entry.text), ["Ask about the sea."], "a failed review changes nothing");
+    assert.deepEqual(app.contemplation.status(poolOf(b)).force, untouched, "B never sees A's runs");
+    assert.doesNotMatch(JSON.stringify(app.contemplation.status(pool)), new RegExp(TEST_KEY));
+  } finally { closeApp(app); }
+});
+
+test("review 0005 P2-B: a follow-up failure after a completed forced Maintenance is reported beside it; the page shows each kind's outcome", async () => {
+  const { app } = await makeApp({
+    contemplation_consolidation: identityConsolidation,
+    contemplation_memory_retrieval: () => ({ stmIds: [], ltmIds: [] }),
+    contemplation_maintenance: (body) => ({ action: "replace", text: `${payloadOf({ body }).interpretation.text} Revised.`, completedExperimentIds: [] }),
+    contemplation_gestaltization: () => ({ gestalt: "Whole." }),
+    contemplation_experiment_planning: () => jsonResponse(400, { error: { message: "planner refused" } })
+  });
+  try {
+    const a = app.createCharacter({ name: "A" });
+    const pool = seedPool(app, a, ["One."]);
+    seedMessages(app, a.id, 2);
+    app.contemplation.force(pool, "maintenance", a.id);
+    await app.contemplation.idle(pool);
+    const last = app.contemplation.status(pool).force.maintenance.last;
+    assert.deepEqual([last.status, last.result, last.followUpError?.stage], ["completed", "applied", "experiment_planning"]);
+    assert.equal(app.contemplation.status(pool).lastMaintenance.status, "applied");
+  } finally { closeApp(app); }
+  const page = fs.readFileSync(path.join(ROOT, "public", "app.js"), "utf8");
+  assert.match(page, /forceText\(s\.force\?\.\[kind\]\)/);
+  assert.match(page, /s\.force\?\.\[kind\]\?\.state/);
 });

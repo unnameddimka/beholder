@@ -116,7 +116,7 @@ export class Dialogue {
     const upload = this.store.uploadForMessage(userMessageId);
     if (!upload || upload.status !== "pending") return;
     progress.stage = "vision";
-    await this.vision.observe(upload.id);
+    await this.vision.observe(upload.id, progress.profile);
     this.contemplation.onUserMessage(characterId);
     this.memory.maybeConsolidate(characterId);
   }
@@ -146,6 +146,10 @@ export class Dialogue {
   startReply(characterId, userMessageId, timeZone = null) {
     const chat = this.chat(characterId);
     const pending = { kind: "reply", userMessageId, startedAt: new Date().toISOString(), stage: "retrieval", timeZone: validTimeZone(timeZone) };
+    // One logical reply job, one frozen profile: Vision, retrieval, the reply, its repairs and the image it may
+    // queue all use the snapshot taken here (review 0005 P2-A). A Retry starts a new job and takes a new one.
+    const owner = this.store.getCharacter(characterId);
+    pending.profile = owner ? profileOf(owner) : null;
     chat.pending = pending;
     pending.promise = this.perceive(characterId, userMessageId, pending)
       .then(() => this.generate(characterId, "reply", pending))
@@ -166,10 +170,11 @@ export class Dialogue {
     return pending.promise;
   }
 
-  // The job's profile (configuration and descriptions) is frozen here and used for retrieval, the reply, its repairs
-  // and the image request it may queue; an edit during the job applies to the next one (Specification 0005 A5).
+  // The job's profile (configuration and descriptions) is used for retrieval, the reply, its repairs and the image
+  // request it may queue; an edit during the job applies to the next one (Specification 0005 A5). A reply job froze
+  // it before Vision (startReply); a follow-up or opener freezes it here.
   async generate(characterId, mode, progress = {}) {
-    const character = profileOf(this.store.getCharacter(characterId));
+    const character = progress.profile ?? profileOf(this.store.getCharacter(characterId));
     progress.profile = character;
     const config = character.config;
     const history = this.store.activeMessages(characterId, VERBATIM_WINDOW);

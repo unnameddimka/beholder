@@ -517,6 +517,20 @@ function maintenanceText(last) {
   return [`${when}: ${MAINTENANCE_OUTCOMES[last.status] || last.status} (${last.source === "forced" ? "forced" : "automatic"})`, last.reason].filter(Boolean).join(". ");
 }
 
+// Review 0005 P2-B: one Force kind's current state and the terminal outcome of its last forced run. While a new
+// request is queued or running, the previous outcome is labeled as previous so it is never read as the new result.
+const FORCE_RESULTS = { applied: "interpretations updated", unchanged: "nothing needed changing", stale: "discarded as stale", empty: "no interpretations",
+  added: "interpretation added", declined: "nothing new to add", stale_discarded: "discarded as stale", rejected_after_pool_change: "discarded after the pool changed",
+  committed: "experiments updated", not_needed: "nothing to review", superseded: "superseded" };
+function forceText(entry) {
+  if (!entry) return "";
+  const last = entry.last;
+  const outcome = last ? [`${formatTime(last.finishedAt)}: ${last.status === "failed" ? "failed" : "completed"}${last.result ? `, ${FORCE_RESULTS[last.result] || last.result}` : ""}`,
+    last.status === "failed" ? last.reason : null, last.followUpError ? `the follow-up ${last.followUpError.stage} failed: ${last.followUpError.reason}` : null].filter(Boolean).join(". ") : "never forced since the server started";
+  if (entry.state === "idle") return `Last run ${outcome}`;
+  return `${entry.state === "running" ? "Running now" : "Queued"}. Previous run ${outcome}`;
+}
+
 // ---- contemplation ---------------------------------------------------------------------------------------------
 
 // Results stay read-only (Specification 0002 U1/U2): no control writes interpretation, experiment or gestalt text.
@@ -562,7 +576,7 @@ async function renderContemplation(characterId) {
     renderForce();
     try {
       data = await api(`/api/characters/${characterId}/contemplation/force`, { method: "POST", body: { kind } });
-      forceNote = data.force.queued ? `${label.slice(6)} queued. Its result appears in the status once it has run.` : `${label.slice(6)} is already ${data.force.reason === "running" ? "running" : "queued"}.`;
+      forceNote = data.force.queued ? `${label.slice(6)} queued. Its result appears below once it has run.` : `${label.slice(6)} is already ${data.force.reason === "running" ? "running" : "queued"}.`;
       renderAll();
     } catch (error) { showBanner(error.message); }
     finally { sending.delete(kind); renderForce(); }
@@ -570,13 +584,14 @@ async function renderContemplation(characterId) {
   const renderForce = () => {
     const s = data.status;
     for (const [kind, button] of forceButtons) {
-      const busy = s.forcedRunning === kind ? "running" : s.queued.forced.includes(kind) ? "queued" : null;
+      const busy = s.force?.[kind]?.state !== "idle" ? s.force?.[kind]?.state : null;
       button.disabled = sending.has(kind) || Boolean(busy);
       button.title = busy ? `Already ${busy}` : "";
     }
     forceEl.replaceChildren(h("h3", { text: "Run now" }),
       h("p", { className: "muted", text: "Asks the Contemplation model to run one stage now, even while automatic Contemplation is off. It never edits text directly." }),
       h("div", { className: "row" }, ...forceButtons.values()),
+      h("div", { className: "stage-grid" }, ...FORCE.flatMap(([kind, label]) => [h("span", { className: "muted", text: label.slice(6) }), h("span", { text: forceText(s.force?.[kind]) })])),
       ...(forceNote ? [h("p", { className: "muted", text: forceNote })] : []));
   };
 

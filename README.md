@@ -88,8 +88,10 @@ SQLite (`data/beholder.sqlite`), generated images (`data/images/`), and images y
      succeed. It shows "Never" until the first attempt, and it survives restarts.
 
    **Run now** offers **Force Maintenance**, **Force Generation**, and **Force Experimentation**. Each one queues the
-   normal model-driven stage, and the result appears in the status once it has run. A button is disabled while its
-   run is queued or running, so it cannot be queued twice. Force works even while automatic Contemplation is off. A
+   normal model-driven stage. Under the buttons, each kind shows whether it is queued or running, and the outcome of
+   its last forced run: completed (with what it did) or failed (with the reason), and when. While a new request
+   waits or runs, the earlier outcome is labeled "Previous run", so it is never mistaken for the new one. A button is
+   disabled while its run is queued or running, so it cannot be queued twice. Force works even while automatic Contemplation is off. A
    forced Maintenance or Generation is then followed by the usual gestalt update and experiment review. No control
    edits interpretation, experiment, or gestalt text.
 3. Every interpretation change leads to one gestalt update and then one experiment review, so the gestalt and active
@@ -238,7 +240,8 @@ non-interpretive observation is a manual judgment, not something the tests can c
     and retry policy, and diagnostics.
   - *Frozen per job.* Every AI job takes a frozen snapshot of its character when it starts and uses it for every
     call, retry, repair, fit check, and catalogue clamp. That holds for a reply, follow-up or opener with its memory
-    retrieval, an STM batch, one pool's daily LTM run, a Contemplation cycle or forced run, a Vision perception, and
+    retrieval (a reply to an attached image freezes it before Vision, so the perception, retrieval, reply, and the
+    image it queues all use one snapshot; a Retry is a new job), an STM batch, one pool's daily LTM run, a Contemplation cycle or forced run, a Vision perception, and
     a queued image. The LLM client has no global model at all: a request without a configuration is refused.
   - *Queued images.* A queued image stores its model and the descriptions with its row, so an edit or a restart
     never changes it. Images queued before this version have no stored context and are sent as queued.
@@ -264,7 +267,10 @@ non-interpretive observation is a manual judgment, not something the tests can c
   - *Empty fields.* Empty fields are shown as not given and are never invented.
 - **Force and Maintenance status (spec 0005):**
   - *Force.* The Force route queues an existing stage on the pool's serial pipeline. It returns whether it queued
-    (or that the kind is already queued or running), never an outcome. A forced Maintenance or Generation is followed
+    (or that the kind is already queued or running), never an outcome, with a request id. The Contemplation status
+    then reports per kind `queued`, `running`, or `idle` and the last finished forced run: `completed` with its
+    stage result, or `failed` with a code and a sanitized reason. A follow-up gestalt or experiment review that fails
+    after a completed forced Maintenance or Generation is shown beside that outcome, not as it. A forced Maintenance or Generation is followed
     by the normal gestaltization and experiment review even while automatic Contemplation is off (owner decision).
     Dialogue still gets no gestalt or experiments while it is off.
   - *Status record.* Each Maintenance attempt is recorded on its pool: running at the start, then applied,
@@ -382,6 +388,8 @@ non-interpretive observation is a manual judgment, not something the tests can c
   still reject an oversized request; that also fails visibly and keeps the previous gestalt.
 - The interpretation and experiment edit routes remain on the server for compatibility (spec 0002 U2), but no page
   uses them. The Contemplation page calls only the Force route (spec 0005).
+- The outcome of the last forced run of each kind is kept in server memory only, like the Force queue itself: after a
+  restart it reads "never forced since the server started". The Last Maintenance record is persisted and survives.
 - Dialogue, memory, and retrieval requests have no pre-flight context check, so three long descriptions can make one
   of them exceed a small model's context. The provider then rejects it and the job fails visibly; nothing is
   truncated or dropped. Consolidation, gestaltization, and Vision keep their estimated pre-flight checks, which now

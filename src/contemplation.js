@@ -142,10 +142,11 @@ export function validatePlanning(raw, experimentIds) {
 
 // Specification 0005 F3: a capacity refusal is shown as a skipped Maintenance, any other error as failed.
 const MAINTENANCE_SKIP_CODES = new Set(["CONSOLIDATION_CONTEXT_EXCEEDED", "CONSOLIDATION_OUTPUT_EXCEEDED"]);
+const FORCE_KINDS = ["maintenance", "generation", "experimentation"];
 
 function newPoolRuntime(pool) {
   return { pool, running: false, stage: "idle", stageCharacterId: null, parallel: { total: 0, inFlight: 0 }, pendingCharacters: new Set(), forced: [], currentForced: null,
-    planningRequested: false, gestaltFailedRevision: null, lastError: null, lastCycle: null, cycles: 0, promise: null };
+    forceSeq: 0, lastForced: {}, planningRequested: false, gestaltFailedRevision: null, lastError: null, lastCycle: null, cycles: 0, promise: null };
 }
 
 export class Contemplation {
@@ -188,18 +189,22 @@ export class Contemplation {
   }
 
   // Queues one explicit model-driven run of an existing stage. A kind that is already queued or running for this pool
-  // is not queued twice (Specification 0005 F2); the result says which happened, never that the run succeeded.
+  // is not queued twice (Specification 0005 F2); the result says which happened, never that the run succeeded. Each
+  // request has a pool-local id, so its terminal outcome (status().force) is never confused with an earlier run's.
   force(pool, kind, characterId) {
-    if (!["generation", "maintenance", "experimentation"].includes(kind)) throw coded("FORCE_KIND_INVALID", "Unknown contemplation action.");
+    if (!FORCE_KINDS.includes(kind)) throw coded("FORCE_KIND_INVALID", "Unknown contemplation action.");
     const ownerId = poolOwnerId(pool);
     if (!this.store.getCharacter(ownerId) || (characterId != null && characterId !== ownerId)) throw coded("CHARACTER_NOT_FOUND", "A character is required for this action.");
     this.store.ensureInterpretationPool(pool);
     const rt = this.runtime(pool);
-    if (rt.currentForced?.kind === kind) return { queued: false, reason: "running" };
-    if (rt.forced.some((op) => op.kind === kind)) return { queued: false, reason: "already_queued" };
-    rt.forced.push({ kind, characterId: ownerId });
+    if (rt.currentForced?.kind === kind) return { queued: false, reason: "running", requestId: rt.currentForced.requestId };
+    const waiting = rt.forced.find((op) => op.kind === kind);
+    if (waiting) return { queued: false, reason: "already_queued", requestId: waiting.requestId };
+    rt.forceSeq += 1;
+    const op = { kind, characterId: ownerId, requestId: rt.forceSeq, queuedAt: nowIso() };
+    rt.forced.push(op);
     this.kick(pool);
-    return { queued: true };
+    return { queued: true, requestId: op.requestId };
   }
 
   requestPlanning(pool) {
@@ -255,19 +260,30 @@ export class Contemplation {
     for (;;) {
       if (rt.forced.length) {
         const op = rt.forced.shift();
-        rt.currentForced = op;
+        rt.currentForced = { ...op, startedAt: nowIso() };
+        // The terminal outcome of this request (review 0005 P2-B): "completed" once its own stage finished, with that
+        // stage's result, or "failed" with the sanitized reason. A failure of a follow-up stage after a completed
+        // Maintenance or Generation is reported beside the outcome, not as the outcome.
+        const outcome = { requestId: op.requestId, kind: op.kind, characterId: op.characterId, queuedAt: op.queuedAt, startedAt: rt.currentForced.startedAt };
+        let stage = op.kind;
         try {
           // An explicit run has the normal consequences of successful model work, gestaltization and experiment
           // planning, even while automatic Contemplation is off (owner decision on Specification 0005 F2).
           const profile = this.ownerProfile(pool);
-          if (op.kind === "maintenance") await this.runMaintenance(rt, profile, "forced");
-          else if (op.kind === "generation") await this.runGeneration(rt, profile);
+          if (op.kind === "maintenance") outcome.result = (await this.runMaintenance(rt, profile, "forced")).status;
+          else if (op.kind === "generation") outcome.result = (await this.runGeneration(rt, profile))?.status ?? null;
+          if (op.kind !== "experimentation") { outcome.status = "completed"; stage = "follow-up"; }
           await this.gestaltizeIfDue(rt, profile, { forced: true });
-          await this.planIfNeeded(rt, profile, { force: op.kind === "experimentation" });
+          const planned = await this.planIfNeeded(rt, profile, { force: op.kind === "experimentation" });
+          if (op.kind === "experimentation") { outcome.status = "completed"; outcome.result = planned.status; }
         } catch (error) {
           rt.lastError = this.diagnostics.error(`contemplation_${op.kind}`, error, { pool, characterId: op.characterId });
+          const failure = this.diagnostics.clean({ stage: rt.stage, code: rt.lastError.code ?? null, reason: String(rt.lastError.message || "The run failed.").slice(0, 500) });
+          if (stage === "follow-up") outcome.followUpError = failure;
+          else Object.assign(outcome, { status: "failed" }, failure);
         } finally {
           rt.currentForced = null;
+          rt.lastForced[op.kind] = { ...outcome, finishedAt: nowIso() };
         }
         continue;
       }
@@ -451,9 +467,10 @@ export class Contemplation {
       });
       this.diagnostics.event({ ...report, status: outcome.applied ? "applied" : "stale", ...outcome });
       const counts = { considered: snapshot.length, candidates: candidates.length, interpretationsChanged: outcome.interpretationsChanged, experimentsRemoved: outcome.experimentsRemoved };
+      const status = !outcome.applied ? "stale" : outcome.interpretationsChanged || outcome.experimentsRemoved ? "applied" : "unchanged";
       if (!outcome.applied) record("stale", { ...counts, reason: "The interpretations or experiments changed while Maintenance was running, so nothing was applied; a later run will retry." });
-      else record(outcome.interpretationsChanged || outcome.experimentsRemoved ? "applied" : "unchanged", counts);
-      return { status: outcome.applied ? "applied" : "stale", ...outcome };
+      else record(status, counts);
+      return { status, ...outcome };
     } catch (error) {
       this.diagnostics.event({ ...report, status: "failed", stage, code: error.code || null });
       record(MAINTENANCE_SKIP_CODES.has(error.code) ? "skipped" : "failed", { stage, code: error.code || null, reason: String(error.message || "Maintenance failed.").slice(0, 500) });
@@ -707,6 +724,13 @@ export class Contemplation {
       maintenance: rt.currentForced?.kind === "maintenance" || rt.stage.startsWith("maintenance") ? "running" : rt.forced.some((op) => op.kind === "maintenance") ? "queued" : "idle",
       lastMaintenance: this.store.ensureInterpretationPool(rt.pool).lastMaintenance,
       forcedRunning: rt.currentForced?.kind ?? null,
+      // Per Force kind (review 0005 P2-B): queued/running/idle now, the request id of that run, and the terminal
+      // outcome of the last finished forced run of this kind in this process (or null).
+      force: Object.fromEntries(FORCE_KINDS.map((kind) => {
+        const waiting = rt.forced.find((op) => op.kind === kind);
+        const state = rt.currentForced?.kind === kind ? "running" : waiting ? "queued" : "idle";
+        return [kind, { state, requestId: rt.currentForced?.kind === kind ? rt.currentForced.requestId : waiting?.requestId ?? null, last: rt.lastForced[kind] ?? null }];
+      })),
       queued: { pendingCharacterIds: [...rt.pendingCharacters], forced: rt.forced.map((op) => op.kind), planningRequested: rt.planningRequested || this.store.ensureInterpretationPool(rt.pool).planningNeeded,
         gestaltDue: this.gestaltView(rt.pool).status === "pending" },
       lastError: rt.lastError ? { at: rt.lastError.at, stage: rt.lastError.stage, code: rt.lastError.code, message: rt.lastError.message } : null,
