@@ -156,6 +156,53 @@ test("C4: a pool change during the model calls discards the stale result; a late
   } finally { closeApp(app); }
 });
 
+// Review 0004 P2: the verifiers' experiment context is part of the snapshot the commit is guarded by.
+for (const [change, mutate, after] of [
+  ["edited", (app, pool, ids) => app.contemplation.editExperiment(pool, ids[0], "Probe, edited meanwhile."), ["Probe, edited meanwhile."]],
+  ["added", (app, pool) => app.contemplation.addExperiment(pool, "Second probe."), ["Probe.", "Second probe."]],
+  ["deleted", (app, pool, ids) => app.contemplation.deleteExperiment(pool, ids[0]), []]
+]) {
+  test(`C4: an experiment ${change} during verification discards the whole result; a later run uses fresh experiments`, async () => {
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const { app, mock } = await makeApp({
+      contemplation_consolidation: (body) => {
+        const [a, b] = payloadOf({ body }).interpretations;
+        return { interpretations: [{ id: a.id, sourceIds: [a.id, b.id], text: "Merged." }] };
+      },
+      contemplation_maintenance: async (body) => {
+        await gate;
+        const ids = JSON.parse(body.messages[1].content).activeExperiments.map((entry) => entry.id);
+        return { action: "replace", text: "Verified.", completedExperimentIds: ids.slice(0, 1) };
+      },
+      contemplation_experiment_planning: () => ({ experiments: [] })
+    });
+    try {
+      const mira = app.createCharacter(base);
+      const { pool, experimentIds } = seedPool(app, mira, ["One.", "Two."], ["Probe."]);
+      const revision = app.store.ensureInterpretationPool(pool).interpretationRevision;
+      app.contemplation.force(pool, "maintenance", mira.id);
+      await waitFor(() => app.contemplation.status(pool).stage === "maintenance", { message: "verification" });
+      mutate(app, pool, experimentIds);
+      release();
+      await app.contemplation.idle(pool);
+      assert.deepEqual(app.store.interpretations(pool).map((entry) => entry.text), ["One.", "Two."], "no consolidated interpretation is persisted");
+      assert.deepEqual(app.store.experiments(pool).map((entry) => entry.text), after, "no completion is applied");
+      assert.equal(app.store.ensureInterpretationPool(pool).interpretationRevision, revision);
+      const event = app.diagnostics.events.findLast((entry) => entry.type === "contemplation-maintenance");
+      assert.equal(event.status, "stale");
+      assert.equal(event.experimentsRemoved, 0);
+      await maintain(app, pool, mira.id);
+      const fresh = payloadOf(mock.byPurpose("contemplation_maintenance").at(-1)).activeExperiments.map((entry) => entry.text);
+      assert.deepEqual(fresh, after, "the retry verifies against the current experiments");
+      assert.deepEqual(app.store.interpretations(pool).map((entry) => entry.text), ["Verified."], "the next run applies");
+      const applied = app.diagnostics.events.findLast((entry) => entry.type === "contemplation-maintenance");
+      assert.equal(applied.status, "applied");
+      assert.equal(applied.experimentsRemoved, after.length ? 1 : 0, "completions come from the fresh experiments");
+    } finally { closeApp(app); }
+  });
+}
+
 test("C3: the consolidation result must account for every id exactly once by supplied representatives", () => {
   const ids = ["int_1", "int_2", "int_3"];
   const entry = (id, sourceIds, text = "t") => ({ id, sourceIds, text });

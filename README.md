@@ -200,9 +200,10 @@ non-interpretive observation is a manual judgment, not something the tests can c
   changed. If the pool changed during the requests (an edit through the API), the whole result is discarded and a
   later run retries. If the pool would not fit the model's context (system prompt, interpretations and output
   budget, estimated at 3 characters per token) or its unmerged rewrite would not fit the max output tokens setting,
-  maintenance is skipped and recorded; the set is never truncated. A completion
-  retires an experiment only if its text is still exactly what the model examined, so an experiment edit made through
-  the API is never lost. Generation is reviewed by a second Contemplation-model call (distinct and compatible?), with
+  maintenance is skipped and recorded; the set is never truncated. The commit is also discarded
+  as stale when an experiment was added, edited or deleted through the API while the checks ran, so neither
+  interpretation changes nor completions are derived from experiments the model no longer sees, and an experiment edit
+  is never lost. Generation is reviewed by a second Contemplation-model call (distinct and compatible?), with
   one retry using the reviewer's feedback, otherwise it declines. The candidate commits only if the interpretation
   pool revision is unchanged since the snapshot. If it changed, the candidate is re-reviewed against the current pool
   (at most twice) and discarded if rejected. Experiment planning commits only when neither the interpretation

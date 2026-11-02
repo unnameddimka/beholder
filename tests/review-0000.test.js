@@ -20,6 +20,8 @@ async function forceAndWait(app, pool, kind, characterId, stage) {
   await waitFor(() => app.contemplation.status(pool).stage === stage, { message: stage });
 }
 
+// Review 0004 P2 tightened this: an experiment edit during maintenance makes the whole result stale, so no completion
+// is applied at all, not even to the experiment that stayed unchanged.
 test("P1-1: a stale maintenance completion never deletes an experiment edited during maintenance", async () => {
   const { gate, release } = gated();
   const { app } = await makeApp({
@@ -43,8 +45,8 @@ test("P1-1: a stale maintenance completion never deletes an experiment edited du
     app.contemplation.editExperiment(pool, edited, "MANUAL EDIT during maintenance");
     release();
     await app.contemplation.idle(pool);
-    assert.deepEqual(app.store.experiments(pool).map((entry) => entry.text), ["MANUAL EDIT during maintenance"],
-      "the unedited completed experiment is retired; the manually edited one survives");
+    assert.deepEqual(app.store.experiments(pool).map((entry) => entry.text), ["MANUAL EDIT during maintenance", "Untouched experiment"],
+      "the manually edited experiment survives, and the stale result retires nothing");
   } finally { closeApp(app); }
 });
 

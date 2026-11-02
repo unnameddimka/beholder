@@ -356,6 +356,8 @@ export class Contemplation {
       this.setStage(rt, "maintenance_retrieval", characterId);
       const conversation = this.conversation(characterId);
       const memory = await this.retrieveMemory(characterId, conversation);
+      // The experiment state every verifier sees; the commit is guarded by it as well (review 0004 P2).
+      const experimentRevision = this.store.ensureInterpretationPool(pool).experimentRevision;
       const experiments = this.experimentViews(pool);
       const experimentIds = new Set(experiments.map((entry) => entry.id));
       this.setStage(rt, "maintenance", characterId);
@@ -376,15 +378,19 @@ export class Contemplation {
       report.actions = results.map((r) => ({ id: r.candidate.id, sourceIds: r.candidate.sourceIds, action: r.action, completed: r.completedExperimentIds }));
       stage = "commit";
       // Every request succeeded: commit the whole verified set only if the pool is still exactly the snapshot the
-      // consolidation read (same revision, ids and texts); otherwise the newer state wins and a later run retries.
-      // A completion is applied only to an experiment whose text is still exactly what the model examined, so a
-      // manual experiment edit made during maintenance is never deleted.
+      // consolidation read (same revision, ids and texts) and the experiments are still exactly what the verifiers
+      // examined (same revision, ids and texts). Otherwise the newer state wins, nothing is applied (neither
+      // interpretations nor completions), and a later run retries.
       const examinedExperiments = new Map(experiments.map((entry) => [entry.id, entry.text]));
       const original = new Map(snapshot.map((entry) => [entry.id, entry.text]));
       const outcome = this.store.tx(() => {
+        const state = this.store.ensureInterpretationPool(pool);
         const current = this.store.interpretations(pool);
-        if (this.store.ensureInterpretationPool(pool).interpretationRevision !== before.interpretationRevision || current.length !== snapshot.length
-          || current.some((entry) => original.get(entry.id) !== entry.text)) {
+        const currentExperiments = this.experimentViews(pool);
+        if (state.interpretationRevision !== before.interpretationRevision || current.length !== snapshot.length
+          || current.some((entry) => original.get(entry.id) !== entry.text)
+          || state.experimentRevision !== experimentRevision || currentExperiments.length !== experiments.length
+          || currentExperiments.some((entry) => examinedExperiments.get(entry.id) !== entry.text)) {
           return { applied: false, stale: true, interpretationsChanged: 0, experimentsRemoved: 0 };
         }
         let interpretationsChanged = 0;
@@ -398,17 +404,11 @@ export class Contemplation {
             if (finalText !== original.get(candidate.id)) interpretationsChanged += this.store.updateInterpretation(pool, candidate.id, finalText);
           }
         }
-        const currentExperiments = new Map(this.store.experiments(pool).map((entry) => [wireExperiment(entry.id), entry]));
         let experimentsRemoved = 0;
-        let experimentsKept = 0;
-        for (const id of completed) {
-          const experiment = currentExperiments.get(id);
-          if (!experiment || experiment.text !== examinedExperiments.get(id)) { experimentsKept += 1; continue; }
-          experimentsRemoved += this.store.deleteExperiment(pool, experiment.id);
-        }
+        for (const id of completed) experimentsRemoved += this.store.deleteExperiment(pool, parseWire(id, "exp"));
         if (interpretationsChanged) this.store.bumpInterpretationRevision(pool);
         if (experimentsRemoved) this.store.bumpExperimentRevision(pool);
-        return { applied: true, stale: false, interpretationsChanged, experimentsRemoved, staleCompletionsSkipped: experimentsKept };
+        return { applied: true, stale: false, interpretationsChanged, experimentsRemoved };
       });
       this.diagnostics.event({ ...report, status: outcome.applied ? "applied" : "stale", ...outcome });
       return { status: outcome.applied ? "applied" : "stale", ...outcome };
