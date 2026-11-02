@@ -2,8 +2,8 @@
 
 **Status:** FORMAL SPECIFICATION — DOCUMENTATION ONLY. Implementation requires a separate explicit owner instruction.
 **Project:** Beholder
-**Baseline:** Specifications 0000–0003; GitHub Actions source snapshot for \`8d95f6c8ec0a9cf6bd22e82befba2b6e2e29e938\` (run \`41337055942\`).
-**Source requirements:** Owner-approved discussion and \`beholder-mini-spec-interpretation-consolidation.md\` (Interpretation Maintenance only).
+**Baseline:** Specifications 0000–0003; GitHub Actions source snapshot for `8d95f6c8ec0a9cf6bd22e82befba2b6e2e29e938` (run `41337055942`).
+**Source requirements:** Owner-approved discussion and `beholder-mini-spec-interpretation-consolidation.md` (Interpretation Maintenance only).
 **Scope:** Interpretation Maintenance, existing shared/private cognitive-pool ownership and migration, character editor/status UI, and chat composer responsiveness/Enter behavior.
 
 ## 0. Executive summary for owner / Claude
@@ -26,7 +26,7 @@ The approved change concerns **Interpretation Maintenance only**. It does **not*
 Every existing Maintenance invocation, whether selected by Prefetch or invoked through an existing internal path, follows this logical sequence:
 
 1. **Consolidation** — exactly **one** structured LLM request receives **all current interpretations in that character's interpretation pool** and returns a consolidated set.
-2. **Individual verification** — the existing per-interpretation Maintenance checks **each surviving consolidated interpretation** against the actual conversation and its existing memory/active-experiment context, applying its existing \`unchanged\`, \`replace\`, \`delete\` and completed-experiment behavior.
+2. **Individual verification** — the existing per-interpretation Maintenance checks **each surviving consolidated interpretation** against the actual conversation and its existing memory/active-experiment context, applying its existing `unchanged`, `replace`, `delete` and completed-experiment behavior.
 3. **Persistence** — only when consolidation **and all required verification requests** succeed, save the final verified set in a **single atomic transaction**. This includes deleting redundant interpretations eliminated by consolidation, applying verified changes and verified experiment completions.
 
 Consolidation is **the first stage inside Maintenance**, not a separately scheduled process. Keep Prefetch's Maintenance decision, independent Generation decision, overall cycle order, character-triggered watermarks, serial queue and existing parallel individual-verification behavior unless technically necessary to honor atomicity.
@@ -79,7 +79,7 @@ An unchanged interpretation set must not spuriously increment its revision or re
 
 ### P1. New ownership invariant
 
-Each character has exactly **one personal memory pool and one personal interpretation pool**, or equivalently a single owner identity for all character-specific cognitive data. The implementation may retain the existing internal \`character:<id>\` pool key as a technical representation; this is **never** a user-selectable scope.
+Each character has exactly **one personal memory pool and one personal interpretation pool**, or equivalently a single owner identity for all character-specific cognitive data. The implementation may retain the existing internal `character:<id>` pool key as a technical representation; this is **never** a user-selectable scope.
 
 A character personally owns:
 
@@ -89,7 +89,7 @@ A character personally owns:
 - **experiments**, their revision and planning-needed state;
 - **Contemplation watermarks / work state** and relevant per-pool scheduling metadata.
 
-**No shared memory or shared interpretations mode.** Remove both \`Use shared memory\` and \`Use shared interpretations\` checkboxes. Do not silently keep a hidden or implicit shared pool after migration.
+**No shared memory or shared interpretations mode.** Remove both `Use shared memory` and `Use shared interpretations` checkboxes. Do not silently keep a hidden or implicit shared pool after migration.
 
 A newly created character starts with **empty personal cognitive state** regardless of what other characters know. Do not copy records, previous gestalts, intentions, watermarks or voice-specific experiences into it. The owner will evaluate a second character and cross-character knowledge transfer only in a **future** patch.
 
@@ -110,7 +110,7 @@ The database migration must be:
 - **Explicitly safe outside the known one-character case:** if a legacy database has **multiple characters with nonempty shared data**, do not infer an owner or broadcast shared records to everybody. Abort that ambiguous migration safely with an actionable error; owner approval of an explicit multi-character policy is required if this case is encountered. Empty newly created pools need no merge.
 - **Existing standalone personal-state installations** should migrate without loss and without introducing an artificial extra character.
 
-After successful transfer, retire the legacy \`shared\` rows/flags **only after all dependent data has been relocated**. Prefer a narrow migration and direct character-owned lookup functions over a broad schema/ORM rewrite. No data-cleansing or memory-to-memory text conversion is authorized.
+After successful transfer, retire the legacy `shared` rows/flags **only after all dependent data has been relocated**. Prefer a narrow migration and direct character-owned lookup functions over a broad schema/ORM rewrite. No data-cleansing or memory-to-memory text conversion is authorized.
 
 ### P3. Remove flags everywhere
 
@@ -195,7 +195,7 @@ Icon buttons require stable accessible names ("Attach image", "Send message"), v
 18. A legacy database already using personal pools survives migration unchanged. When two nonempty legacy sources cannot be reconciled safely, migration fails atomically rather than silently dropping an interpretation, gestalt or memory.
 19. A legacy database with multiple characters sharing nonempty cognitive state cannot accidentally assign the whole shared pool to the wrong character or copy it to all characters.
 20. Creating a **second** character after migration produces a character with **empty personal STM/LTM, interpretations, gestalt and experiments**. Its retrieval, Contemplation, Vision and Dialogue contexts do not contain the first character's cognitive state.
-21. All new character CRUD calls work **without** \`useSharedMemory\` or \`useSharedInterpretations\`. Legacy values cannot re-enable sharing; no two Shared checkboxes or shared/private badges remain anywhere in the UI.
+21. All new character CRUD calls work **without** `useSharedMemory` or `useSharedInterpretations`. Legacy values cannot re-enable sharing; no two Shared checkboxes or shared/private badges remain anywhere in the UI.
 22. Contemplation and diagnostics accurately show only character-owned state, while the Contemplation page stays **strictly read-only**.
 23. Existing memory consolidation (100/20/~80; midnight STM → LTM), image observations, experiment planning, gestalt maintenance, Retry, and normal Dialogue function with the new owner scope.
 24. No global pinned user self-description, transcript, upload, generated image, OpenRouter configuration or API-key lifecycle is unexpectedly lost or modified by the migration.
@@ -219,7 +219,7 @@ Icon buttons require stable accessible names ("Attach image", "Send message"), v
 
 - **This specification commit does not authorize implementation.** The owner will instruct Claude separately.
 - Implementation is reviewed from the **GitHub Actions snapshot associated with its source commit**, not an unrelated checkout.
-- Reviewer messages go to \`docs/review/\` only on the owner's command.
+- Reviewer messages go to `docs/review/` only on the owner's command.
 - Begin each implementation/review communication with the four executive-summary items above.
 - If safely migrating existing state would require a change outside this specification, ask the owner first rather than silently changing ownership semantics.
 
