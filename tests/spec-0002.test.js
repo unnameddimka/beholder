@@ -4,8 +4,8 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { makeApp, closeApp, waitFor, reply, tempDir, completion, ROOT, TEST_KEY, identityConsolidation } from "./helpers.js";
-import { poolOf, MIGRATIONS } from "../src/db.js";
+import { makeApp, closeApp, waitFor, reply, tempDir, completion, ROOT, TEST_KEY, identityConsolidation, configure, configOf } from "./helpers.js";
+import { poolOf, poolOwnerId, MIGRATIONS } from "../src/db.js";
 import { PROVIDER_IGNORE } from "../src/openrouter.js";
 import { PURPOSE_ROLES } from "../src/llm.js";
 import { gestaltizationSystemPrompt } from "../src/prompts/contemplation.js";
@@ -16,10 +16,11 @@ const payloadOf = (call) => JSON.parse(call.body.messages[1].content);
 
 // Seeds interpretations with Contemplation off, so no pipeline runs, then clears the pending experiment review.
 function seedPool(app, pool, texts) {
-  app.settings.update({ contemplationEnabled: false });
+  const owner = poolOwnerId(pool);
+  configure(app, owner, { contemplationEnabled: false });
   for (const text of texts) app.contemplation.addInterpretation(pool, text);
   app.store.setPlanningNeeded(pool, false);
-  app.settings.update({ contemplationEnabled: true });
+  configure(app, owner, { contemplationEnabled: true });
 }
 
 test("migration: a schema-1 database keeps its data, gains an empty gestalt, and synthesizes it once the key is entered", async () => {
@@ -234,7 +235,7 @@ test("context limit: an interpretation set that cannot fit is refused without a 
     const mira = app.createCharacter(base);
     const pool = poolOf(mira);
     await app.llm.modelCatalog();
-    const model = app.settings.get().models.contemplation;
+    const model = configOf(app, mira.id).models.contemplation;
     app.llm.catalog.byId.set(model, { id: model, contextLength: 17_000, supportedParameters: null, maxCompletionTokens: null });
     seedPool(app, pool, Array.from({ length: 4 }, (_, index) => `${index} ${"x".repeat(3900)}`));
     app.contemplation.recover();
@@ -253,7 +254,7 @@ test("restart: the persisted gestalt survives and an outdated one is updated onc
   first.app.contemplation.recover();
   await waitFor(() => first.app.store.ensureInterpretationPool(pool).gestalt === "Before restart.");
   await first.app.contemplation.idle(pool);
-  first.app.settings.update({ contemplationEnabled: false });
+  configure(first.app, mira.id, { contemplationEnabled: false });
   first.app.contemplation.addInterpretation(pool, "Two.");
   closeApp(first.app);
 
@@ -264,7 +265,7 @@ test("restart: the persisted gestalt survives and an outdated one is updated onc
     await app.setApiKey(TEST_KEY);
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(mock.byPurpose("contemplation_gestaltization").length, 0, "disabled: no automatic synthesis");
-    app.settings.update({ contemplationEnabled: true });
+    configure(app, mira.id, { contemplationEnabled: true });
     app.contemplation.recover();
     await waitFor(() => app.store.ensureInterpretationPool(pool).gestalt === "After restart.");
   } finally { closeApp(app); }
@@ -303,14 +304,14 @@ test("dialogue: every mode gets the gestalt with its semantics and never interpr
       assert.doesNotMatch(JSON.stringify(call.body), /INTERPRETATION-SECRET/);
     }
 
-    app.settings.update({ contemplationEnabled: false });
+    configure(app, mira.id, { contemplationEnabled: false });
     await app.dialogue.generate(mira.id, "followup");
     const disabled = mock.byPurpose("dialogue_followup").at(-1).body.messages[0].content;
     assert.doesNotMatch(disabled, /GESTALT-TEXT|EXPERIMENT-INTENTION|gestalt\)/);
     assert.equal(app.store.ensureInterpretationPool(pool).gestalt, "GESTALT-TEXT one person, many views.", "stored state is kept");
 
     // No gestalt yet: no impression section and no invented portrait.
-    app.settings.update({ contemplationEnabled: true });
+    configure(app, mira.id, { contemplationEnabled: true });
     const nova = app.createCharacter({ ...base, name: "Nova" });
     await app.dialogue.generate(nova.id, "opener");
     assert.doesNotMatch(mock.byPurpose("dialogue_opener").at(-1).body.messages[0].content, /IMPRESSION OF THE USER/);
@@ -320,12 +321,11 @@ test("dialogue: every mode gets the gestalt with its semantics and never interpr
 test("ownership: each character's Dialogue gets only its own gestalt and experiments (Specification 0004)", async () => {
   const { app, mock } = await makeApp({ dialogue_opener: () => reply("hello") });
   try {
-    app.settings.update({ contemplationEnabled: false });
-    const a = app.createCharacter({ ...base, name: "A", useSharedInterpretations: true });
+    const a = app.createCharacter({ ...base, name: "A", useSharedInterpretations: true, config: { contemplationEnabled: false } });
     const b = app.createCharacter({ ...base, name: "B", useSharedInterpretations: true });
     app.store.setGestalt(poolOf(a), "A-GESTALT", 0);
     app.contemplation.addExperiment(poolOf(a), "A-EXPERIMENT");
-    app.settings.update({ contemplationEnabled: true });
+    configure(app, a.id, { contemplationEnabled: true });
     const systemFor = async (character) => {
       await app.dialogue.generate(character.id, "opener");
       return mock.byPurpose("dialogue_opener").at(-1).body.messages[0].content;
@@ -343,7 +343,7 @@ test("disabled: interpretation changes schedule no synthesis; the page view stil
   try {
     const mira = app.createCharacter(base);
     const pool = poolOf(mira);
-    app.settings.update({ contemplationEnabled: false });
+    configure(app, mira.id, { contemplationEnabled: false });
     app.store.setGestalt(pool, "Stored.", 0);
     app.contemplation.addInterpretation(pool, "New.");
     app.contemplation.recover();
@@ -365,20 +365,23 @@ async function listen(app) {
   return `http://127.0.0.1:${app.server.address().port}`;
 }
 
+// Specification 0005 F1/F2 supersedes the Force ban: the page may now ask for the three model-driven runs, and only
+// through the force route; it still writes no interpretation, experiment or gestalt text.
 test("page: the Contemplation view is read-only and its copy matches the new Dialogue boundary", () => {
   const source = fs.readFileSync(path.join(ROOT, "public", "app.js"), "utf8");
   const start = source.indexOf("async function renderContemplation(");
-  const page = source.slice(start, source.indexOf("// ---- settings", start));
+  const page = source.slice(start, source.indexOf("// ---- main loop", start));
   assert.ok(start > 0 && page.length > 100);
-  assert.doesNotMatch(page, /method:\s*"(POST|PUT|DELETE)"/);
-  assert.doesNotMatch(page, /Force|\/force|textarea|"Add"|"Edit"|"Save"|"Delete"/);
+  assert.deepEqual([...page.matchAll(/api\(`([^`]*)`, \{ method: "(\w+)"/g)].map((match) => [match[1], match[2]]), [["/api/characters/${characterId}/contemplation/force", "POST"]]);
+  assert.doesNotMatch(page, /method:\s*"(PUT|DELETE)"|\/interpretations|\/experiments/);
+  assert.doesNotMatch(page, /textarea|"Add"|"Edit"|"Save"|"Delete"/);
   assert.match(page, /Gestalt/);
   assert.match(page, /Not formed yet/);
   assert.match(page, /never the interpretations themselves/);
   assert.doesNotMatch(source, /Only the active experiments reach the dialogue model|Force actions remain/);
   for (const doc of ["README.md", "AGENTS.md"]) {
     const text = fs.readFileSync(path.join(ROOT, doc), "utf8");
-    assert.doesNotMatch(text, /Force (Generation|Maintenance|Experimentation)|Force actions remain/, doc);
+    assert.doesNotMatch(text, /Force actions remain/, doc);
   }
 });
 
@@ -411,7 +414,7 @@ test("Baidu: every text request, including gestaltization, repair and truncation
     for (const call of mock.calls) {
       assert.deepEqual(call.body.provider.ignore, ["alibaba", "Phala", "SiliconFlow", "GMICloud", "baidu"], call.purpose);
       assert.equal(call.body.provider.allow_fallbacks, true);
-      assert.equal(call.body.model, app.llm.requestParameters(PURPOSE_ROLES[call.purpose]).model, "the selected model is kept");
+      assert.equal(call.body.model, app.llm.requestParameters(PURPOSE_ROLES[call.purpose], configOf(app, mira.id)).model, "the selected model is kept");
     }
     const imagesSource = fs.readFileSync(path.join(ROOT, "src", "images.js"), "utf8");
     assert.doesNotMatch(imagesSource, /PROVIDER_IGNORE|baidu/);

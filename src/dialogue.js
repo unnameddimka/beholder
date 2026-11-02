@@ -9,6 +9,7 @@ import { dialogueSystemPrompt, historyMessages, pinnedSelfDescriptionMessage, va
 import { VERBATIM_WINDOW } from "./memory.js";
 import { clockContext, stripTimestampEcho, validTimeZone } from "./clock.js";
 import { validateUploadBytes } from "./uploads.js";
+import { profileOf } from "./settings.js";
 
 export const OPENER_DELAY_SECONDS = 60;
 export const PRESENCE_TTL_MS = 20_000;
@@ -16,17 +17,19 @@ const RETRIEVAL_SITUATION_MESSAGES = 12;
 
 // Pure context assembly, exported for tests: system contract + pinned self-description + verbatim history. The
 // clock adds the current time and a timestamp marker per history message; the pinned self-description has none.
-export function buildDialogueMessages({ character, userDescription, history, imagesByMessage, gestalt = null, experiments, memories, imageEnabled, mode, clock = null }) {
+// character is the job's profile: its Character and Scene descriptions go into the system prompt, its User
+// Description is the one pinned self-description (Specification 0005 C2).
+export function buildDialogueMessages({ character, history, imagesByMessage, gestalt = null, experiments, memories, imageEnabled, mode, clock = null }) {
   const userImages = history.some((message) => message.upload || message.role === "observation");
   return [
     { role: "system", content: dialogueSystemPrompt({ character, gestalt, experiments, memories, imageEnabled, mode, clock, userImages }) },
-    pinnedSelfDescriptionMessage(userDescription),
+    pinnedSelfDescriptionMessage(character.userDescription),
     ...historyMessages(history, imagesByMessage, clock)
   ];
 }
 
 export class Dialogue {
-  constructor({ store, llm, memory, contemplation, images, vision = null, uploads = null, settings, diagnostics, now = () => new Date(), timeScaleMs = 1000, openerDelaySeconds = OPENER_DELAY_SECONDS, presenceTtlMs = PRESENCE_TTL_MS }) {
+  constructor({ store, llm, memory, contemplation, images, vision = null, uploads = null, diagnostics, now = () => new Date(), timeScaleMs = 1000, openerDelaySeconds = OPENER_DELAY_SECONDS, presenceTtlMs = PRESENCE_TTL_MS }) {
     this.now = now;
     this.store = store;
     this.llm = llm;
@@ -35,7 +38,6 @@ export class Dialogue {
     this.images = images;
     this.vision = vision;
     this.uploads = uploads;
-    this.settings = settings;
     this.diagnostics = diagnostics;
     this.timeScaleMs = timeScaleMs;
     this.openerDelaySeconds = openerDelaySeconds;
@@ -148,7 +150,7 @@ export class Dialogue {
     pending.promise = this.perceive(characterId, userMessageId, pending)
       .then(() => this.generate(characterId, "reply", pending))
       .then((envelope) => {
-        const message = this.commitCharacterMessage(characterId, "reply", envelope);
+        const message = this.commitCharacterMessage(characterId, "reply", envelope, pending.profile);
         // A follow-up is scheduled only for a chat that is still actively open and idle at commit time.
         if (envelope.followUpDelaySeconds !== null && this.isActive(characterId) && !this.isTyping(characterId)) {
           this.scheduleTimer(characterId, "followup", envelope.followUpDelaySeconds, message.id);
@@ -164,17 +166,20 @@ export class Dialogue {
     return pending.promise;
   }
 
+  // The job's profile (configuration and descriptions) is frozen here and used for retrieval, the reply, its repairs
+  // and the image request it may queue; an edit during the job applies to the next one (Specification 0005 A5).
   async generate(characterId, mode, progress = {}) {
-    const character = this.store.getCharacter(characterId);
-    const settings = this.settings.get();
+    const character = profileOf(this.store.getCharacter(characterId));
+    progress.profile = character;
+    const config = character.config;
     const history = this.store.activeMessages(characterId, VERBATIM_WINDOW);
     // Snapshot of the gestalt and experiment intentions at request start; later updates apply to the next request only.
-    // Both come from the character's own interpretation pool and only while Contemplation is enabled.
-    const pool = poolOf(character);
-    const gestalt = settings.contemplationEnabled ? this.store.ensureInterpretationPool(pool).gestalt : null;
-    const experiments = settings.contemplationEnabled ? this.store.experiments(pool) : [];
+    // Both come from the character's own interpretation pool and only while its Contemplation is enabled.
+    const pool = poolOf({ id: characterId });
+    const gestalt = config.contemplationEnabled ? this.store.ensureInterpretationPool(pool).gestalt : null;
+    const experiments = config.contemplationEnabled ? this.store.experiments(pool) : [];
     progress.stage = "retrieval";
-    const memories = await this.memory.retrieve({ pool, purpose: "dialogue_memory_retrieval", currentCharacterId: characterId,
+    const memories = await this.memory.retrieve({ pool, purpose: "dialogue_memory_retrieval", profile: character,
       situation: { character: character.name, mode, recentMessages: history.slice(-RETRIEVAL_SITUATION_MESSAGES).map((message) => messageView(message, character.name)) } });
     progress.stage = "dialogue";
     const imagesByMessage = new Map(this.store.imagesForCharacter(characterId).map((image) => [image.messageId, image]));
@@ -185,18 +190,18 @@ export class Dialogue {
     const turns = history.filter((message) => message.role !== "observation");
     const clock = clockContext({ now: this.now(), timeZone: mode === "reply" ? progress.timeZone : this.timeZoneFor(characterId),
       lastMessageAt: turns.at(-1)?.createdAt ?? null, previousMessageAt: turns.at(-2)?.createdAt ?? null });
-    const messages = buildDialogueMessages({ character, userDescription: this.settings.userDescription(), history, imagesByMessage, gestalt, experiments,
-      memories: { shortTermMemories: memories.shortTermMemories, longTermMemories: memories.longTermMemories }, imageEnabled: settings.imageEnabled, mode, clock });
+    const messages = buildDialogueMessages({ character, history, imagesByMessage, gestalt, experiments,
+      memories: { shortTermMemories: memories.shortTermMemories, longTermMemories: memories.longTermMemories }, imageEnabled: config.imageEnabled, mode, clock });
     const purpose = mode === "reply" ? "dialogue_reply" : mode === "followup" ? "dialogue_followup" : "dialogue_opener";
     const context = { characterId, characterName: character.name, gestaltPresent: Boolean(gestalt), experimentCount: experiments.length, timeZone: clock.timeZone, timeZoneKnown: clock.timeZoneKnown };
-    const { value } = await this.llm.structured({ purpose, messages, validate: validateDialogueEnvelope, context });
+    const { value } = await this.llm.structured({ purpose, config, messages, validate: validateDialogueEnvelope, context });
     // A model that copies the history's timestamp markers gets them removed; the marker is metadata, not speech.
     const echo = stripTimestampEcho(value.message);
     if (echo.stripped) {
       this.diagnostics.event({ type: "dialogue-timestamp-echo-stripped", purpose, characterId });
       if (!echo.text.trim()) throw coded("AI_OUTPUT_INVALID", `${purpose} output contained only a timestamp marker.`);
     }
-    return { ...value, message: echo.text.trim(), imageRequest: settings.imageEnabled ? value.imageRequest : null };
+    return { ...value, message: echo.text.trim(), imageRequest: config.imageEnabled ? value.imageRequest : null };
   }
 
   // Browser time zone for autonomous messages (and a reply sent without one): the most recently active session in
@@ -211,9 +216,10 @@ export class Dialogue {
     return best?.timeZone ?? null;
   }
 
-  commitCharacterMessage(characterId, kind, envelope) {
+  // profile: the generating job's snapshot; its image model and descriptions go with a queued image.
+  commitCharacterMessage(characterId, kind, envelope, profile) {
     const message = this.store.addMessage({ characterId, role: "character", kind, text: envelope.message });
-    if (envelope.imageRequest && this.settings.get().imageEnabled) this.images.request({ message, prompt: envelope.imageRequest });
+    if (envelope.imageRequest && profile.config.imageEnabled) this.images.request({ message, prompt: envelope.imageRequest, profile });
     this.memory.maybeConsolidate(characterId);
     return message;
   }
@@ -304,7 +310,8 @@ export class Dialogue {
     chat.timer = null;
     if (!this.stillEligible(characterId, timer)) { this.diagnostics.event({ type: "followup-skipped", characterId, kind: timer.kind, stage: "fire" }); return null; }
     const mode = timer.kind === "opener" ? "opener" : "followup";
-    const job = this.generate(characterId, mode, {})
+    const progress = {};
+    const job = this.generate(characterId, mode, progress)
       .then((envelope) => {
         // Re-check at commit: a send or navigation during generation discards the autonomous message.
         if (!this.stillEligible(characterId, timer) || chat.timer) {
@@ -312,7 +319,7 @@ export class Dialogue {
           return null;
         }
         // An autonomous message never schedules another timer, whatever followUpDelaySeconds it returned.
-        return this.commitCharacterMessage(characterId, mode === "opener" ? "opener" : "followup", envelope);
+        return this.commitCharacterMessage(characterId, mode === "opener" ? "opener" : "followup", envelope, progress.profile);
       })
       .catch((error) => { this.diagnostics.error(`dialogue_${mode}`, error, { characterId }); return null; })
       .finally(() => chat.background.delete(job));

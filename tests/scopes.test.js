@@ -12,7 +12,7 @@ test("every character owns its own pool; legacy scope fields are ignored on crea
     for (const [useSharedMemory, useSharedInterpretations] of combos) {
       const character = app.createCharacter({ name: `C${useSharedMemory}${useSharedInterpretations}`, description: "", useSharedMemory, useSharedInterpretations });
       assert.equal(poolOf(character), characterPool(character.id));
-      assert.deepEqual(Object.keys(character).sort(), ["createdAt", "description", "id", "name", "updatedAt"]);
+      assert.deepEqual(Object.keys(character).sort(), ["config", "createdAt", "description", "id", "name", "sceneDescription", "updatedAt", "userDescription"]);
       const updated = app.updateCharacter(character.id, { name: "Renamed", description: "d", useSharedMemory: true, useSharedInterpretations: true });
       assert.equal(poolOf(updated), characterPool(character.id));
     }
@@ -24,9 +24,8 @@ test("every character owns its own pool; legacy scope fields are ignored on crea
 test("pools of different characters stay separate", async () => {
   const { app } = await makeApp({ contemplation_experiment_planning: () => ({ experiments: [] }) });
   try {
-    app.settings.update({ contemplationEnabled: false });
-    const a = app.createCharacter({ name: "A", description: "" });
-    const b = app.createCharacter({ name: "B", description: "" });
+    const a = app.createCharacter({ name: "A", description: "", config: { contemplationEnabled: false } });
+    const b = app.createCharacter({ name: "B", description: "", config: { contemplationEnabled: false } });
     app.contemplation.addInterpretation(poolOf(a), "about A's chat");
     app.store.insertMemory({ pool: poolOf(a), tier: "ltm", topic: "A memory", summary: "s", retrievalBrief: "", importance: 0.5, sources: [] });
     assert.deepEqual(app.store.interpretations(poolOf(b)), []);

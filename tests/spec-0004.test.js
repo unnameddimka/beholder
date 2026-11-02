@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { makeApp, closeApp, waitFor, seedMessages, tempDir, identityConsolidation, ROOT } from "./helpers.js";
+import { makeApp, closeApp, waitFor, seedMessages, tempDir, identityConsolidation, ROOT, configure, configOf } from "./helpers.js";
 import { Store, MIGRATIONS, poolOf, characterPool } from "../src/db.js";
 import { validateConsolidation } from "../src/contemplation.js";
 import { consolidationSystemPrompt, INTERPRETATION_MAX_CHARS } from "../src/prompts/contemplation.js";
@@ -22,7 +22,7 @@ async function maintain(app, pool, characterId) {
 // A pool seeded without triggering planning or gestaltization.
 function seedPool(app, character, texts, experiments = []) {
   const pool = poolOf(character);
-  app.settings.update({ contemplationEnabled: false });
+  configure(app, character.id, { contemplationEnabled: false });
   const ids = texts.map((text) => app.contemplation.addInterpretation(pool, text, character.id));
   const experimentIds = experiments.map((text) => app.contemplation.addExperiment(pool, text));
   app.store.setPlanningNeeded(pool, false);
@@ -79,7 +79,7 @@ test("C1/C4: a prefetch-selected maintenance consolidates, verifies the consolid
     const mira = app.createCharacter(base);
     const { pool, ids } = seedPool(app, mira, ["The user jokes to test trust.", "Humor is the user's way of checking whether the character is safe.", "The user is homesick."], ["Tell an absurd story."]);
     const before = app.store.ensureInterpretationPool(pool);
-    app.settings.update({ contemplationEnabled: true });
+    configure(app, mira.id, { contemplationEnabled: true });
     app.dialogue.send(mira.id, "haha");
     await waitFor(() => mock.byPurpose("contemplation_experiment_planning").length === 1, { message: "planning after the change" });
     await app.contemplation.idle(pool);
@@ -113,9 +113,11 @@ test("C4: a failed consolidation or a failed verification commits nothing", asyn
   try {
     const mira = app.createCharacter(base);
     const { pool } = seedPool(app, mira, ["One.", "Two."], ["Probe."]);
-    const snapshot = () => JSON.stringify([app.store.interpretations(pool), app.store.experiments(pool), app.store.ensureInterpretationPool(pool)]);
+    // The cognitive state; the Maintenance status record (Specification 0005 F3) is expected to change.
+    const snapshot = () => JSON.stringify([app.store.interpretations(pool), app.store.experiments(pool), { ...app.store.ensureInterpretationPool(pool), lastMaintenance: undefined }]);
     const before = snapshot();
     await maintain(app, pool, mira.id);
+    assert.equal(app.store.ensureInterpretationPool(pool).lastMaintenance.status, "failed");
     assert.equal(mock.byPurpose("contemplation_consolidation").length, 3, "initial attempt plus bounded repairs");
     assert.equal(mock.byPurpose("contemplation_maintenance").length, 0, "no verification after an invalid consolidation");
     assert.equal(snapshot(), before);
@@ -241,14 +243,14 @@ test("C3: a pool beyond the model's context or output budget is refused before a
     const mira = app.createCharacter(base);
     const { pool } = seedPool(app, mira, ["A".repeat(3000), "B".repeat(3000), "C".repeat(3000)]);
     const before = JSON.stringify(app.store.interpretations(pool));
-    const model = app.settings.get().models.contemplation;
+    const model = configOf(app, mira.id).models.contemplation;
     app.llm.catalog = { at: Date.now(), models: [], byId: new Map([[model, { id: model, contextLength: 16_500 }]]) };
     await maintain(app, pool, mira.id);
     assert.equal(app.contemplation.status(pool).lastError.code, "CONSOLIDATION_CONTEXT_EXCEEDED");
     assert.match(app.contemplation.status(pool).lastError.message, /system prompt and output budget/);
 
     app.llm.catalog = { at: Date.now(), models: [], byId: new Map() };
-    app.settings.update({ maxTokens: { ...app.settings.get().maxTokens, contemplation: 1000 } });
+    configure(app, mira.id, { maxTokens: { ...configOf(app, mira.id).maxTokens, contemplation: 1000 } });
     await maintain(app, pool, mira.id);
     assert.equal(app.contemplation.status(pool).lastError.code, "CONSOLIDATION_OUTPUT_EXCEEDED");
     assert.equal(mock.byPurpose("contemplation_consolidation").length, 0);
@@ -268,12 +270,12 @@ test("P1: a new character starts with empty cognition; Dialogue, Vision and Cont
   });
   try {
     const first = app.createCharacter(base);
-    app.settings.update({ contemplationEnabled: false });
+    configure(app, first.id, { contemplationEnabled: false });
     app.contemplation.addInterpretation(poolOf(first), "FIRST-INTERPRETATION");
     app.contemplation.addExperiment(poolOf(first), "FIRST-EXPERIMENT");
     app.store.setGestalt(poolOf(first), "FIRST-GESTALT", 1);
     app.store.insertMemory({ pool: poolOf(first), tier: "ltm", topic: "FIRST-MEMORY", summary: "s", retrievalBrief: "", importance: 0.5, sources: [] });
-    app.settings.update({ contemplationEnabled: true });
+    configure(app, first.id, { contemplationEnabled: true });
     const second = app.createCharacter({ ...base, name: "Second", useSharedMemory: true, useSharedInterpretations: true });
     assert.deepEqual([app.store.interpretations(poolOf(second)), app.store.experiments(poolOf(second)), app.store.memoryRecords(poolOf(second))], [[], [], []]);
     assert.equal(app.store.ensureInterpretationPool(poolOf(second)).gestalt, null);
@@ -341,13 +343,18 @@ test("P2: the single shared-pool character keeps every record, id, text, revisio
   assert.deepEqual(rows(file, "SELECT * FROM experiments ORDER BY id"), moved(before.experiments));
   assert.deepEqual(rows(file, "SELECT * FROM memory_pools"), [{ pool: own, revision: 15, last_ltm_date: "2026-11-01" }]);
   assert.deepEqual(rows(file, "SELECT * FROM interpretation_pools"), [{ pool: own, interpretation_revision: 61, experiment_revision: 98, planning_needed: 1,
-    gestalt: "The interpretations circle the user.", gestalt_revision: 60, gestalt_updated_at: "2026-11-01T10:00:00.000Z" }]);
+    gestalt: "The interpretations circle the user.", gestalt_revision: 60, gestalt_updated_at: "2026-11-01T10:00:00.000Z", last_maintenance: null }]);
   assert.deepEqual(rows(file, "SELECT pool, character_id, last_user_message_id FROM contemplation_watermarks"), [{ pool: own, character_id: 1, last_user_message_id: 5 }]);
   assert.deepEqual(rows(file, "SELECT * FROM messages ORDER BY id"), before.messages.map((row) => ({ ...row, consolidated_pool: row.consolidated_pool ? own : null })),
     "the transcript is untouched apart from the consolidation pool label");
   assert.deepEqual(rows(file, "SELECT * FROM uploads"), before.uploads);
-  assert.deepEqual(rows(file, "SELECT * FROM meta ORDER BY key"), before.meta, "settings, self-description and the daily LTM marker are kept");
-  assert.deepEqual(rows(file, "SELECT name FROM pragma_table_info('characters') ORDER BY cid").map((row) => row.name), ["id", "name", "description", "created_at", "updated_at"]);
+  // Specification 0005 migration then moves the global settings and self-description into the character itself.
+  assert.deepEqual(rows(file, "SELECT * FROM meta ORDER BY key"), before.meta.filter((row) => row.key === "lastLtmDate"), "the daily LTM marker is kept");
+  const [alice] = rows(file, "SELECT user_description, ai_config FROM characters");
+  assert.equal(alice.user_description, "I am the user.");
+  assert.equal(JSON.parse(alice.ai_config).contemplationEnabled, true);
+  assert.deepEqual(rows(file, "SELECT name FROM pragma_table_info('characters') ORDER BY cid").map((row) => row.name),
+    ["id", "name", "description", "created_at", "updated_at", "scene_description", "user_description", "ai_config"]);
   assert.equal(rows(file, "PRAGMA user_version")[0].user_version, MIGRATIONS.length);
 
   const snapshot = () => JSON.stringify(["memory_records", "memory_pools", "interpretations", "experiments", "interpretation_pools", "contemplation_watermarks", "messages"].map((table) => rows(file, `SELECT * FROM ${table}`)));
@@ -383,7 +390,8 @@ test("P2: personal-pool installations migrate unchanged without any extra charac
     db.prepare("INSERT INTO memory_records (pool, tier, topic, summary, importance, sources, created_at, updated_at) VALUES ('character:2', 'ltm', 'Ben memory', 's', 0.5, '[]', ?, ?)").run(at, at);
     db.prepare("INSERT INTO interpretation_pools (pool, interpretation_revision) VALUES ('shared', 4)").run();
   });
-  const personal = () => [rows(file, "SELECT * FROM interpretations"), rows(file, "SELECT * FROM memory_records"), rows(file, "SELECT * FROM interpretation_pools WHERE pool = 'character:1'")];
+  const personal = () => [rows(file, "SELECT * FROM interpretations"), rows(file, "SELECT * FROM memory_records"),
+    rows(file, "SELECT pool, interpretation_revision, experiment_revision, planning_needed, gestalt, gestalt_revision, gestalt_updated_at FROM interpretation_pools WHERE pool = 'character:1'")];
   const before = personal();
   new Store(file).close();
   assert.deepEqual(personal(), before);
@@ -416,11 +424,13 @@ test("P2: ambiguous legacy states stop the migration atomically and leave the da
 
 // ---- P3 and U1-U3: browser UI -----------------------------------------------------------------------------------
 
+// Specification 0005 section 4 adds Ctrl+Enter as the only keyboard send; plain Enter stays a newline.
 test("P3/U1/U2: no scope controls remain; the composer has icon buttons and no Enter-to-send handler", () => {
   const app = fs.readFileSync(path.join(ROOT, "public", "app.js"), "utf8");
   const css = fs.readFileSync(path.join(ROOT, "public", "styles.css"), "utf8");
   assert.doesNotMatch(app, /useShared|shared memory|shared interpretations|private memory|private interpretations|Shared pool/i);
-  assert.doesNotMatch(app, /keydown|keypress|"Enter"|'Enter'/, "no keyboard shortcut submits a message");
+  assert.doesNotMatch(app, /keypress/);
+  assert.equal(app.split("keydown").length - 1, 1, "one key handler: the Ctrl+Enter shortcut");
   assert.match(app, /"aria-label": "Attach image"/);
   assert.match(app, /"aria-label": "Send message"/);
   assert.match(app, /sendButton\.addEventListener\("click", submit\)/);

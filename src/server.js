@@ -6,7 +6,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { BeholderApp } from "./app.js";
-import { CURATED_TEXT_MODELS, CURATED_VISION_MODELS, DEFAULT_IMAGE_MODEL } from "./settings.js";
+import { CURATED_TEXT_MODELS, CURATED_VISION_MODELS, DEFAULT_IMAGE_MODEL, defaultConfig } from "./settings.js";
 import { poolOf } from "./db.js";
 import { buildEmergencyDump } from "./dump.js";
 import { IMAGE_FILE_PATTERN } from "./images.js";
@@ -74,12 +74,13 @@ function messagesWithImages(app, characterId, afterId) {
   });
 }
 
-function contemplationView(app, character) {
+function contemplationView(app, character, extra = {}) {
   const pool = poolOf(character);
   return {
+    ...extra,
     pool,
     poolState: app.store.ensureInterpretationPool(pool),
-    contemplationEnabled: app.settings.get().contemplationEnabled,
+    contemplationEnabled: character.config.contemplationEnabled,
     gestalt: app.contemplation.gestaltView(pool),
     interpretations: app.store.interpretations(pool),
     experiments: app.store.experiments(pool),
@@ -89,7 +90,8 @@ function contemplationView(app, character) {
 
 export function createServer(app) {
   const routes = [
-    ["GET", /^\/api\/status$/, () => ({ apiKeyConfigured: app.key.configured(), settings: app.settings.get(), userDescription: app.settings.userDescription(),
+    // Global status is infrastructure only; model selection and descriptions belong to each character (Specification 0005).
+    ["GET", /^\/api\/status$/, () => ({ apiKeyConfigured: app.key.configured(), defaultConfig: defaultConfig(),
       curatedModels: CURATED_TEXT_MODELS, curatedVisionModels: CURATED_VISION_MODELS, defaultImageModel: DEFAULT_IMAGE_MODEL, uploadMaxBytes: UPLOAD_MAX_BYTES, build: { ...app.projectMeta, sourceCommitSha: app.buildInfo.sourceCommitSha } })],
     ["POST", /^\/api\/key$/, async (req) => app.setApiKey((await readJsonBody(req)).apiKey)],
     ["GET", /^\/api\/models$/, async (req, url) => {
@@ -101,16 +103,15 @@ export function createServer(app) {
       const chatImageModels = (catalog?.models || []).filter((model) => model.outputModalities?.includes("image")).map((model) => ({ id: model.id, name: model.name }));
       return { curated: CURATED_TEXT_MODELS, text: textModels, image: imageList.models.length ? imageList.models : chatImageModels, imageSource: imageList.source, catalogError };
     }],
-    ["PUT", /^\/api\/settings$/, async (req) => {
-      const before = app.settings.get();
-      const after = app.settings.update(await readJsonBody(req));
-      if (!before.contemplationEnabled && after.contemplationEnabled && app.key.configured()) app.contemplation.recover();
-      return after;
-    }],
-    ["PUT", /^\/api\/user-description$/, async (req) => ({ text: app.settings.setUserDescription((await readJsonBody(req)).text) })],
     ["GET", /^\/api\/characters$/, () => app.store.listCharacters().map((character) => app.characterSummary(character))],
     ["POST", /^\/api\/characters$/, async (req) => app.characterSummary(app.createCharacter(await readJsonBody(req)))],
-    ["PUT", /^\/api\/characters\/(\d+)$/, async (req, url, m) => app.characterSummary(app.updateCharacter(idParam(m[1]), await readJsonBody(req)))],
+    // Turning a character's automatic Contemplation on catches up on its unprocessed messages, as the global switch did.
+    ["PUT", /^\/api\/characters\/(\d+)$/, async (req, url, m) => {
+      const before = mustCharacter(app, m[1]);
+      const after = app.updateCharacter(before.id, await readJsonBody(req));
+      if (!before.config.contemplationEnabled && after.config.contemplationEnabled && app.key.configured()) app.contemplation.recover(after.id);
+      return app.characterSummary(after);
+    }],
     ["GET", /^\/api\/characters\/(\d+)\/chat$/, (req, url, m) => {
       const character = mustCharacter(app, m[1]);
       const after = Math.max(0, Number(url.searchParams.get("after")) || 0);
@@ -142,8 +143,9 @@ export function createServer(app) {
     ["POST", /^\/api\/characters\/(\d+)\/contemplation\/force$/, async (req, url, m) => {
       const character = mustCharacter(app, m[1]);
       if (!app.key.configured()) throw coded("API_KEY_MISSING", "Enter the OpenRouter API key first.");
-      app.contemplation.force(poolOf(character), (await readJsonBody(req)).kind, character.id);
-      return contemplationView(app, character);
+      // The result reports queueing only (queued, or why not); the run's outcome appears in the status later.
+      const force = app.contemplation.force(poolOf(character), (await readJsonBody(req)).kind, character.id);
+      return contemplationView(app, character, { force });
     }],
     ["POST", /^\/api\/characters\/(\d+)\/interpretations$/, async (req, url, m) => {
       const character = mustCharacter(app, m[1]);

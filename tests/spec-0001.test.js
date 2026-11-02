@@ -1,7 +1,7 @@
 // Specification 0001: dialogue response reliability (R1-R4) and temporal context (T1-T3), with a mocked OpenRouter.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { makeApp, closeApp, waitFor, reply, completion, jsonResponse, sleep } from "./helpers.js";
+import { makeApp, closeApp, waitFor, reply, completion, jsonResponse, sleep, configure, configOf } from "./helpers.js";
 import { poolOf } from "../src/db.js";
 import { stripTimestampEcho, validTimeZone } from "../src/clock.js";
 
@@ -25,8 +25,14 @@ async function catalogue(app, entries) {
   app.llm.catalog = { at: Date.now(), models: entries, byId: new Map(entries.map((entry) => [entry.id, entry])) };
 }
 
+// Specification 0005: the Dialogue model is per character; this sets it for every existing character and for
+// characters created afterwards.
 function useDialogueModel(app, model) {
-  app.settings.update({ models: { ...app.settings.get().models, dialogue: model } });
+  for (const character of app.store.listCharacters()) configure(app, character.id, { models: { dialogue: model } });
+  app.testDialogueModel = model;
+  if (app.createCharacter.wrapped) return;
+  const create = app.createCharacter.bind(app);
+  app.createCharacter = Object.assign((input) => create({ ...input, config: { ...input.config, models: { dialogue: app.testDialogueModel } } }), { wrapped: true });
 }
 
 const lastCharacterText = (app, id) => app.store.lastMessage(id)?.role === "character" ? app.store.lastMessage(id).text : null;
@@ -59,12 +65,10 @@ test("malformed JSON repair sees only the invalid output, contract and errors: n
     contemplation_prefetch: quietPrefetch
   });
   try {
-    app.settings.setUserDescription("PINNED-NURSE-DESCRIPTION");
-    app.settings.update({ contemplationEnabled: false });
-    const mira = app.createCharacter(base);
+    const mira = app.createCharacter({ ...base, userDescription: "PINNED-NURSE-DESCRIPTION", config: { contemplationEnabled: false } });
     app.contemplation.addExperiment(poolOf(mira), "EXPERIMENT-ABSURD-STORY");
     app.store.insertMemory({ pool: `character:${mira.id}`, tier: "ltm", topic: "MEMORY-TOPIC", summary: "MEMORY-SUMMARY", retrievalBrief: "x", importance: 0.5, sources: [] });
-    app.settings.update({ contemplationEnabled: true });
+    configure(app, mira.id, { contemplationEnabled: true });
     app.store.addMessage({ characterId: mira.id, role: "character", kind: "reply", text: "HISTORY-DARLING-SPEECH" });
     app.dialogue.send(mira.id, "hello");
     await waitFor(() => lastCharacterText(app, mira.id) === "Repaired.");
@@ -132,9 +136,8 @@ test("valid envelope keeps image requests and follow-up scheduling", async () =>
     contemplation_prefetch: quietPrefetch
   });
   try {
-    app.settings.update({ imageEnabled: true });
     app.images.request = (input) => { app.images.requested = input; };
-    const mira = app.createCharacter(base);
+    const mira = app.createCharacter({ ...base, config: { imageEnabled: true } });
     app.dialogue.presence(CLIENT, { characterId: mira.id });
     app.dialogue.send(mira.id, "show me");
     await waitFor(() => lastCharacterText(app, mira.id) === "*holds up a sketch*");

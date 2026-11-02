@@ -140,7 +140,6 @@ function parseRoute() {
   if (parts[0] === "contemplation" && parts[1]) return { kind: "contemplation", characterId: Number(parts[1]) };
   if (parts[0] === "edit" && parts[1]) return { kind: "edit", characterId: Number(parts[1]) };
   if (parts[0] === "new") return { kind: "new" };
-  if (parts[0] === "settings") return { kind: "settings" };
   return { kind: "home" };
 }
 
@@ -175,7 +174,6 @@ async function route() {
     else if (target.kind === "edit") view = renderEditor(target.characterId);
     else if (target.kind === "chat") view = await renderChat(target.characterId);
     else if (target.kind === "contemplation") view = await renderContemplation(target.characterId);
-    else if (target.kind === "settings") view = await renderSettings();
   } catch (error) {
     if (epoch !== routeEpoch) return;
     root.append(h("div", { className: "card" }, h("h2", { text: "Something went wrong" }), h("p", { className: "muted", text: error.message }), h("a", { href: "#/", text: "Back to characters" })));
@@ -233,18 +231,9 @@ function renderHome() {
       : [h("p", { className: "muted", text: "No characters yet." })]));
   };
   fill();
-  const description = h("textarea", { rows: 4, value: state.status.userDescription, placeholder: "Describe yourself for the characters (optional)." });
-  const saveDescription = h("button", { className: "btn small", type: "button", text: "Save", onClick: async () => {
-    try { await api("/api/user-description", { method: "PUT", body: { text: description.value } }); showBanner(""); saveDescription.textContent = "Saved"; setTimeout(() => { saveDescription.textContent = "Save"; }, 1500); }
-    catch (error) { showBanner(error.message); }
-  } });
   root.append(
     h("div", { className: "row spread" }, h("h2", { text: "Characters" }), h("a", { className: "btn primary", href: "#/new", text: "Add Character" })),
-    list,
-    h("div", { className: "card stack" },
-      h("h3", { text: "About you" }),
-      h("p", { className: "muted", text: "Pinned as the first user message for every character. It is your self-description, not an instruction." }),
-      description, h("div", { className: "row" }, saveDescription))
+    list
   );
   return {
     kind: "home",
@@ -254,28 +243,107 @@ function renderHome() {
 
 // ---- character editor ------------------------------------------------------------------------------------------
 
+// Specification 0005 A1-A3: the character owns its three AI-facing descriptions and its whole AI configuration. A
+// new character starts from the built-in defaults, never from another character.
 function renderEditor(characterId) {
   const root = els.root;
   const existing = characterId ? state.characters.find((character) => character.id === characterId) : null;
   if (characterId && !existing) throw new Error("Character not found.");
   setTitle(root, existing ? `Edit ${existing.name}` : "New character");
+  const config = structuredClone(existing?.config || state.status.defaultConfig);
   const name = h("input", { type: "text", maxLength: 100, value: existing?.name || "", required: true });
-  const description = h("textarea", { rows: 10, value: existing?.description || "", placeholder: "Who is this character? Identity, personality, voice, situation..." });
+  const descriptionField = (label, hint, value, rows, placeholder) => {
+    const input = h("textarea", { rows, maxLength: 20000, value, placeholder });
+    return { input, el: h("label", { className: "field" }, label, h("span", { className: "field-hint", text: hint }), input) };
+  };
+  const characterDescription = descriptionField("Character Description", "Who the character is: identity, personality, voice, manner.", existing?.description || "", 8, "Who is this character?");
+  const sceneDescription = descriptionField("Scene Description", "Where and in what circumstances the conversation takes place. Only you write it.", existing?.sceneDescription || "", 5, "Optional");
+  const userDescription = descriptionField("User Description", "How you describe yourself to this character. Pinned as your self-description, not as a chat message.", existing?.userDescription || "", 5, "Optional");
+  const models = modelSelectors(config);
   const save = h("button", { className: "btn primary", type: "submit", text: existing ? "Save" : "Create" });
-  root.append(h("form", { className: "card stack", onSubmit: async (event) => {
+  root.append(h("form", { className: "stack", onSubmit: async (event) => {
     event.preventDefault();
     save.disabled = true;
-    const body = { name: name.value, description: description.value };
+    const body = { name: name.value, description: characterDescription.input.value, sceneDescription: sceneDescription.input.value, userDescription: userDescription.input.value, config };
     try {
       const saved = await api(existing ? `/api/characters/${existing.id}` : "/api/characters", { method: existing ? "PUT" : "POST", body });
       location.hash = `#/chat/${saved.id}`;
     } catch (error) { showBanner(error.message); save.disabled = false; }
   } },
-  h("label", { className: "field" }, "Display name", name),
-  h("label", { className: "field" }, "AI-facing description", description),
-  h("div", { className: "row" }, save, h("a", { className: "btn", href: existing ? `#/chat/${existing.id}` : "#/", text: "Cancel" }))));
+  h("div", { className: "card stack" }, h("label", { className: "field" }, "Display name", name)),
+  h("div", { className: "card stack" }, h("h3", { text: "Descriptions" }),
+    h("p", { className: "muted", text: "All three are given to every AI role of this character as labeled context. They are never chat messages." }),
+    characterDescription.el, sceneDescription.el, userDescription.el),
+  h("h3", { className: "section-title", text: "AI Models" }),
+  models.el,
+  h("div", { className: "row form-actions" }, save, h("a", { className: "btn", href: existing ? `#/chat/${existing.id}` : "#/", text: "Cancel" }))));
   name.focus();
-  return { kind: "editor" };
+  return { kind: "editor", onActivity: models.onActivity };
+}
+
+// The four role cards of one character's configuration, edited in place on config. Models are chosen from the
+// curated and catalogue lists (or typed as an id); a configured id stays shown even when the catalogue lacks it.
+function modelSelectors(config) {
+  let models = null;
+  const catalogNote = h("p", { className: "muted", text: "Loading the model list..." });
+  const textList = h("datalist", { id: "text-models" });
+  const visionList = h("datalist", { id: "vision-models" });
+  const imageList = h("datalist", { id: "image-models" });
+  const fillLists = () => {
+    const text = new Map([...(models?.curated || state.status.curatedModels).map((m) => [m.id, m.label || m.name]), ...(models?.text || []).map((m) => [m.id, m.name])]);
+    textList.replaceChildren(...[...text].map(([id, label]) => h("option", { value: id, text: label })));
+    // Vision offers exactly the curated models (Specification 0003 V2); another image-capable id can still be typed.
+    const vision = new Map(state.status.curatedVisionModels.map((m) => [m.id, m.label]));
+    visionList.replaceChildren(...[...vision].map(([id, label]) => h("option", { value: id, text: label })));
+    const images = new Map([[state.status.defaultImageModel, "Default (Society)"], ...(models?.image || []).map((m) => [m.id, m.name])]);
+    imageList.replaceChildren(...[...images].map(([id, label]) => h("option", { value: id, text: label })));
+    catalogNote.textContent = !models ? "Loading the model list..." : models.catalogError
+      ? `The OpenRouter model list is unavailable (${models.catalogError}); the curated models are listed and any model id can be typed.`
+      : "Pick a model from the list or type any OpenRouter model id.";
+  };
+  const load = (refresh) => api(`/api/models${refresh ? "?refresh=1" : ""}`).then((value) => { models = value; fillLists(); })
+    .catch((error) => { models = { catalogError: error.message }; fillLists(); });
+  fillLists();
+  load(false);
+  const dots = {};
+  const modelRow = (role, label, list) => {
+    const input = h("input", { type: "text", value: config.models[role], list, autocomplete: "off", spellcheck: false, "aria-label": `${label} model`, onInput: (event) => { config.models[role] = event.target.value.trim(); } });
+    dots[role] = h("span", { className: "dot", title: `${label} activity` });
+    return h("label", { className: "field" }, "Model", h("div", { className: "model-row" }, input, dots[role]));
+  };
+  const textModelCard = (role, label, hint, list = "text-models", extra = null) => {
+    const temperature = config.temperature[role];
+    const valueLabel = h("span", { text: temperature.value.toFixed(2) });
+    const range = h("input", { type: "range", min: 0, max: 2, step: 0.05, value: temperature.value, disabled: !temperature.enabled, "aria-label": `${label} temperature`,
+      onInput: (event) => { temperature.value = Number(event.target.value); valueLabel.textContent = temperature.value.toFixed(2); } });
+    const toggle = h("input", { type: "checkbox", checked: temperature.enabled, onChange: (event) => { temperature.enabled = event.target.checked; range.disabled = !temperature.enabled; } });
+    const maxTokens = h("input", { type: "number", min: 256, max: 200000, step: 256, value: config.maxTokens[role], onInput: (event) => { config.maxTokens[role] = Number(event.target.value); } });
+    return h("div", { className: "card stack" }, h("h3", { text: label }), h("p", { className: "muted", text: hint }), modelRow(role, label, list),
+      h("label", { className: "check" }, toggle, h("span", {}, "Override temperature ", h("span", { className: "muted", text: "(off: provider default; ignored for models that do not support it)" }))),
+      h("div", { className: "row" }, range, valueLabel),
+      h("label", { className: "field" }, "Maximum output tokens (includes reasoning tokens on reasoning models)", maxTokens), extra);
+  };
+  const imageEnabled = h("input", { type: "checkbox", checked: config.imageEnabled, onChange: (event) => { config.imageEnabled = event.target.checked; } });
+  const contemplationEnabled = h("input", { type: "checkbox", checked: config.contemplationEnabled, onChange: (event) => { config.contemplationEnabled = event.target.checked; } });
+  const el = h("div", { className: "stack" }, textList, visionList, imageList, catalogNote,
+    textModelCard("dialogue", "Dialogue", "Chat replies, openers and follow-ups, memory retrieval and memory consolidation."),
+    textModelCard("contemplation", "Contemplation", "Prefetch, interpretations, maintenance, gestalt and experiments.", "text-models",
+      h("label", { className: "check" }, contemplationEnabled, h("span", { text: "Automatic Contemplation (off: nothing runs on its own and the gestalt and experiments are not sent to dialogue; Force on the Contemplation page still works)" }))),
+    textModelCard("vision", "Vision", "Looks at images you attach; needs a model with image input and text output.", "vision-models"),
+    h("div", { className: "card stack" }, h("h3", { text: "Image Generation" }), h("p", { className: "muted", text: "Pictures the character shows you. Attaching your own images works either way." }),
+      modelRow("image", "Image Generation", "image-models"),
+      h("label", { className: "check" }, imageEnabled, h("span", { text: "Enable image generation" }))),
+    h("div", { className: "row" }, h("button", { className: "btn", type: "button", text: "Refresh model list", onClick: () => load(true) })));
+  const onActivity = (activity) => {
+    for (const [role, dot] of Object.entries(dots)) {
+      const info = activity.roles[role];
+      dot.classList.toggle("working", Boolean(info?.working));
+      dot.classList.toggle("error", !info?.working && Boolean(info?.lastError));
+      dot.title = info?.working ? `${info.pendingCount} request(s): ${info.purposes.join(", ")}` : info?.lastError ? `Last error: ${info.lastError.message}` : "idle";
+    }
+  };
+  if (state.activity) onActivity(state.activity);
+  return { el, onActivity };
 }
 
 // ---- chat ------------------------------------------------------------------------------------------------------
@@ -287,8 +355,8 @@ async function renderChat(characterId) {
   setTitle(root, character.name);
   const messagesEl = h("div", { className: "messages", "aria-live": "polite" });
   const statusEl = h("div");
-  // Specification 0004 U1/U2: a growing multiline field between two compact icon buttons. Enter always inserts a
-  // newline; only the Send button sends.
+  // Specification 0004 U1/U2: a growing multiline field between two compact icon buttons. Enter and Shift+Enter insert
+  // a newline; the Send button sends, and so does Ctrl+Enter on a desktop keyboard (Specification 0005 section 4).
   const input = h("textarea", { rows: 1, placeholder: `Message ${character.name}...`, value: state.drafts.get(characterId) || "", "aria-label": "Message", enterkeyhint: "enter" });
   const sendButton = h("button", { className: "composer-button primary", type: "button", "aria-label": "Send message", title: "Send message" }, icon(ICON_SEND));
   // One attached image per message (Specification 0003 U1), validated again by the server.
@@ -410,6 +478,15 @@ async function renderChat(characterId) {
     finally { sending = false; renderStatus(); }
   };
   sendButton.addEventListener("click", submit);
+  // Ctrl+Enter runs the same submit as the button. Nothing else is intercepted: plain and Shift+Enter keep their
+  // newline, an IME composition or an auto-repeated key is ignored, and Meta (Command) is not a send shortcut.
+  input.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" || !event.ctrlKey || event.metaKey || event.altKey || event.shiftKey) return;
+    if (event.isComposing || event.keyCode === 229) return;
+    event.preventDefault();
+    if (event.repeat) return;
+    submit();
+  });
   // Grows with its lines up to the CSS max-height, then scrolls inside.
   const fitInput = () => {
     input.style.height = "auto";
@@ -431,9 +508,19 @@ async function renderChat(characterId) {
   return { kind: "chat", characterId, poll: refresh };
 }
 
+// Specification 0005 F3: the last persisted Maintenance attempt, never a prediction of the next one.
+const MAINTENANCE_OUTCOMES = { running: "running", applied: "succeeded, interpretations updated", unchanged: "succeeded, nothing needed changing",
+  stale: "discarded as stale", skipped: "skipped", failed: "failed", interrupted: "interrupted by a server restart" };
+function maintenanceText(last) {
+  if (!last) return "Never";
+  const when = formatTime(last.finishedAt || last.startedAt);
+  return [`${when}: ${MAINTENANCE_OUTCOMES[last.status] || last.status} (${last.source === "forced" ? "forced" : "automatic"})`, last.reason].filter(Boolean).join(". ");
+}
+
 // ---- contemplation ---------------------------------------------------------------------------------------------
 
-// Reference-only view (Specification 0002 U1/U2): reading and polling never change contemplation state.
+// Results stay read-only (Specification 0002 U1/U2): no control writes interpretation, experiment or gestalt text.
+// The Force buttons only ask the model to run an existing stage (Specification 0005 F1/F2).
 async function renderContemplation(characterId) {
   const root = els.root;
   const character = state.characters.find((entry) => entry.id === characterId);
@@ -441,6 +528,7 @@ async function renderContemplation(characterId) {
   setTitle(root, `Contemplation: ${character.name}`);
   let data = await api(`/api/characters/${characterId}/contemplation`);
   const statusEl = h("div", { className: "card" });
+  const forceEl = h("div", { className: "card stack" });
   const gestaltEl = h("div", { className: "card" });
   const interpretationsEl = h("div", { className: "card" });
   const experimentsEl = h("div", { className: "card" });
@@ -449,7 +537,9 @@ async function renderContemplation(characterId) {
     const s = data.status;
     const roles = state.activity?.roles?.contemplation;
     const rows = [
-      ["Contemplation", data.contemplationEnabled ? "enabled" : "disabled (no automatic contemplation; gestalt and experiments are not sent to dialogue)"],
+      ["Automatic", data.contemplationEnabled ? "on" : "off (nothing runs on its own; gestalt and experiments are not sent to dialogue)"],
+      ["Maintenance now", s.maintenance],
+      ["Last Maintenance", maintenanceText(s.lastMaintenance)],
       ["Stage", s.running ? `${s.stage}${s.stageCharacterId ? ` (chat ${state.characters.find((c) => c.id === s.stageCharacterId)?.name || s.stageCharacterId})` : ""}` : "idle"],
       ["Parallel", s.parallel.total ? `${s.parallel.inFlight} running of ${s.parallel.total} maintenance requests` : "-"],
       ["Model requests", roles ? `${roles.pendingCount} in flight` : "-"],
@@ -460,6 +550,34 @@ async function renderContemplation(characterId) {
     ];
     statusEl.replaceChildren(h("div", { className: "row spread" }, h("h3", { text: "Status" }), h("span", { className: `dot${s.running ? " working" : s.lastError ? " error" : ""}` })),
       h("div", { className: "stage-grid" }, ...rows.flatMap(([label, value]) => [h("span", { className: "muted", text: label }), h("span", { text: value })])));
+    renderForce();
+  };
+
+  // A kind already queued or running cannot be queued again; a click is disabled until the server answers.
+  const FORCE = [["maintenance", "Force Maintenance"], ["generation", "Force Generation"], ["experimentation", "Force Experimentation"]];
+  const sending = new Set();
+  let forceNote = "";
+  const forceButtons = new Map(FORCE.map(([kind, label]) => [kind, h("button", { className: "btn", type: "button", text: label, onClick: async () => {
+    sending.add(kind);
+    renderForce();
+    try {
+      data = await api(`/api/characters/${characterId}/contemplation/force`, { method: "POST", body: { kind } });
+      forceNote = data.force.queued ? `${label.slice(6)} queued. Its result appears in the status once it has run.` : `${label.slice(6)} is already ${data.force.reason === "running" ? "running" : "queued"}.`;
+      renderAll();
+    } catch (error) { showBanner(error.message); }
+    finally { sending.delete(kind); renderForce(); }
+  } })]));
+  const renderForce = () => {
+    const s = data.status;
+    for (const [kind, button] of forceButtons) {
+      const busy = s.forcedRunning === kind ? "running" : s.queued.forced.includes(kind) ? "queued" : null;
+      button.disabled = sending.has(kind) || Boolean(busy);
+      button.title = busy ? `Already ${busy}` : "";
+    }
+    forceEl.replaceChildren(h("h3", { text: "Run now" }),
+      h("p", { className: "muted", text: "Asks the Contemplation model to run one stage now, even while automatic Contemplation is off. It never edits text directly." }),
+      h("div", { className: "row" }, ...forceButtons.values()),
+      ...(forceNote ? [h("p", { className: "muted", text: forceNote })] : []));
   };
 
   const renderGestalt = () => {
@@ -486,84 +604,14 @@ async function renderContemplation(characterId) {
     listSection(interpretationsEl, "Interpretations", data.interpretations);
     listSection(experimentsEl, "Active experiments", data.experiments);
   };
-  root.append(statusEl, gestaltEl, interpretationsEl, experimentsEl,
-    h("p", { className: "muted", text: "This page is read-only. The dialogue model receives the gestalt and the active experiments, never the interpretations themselves. Contemplation runs on its own after your messages." }));
+  root.append(statusEl, forceEl, gestaltEl, interpretationsEl, experimentsEl,
+    h("p", { className: "muted", text: "Interpretations, experiments and the gestalt cannot be edited here. The dialogue model receives the gestalt and the active experiments, never the interpretations themselves." }));
   renderAll();
   return {
     kind: "contemplation",
     poll: async () => { data = await api(`/api/characters/${characterId}/contemplation`); renderAll(); },
     onActivity: () => renderStatusCard()
   };
-}
-
-// ---- settings --------------------------------------------------------------------------------------------------
-
-async function renderSettings() {
-  const root = els.root;
-  setTitle(root, "Settings");
-  const settings = structuredClone(state.status.settings);
-  const container = h("div");
-  root.append(container);
-  let models = null;
-  api("/api/models").then((value) => { models = value; fillLists(); }).catch(() => {});
-  const textList = h("datalist", { id: "text-models" });
-  const visionList = h("datalist", { id: "vision-models" });
-  const imageList = h("datalist", { id: "image-models" });
-  const fillLists = () => {
-    const text = new Map([...(models?.curated || state.status.curatedModels).map((m) => [m.id, m.label || m.name]), ...(models?.text || []).map((m) => [m.id, m.name])]);
-    textList.replaceChildren(...[...text].map(([id, label]) => h("option", { value: id, text: label })));
-    // Vision offers exactly the curated models (Specification 0003 V2); another image-capable id can still be typed.
-    const vision = new Map(state.status.curatedVisionModels.map((m) => [m.id, m.label]));
-    visionList.replaceChildren(...[...vision].map(([id, label]) => h("option", { value: id, text: label })));
-    const images = new Map([[state.status.defaultImageModel, "Default (Society)"], ...(models?.image || []).map((m) => [m.id, m.name])]);
-    imageList.replaceChildren(...[...images].map(([id, label]) => h("option", { value: id, text: label })));
-  };
-  fillLists();
-  const dots = {};
-  const modelRow = (role, label, list) => {
-    const input = h("input", { type: "text", value: settings.models[role], list, autocomplete: "off", spellcheck: false, onInput: (event) => { settings.models[role] = event.target.value.trim(); } });
-    dots[role] = h("span", { className: "dot", title: `${label} activity` });
-    return h("label", { className: "field" }, label, h("div", { className: "model-row" }, input, dots[role]));
-  };
-  const textModelCard = (role, label, list = "text-models") => {
-    const temperature = settings.temperature[role];
-    const valueLabel = h("span", { text: temperature.value.toFixed(2) });
-    const range = h("input", { type: "range", min: 0, max: 2, step: 0.05, value: temperature.value, disabled: !temperature.enabled,
-      onInput: (event) => { temperature.value = Number(event.target.value); valueLabel.textContent = temperature.value.toFixed(2); } });
-    const toggle = h("input", { type: "checkbox", checked: temperature.enabled, onChange: (event) => { temperature.enabled = event.target.checked; range.disabled = !temperature.enabled; } });
-    const maxTokens = h("input", { type: "number", min: 256, max: 200000, step: 256, value: settings.maxTokens[role], onInput: (event) => { settings.maxTokens[role] = Number(event.target.value); } });
-    return h("div", { className: "card stack" }, h("h3", { text: label }), modelRow(role, "Model", list),
-      h("label", { className: "check" }, toggle, h("span", {}, "Override temperature ", h("span", { className: "muted", text: "(off: provider default; ignored for models that do not support it)" }))),
-      h("div", { className: "row" }, range, valueLabel),
-      h("label", { className: "field" }, "Maximum output tokens (includes reasoning tokens on reasoning models)", maxTokens));
-  };
-  const imageEnabled = h("input", { type: "checkbox", checked: settings.imageEnabled, onChange: (event) => { settings.imageEnabled = event.target.checked; } });
-  const contemplationEnabled = h("input", { type: "checkbox", checked: settings.contemplationEnabled, onChange: (event) => { settings.contemplationEnabled = event.target.checked; } });
-  const save = h("button", { className: "btn primary", type: "button", text: "Save settings", onClick: async () => {
-    save.disabled = true;
-    try { state.status.settings = await api("/api/settings", { method: "PUT", body: settings }); save.textContent = "Saved"; setTimeout(() => { save.textContent = "Save settings"; }, 1500); }
-    catch (error) { showBanner(error.message); }
-    finally { save.disabled = false; }
-  } });
-  container.append(textList, visionList, imageList,
-    textModelCard("dialogue", "Dialogue model (chat replies and memory consolidation)"),
-    textModelCard("contemplation", "Contemplation model (prefetch, interpretations, maintenance, experiments)"),
-    textModelCard("vision", "Vision model (perceives images you attach; needs image input and text output)", "vision-models"),
-    h("div", { className: "card stack" }, h("h3", { text: "Images" }), modelRow("image", "Image generation model", "image-models"),
-      h("label", { className: "check" }, imageEnabled, h("span", { text: "Enable image generation (the dialogue model may then show pictures; attaching your own images works either way)" }))),
-    h("div", { className: "card stack" }, h("h3", { text: "Contemplation" }),
-      h("label", { className: "check" }, contemplationEnabled, h("span", { text: "Enable Contemplation (off: no automatic contemplation, and no gestalt or experiments in dialogue; stored state stays visible)" }))),
-    h("div", { className: "row" }, save, h("button", { className: "btn", type: "button", text: "Refresh model list", onClick: () => api("/api/models?refresh=1").then((value) => { models = value; fillLists(); }).catch((error) => showBanner(error.message)) })));
-  const onActivity = (activity) => {
-    for (const [role, dot] of Object.entries(dots)) {
-      const info = activity.roles[role];
-      dot.classList.toggle("working", Boolean(info?.working));
-      dot.classList.toggle("error", !info?.working && Boolean(info?.lastError));
-      dot.title = info?.working ? `${info.pendingCount} request(s): ${info.purposes.join(", ")}` : info?.lastError ? `Last error: ${info.lastError.message}` : "idle";
-    }
-  };
-  if (state.activity) onActivity(state.activity);
-  return { kind: "settings", onActivity };
 }
 
 // ---- main loop -------------------------------------------------------------------------------------------------

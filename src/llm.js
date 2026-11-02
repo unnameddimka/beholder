@@ -1,5 +1,7 @@
 // Named-purpose LLM calls on top of the OpenRouter transport. Each purpose maps to one model role (Dialogue,
-// Contemplation, or Vision); memory purposes use the Dialogue model as Specification 0000 section 4.1 requires. Structured
+// Contemplation, or Vision); memory purposes use the Dialogue model as Specification 0000 section 4.1 requires.
+// There is no global role selection (Specification 0005 A5): every call names the character configuration snapshot
+// of its job, and the fit checks use that same snapshot. Structured
 // outputs are parsed and validated; malformed output gets bounded LLM repair (pattern from Society
 // src/memory-generation.js generateValidatedDraft) and is never committed.
 import { callOpenRouter, fetchModelCatalog } from "./openrouter.js";
@@ -37,8 +39,7 @@ const CHARS_PER_TOKEN_ESTIMATE = 3;
 const IMAGE_TOKEN_ALLOWANCE = 3000;
 
 export class LlmClient {
-  constructor({ settings, key, diagnostics, fetchImpl = fetch, backoffMs = 1000, timeouts = TIMEOUTS }) {
-    this.settings = settings;
+  constructor({ key, diagnostics, fetchImpl = fetch, backoffMs = 1000, timeouts = TIMEOUTS }) {
     this.key = key;
     this.diagnostics = diagnostics;
     this.fetchImpl = fetchImpl;
@@ -55,14 +56,15 @@ export class LlmClient {
     return this.catalog;
   }
 
-  // Effective request parameters for a role, honoring catalogue constraints when the catalogue is known.
-  requestParameters(role) {
-    const settings = this.settings.get();
-    const model = settings.models[role];
+  // Effective request parameters for a role of one character configuration, honoring catalogue constraints when the
+  // catalogue is known.
+  requestParameters(role, config) {
+    if (!config?.models?.[role]) throw coded("CONFIG_REQUIRED", `A character configuration is required for the ${role} role.`);
+    const model = config.models[role];
     const entry = this.catalog?.byId.get(model) || null;
-    let maxTokens = settings.maxTokens[role];
+    let maxTokens = config.maxTokens[role];
     if (entry?.maxCompletionTokens && maxTokens > entry.maxCompletionTokens) maxTokens = entry.maxCompletionTokens;
-    const temperatureSetting = settings.temperature[role];
+    const temperatureSetting = config.temperature[role];
     const temperatureSupported = !entry?.supportedParameters || entry.supportedParameters.includes("temperature");
     const temperature = temperatureSetting.enabled && temperatureSupported ? temperatureSetting.value : null;
     return { model, maxTokens, temperature };
@@ -70,8 +72,8 @@ export class LlmClient {
 
   // Pre-flight size estimate of a request against the catalogue's context length, including the output budget. Null
   // when the catalogue does not know the model's context length; the provider then decides.
-  contextFit(role, messages) {
-    const { model, maxTokens } = this.requestParameters(role);
+  contextFit(role, messages, config) {
+    const { model, maxTokens } = this.requestParameters(role, config);
     const contextLength = this.catalog?.byId.get(model)?.contextLength;
     if (!contextLength) return null;
     const parts = messages.flatMap((message) => Array.isArray(message.content) ? message.content : [{ type: "text", text: String(message.content || "") }]);
@@ -82,8 +84,8 @@ export class LlmClient {
   }
 
   // Pre-flight estimate of whether an output of about this many characters fits the role's output token budget.
-  outputFit(role, characters) {
-    const { maxTokens } = this.requestParameters(role);
+  outputFit(role, characters, config) {
+    const { maxTokens } = this.requestParameters(role, config);
     const estimatedTokens = Math.ceil(characters / CHARS_PER_TOKEN_ESTIMATE);
     return { fits: estimatedTokens <= maxTokens, estimatedTokens, maxTokens };
   }
@@ -98,10 +100,10 @@ export class LlmClient {
     return { known: true, ok, inputModalities: input, outputModalities: output };
   }
 
-  async call({ purpose, messages, context = {}, signal = null, responseFormat = null }) {
+  async call({ purpose, config, messages, context = {}, signal = null, responseFormat = null }) {
     const role = PURPOSE_ROLES[purpose];
     if (!role) throw coded("PURPOSE_UNKNOWN", `No model role is registered for ${purpose}.`);
-    const { model, maxTokens, temperature } = this.requestParameters(role);
+    const { model, maxTokens, temperature } = this.requestParameters(role, config);
     return callOpenRouter({
       apiKey: this.key.get(), model, messages, maxTokens, temperature, timeoutMs: this.timeouts[role], fetchImpl: this.fetchImpl, diagnostics: this.diagnostics,
       meta: { purpose, modelRole: role, ...context }, signal, backoffMs: this.backoffMs, responseFormat
@@ -117,30 +119,32 @@ export class LlmClient {
     return DIALOGUE_FORMAT_MODES.filter((mode) => mode === "prompt" || parameters.includes(mode === "json_schema" ? "structured_outputs" : "response_format"));
   }
 
-  async dialogueFormatMode() {
+  async dialogueFormatMode(config) {
     try { await this.modelCatalog(); } catch {} // An unavailable catalogue means prompt-only enforcement.
-    const model = this.requestParameters("dialogue").model;
+    const model = this.requestParameters("dialogue", config).model;
     const floor = this.formatDowngrades.get(model) ?? 0;
     return this.dialogueFormatModes(model).find((mode) => DIALOGUE_FORMAT_MODES.indexOf(mode) >= floor);
   }
 
   // Structured call: technical truncation retry once, then JSON parse + validate with up to REPAIR_ATTEMPTS repairs.
   // validate(raw) returns { ok: true, value } or { ok: false, errors: [...] }.
-  async structured({ purpose, messages, validate, context = {}, signal = null }) {
+  async structured({ purpose, config, messages, validate, context = {}, signal = null }) {
     const dialogue = DIALOGUE_ENVELOPE_PURPOSES.has(purpose);
-    let formatMode = dialogue ? await this.dialogueFormatMode() : null;
+    // Fails before any request when the job did not supply its configuration snapshot.
+    this.requestParameters(PURPOSE_ROLES[purpose] || "dialogue", config);
+    let formatMode = dialogue ? await this.dialogueFormatMode(config) : null;
     const trace = { exchangeIds: [], repairs: 0, truncationRetry: false, normalizedPlainText: false, formatMode };
     const call = async (callMessages) => {
       for (;;) {
         try {
-          const result = await this.call({ purpose, messages: callMessages, context: dialogue ? { ...context, responseFormatMode: formatMode } : context, signal,
+          const result = await this.call({ purpose, config, messages: callMessages, context: dialogue ? { ...context, responseFormatMode: formatMode } : context, signal,
             responseFormat: dialogue ? dialogueResponseFormat(formatMode) : null });
           trace.exchangeIds.push(result.exchangeId);
           return result;
         } catch (error) {
           if (error?.exchangeId) trace.exchangeIds.push(error.exchangeId);
           if (!dialogue || formatMode === "prompt" || !isFormatRejection(error)) throw error;
-          const model = this.requestParameters("dialogue").model;
+          const model = this.requestParameters("dialogue", config).model;
           const current = DIALOGUE_FORMAT_MODES.indexOf(formatMode);
           const next = this.dialogueFormatModes(model).find((mode) => DIALOGUE_FORMAT_MODES.indexOf(mode) > current);
           this.formatDowngrades.set(model, Math.max(DIALOGUE_FORMAT_MODES.indexOf(next), this.formatDowngrades.get(model) ?? 0));

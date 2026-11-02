@@ -1,6 +1,7 @@
 // Contemplation model prompts: prefetch triage, per-interpretation maintenance, new interpretation generation, the
 // LLM review of a generated candidate, gestaltization, and experiment planning. Interpretations are free-form prose with no
 // ontology, confidence scores, or mandatory citations; experiments are intentions, never scripted lines.
+import { CHARACTER_CONTEXT_RULES } from "./context.js";
 
 export const INTERPRETATION_MAX_CHARS = 4000;
 export const EXPERIMENT_MAX_CHARS = 1000;
@@ -10,7 +11,9 @@ const ROLE = [
   "You are part of the private Contemplation process behind a roleplay chat character. The human chatting with the character is called the user.",
   "Contemplation keeps a pool of interpretations: free-form, imaginative prose hypotheses about who the user is, what moves them, and what is going on between them and the character.",
   "Interpretations may be speculative and may contradict one another; that is intended. An individual interpretation must never contradict established facts in the evidence (what was actually said or done, and remembered facts). An unproven hypothesis is not invalid merely because it is unproven.",
-  "The goal is understanding, not classification, diagnosis, persuasion, or optimizing the user's behavior."
+  "The goal is understanding, not classification, diagnosis, persuasion, or optimizing the user's behavior.",
+  CHARACTER_CONTEXT_RULES,
+  "They may orient how you read the interaction; they never complete an experiment and never establish or contradict a fact about what happened."
 ].join(" ");
 
 const EVIDENCE_RULES = [
@@ -105,7 +108,7 @@ export function gestaltizationSystemPrompt() {
 export function experimentPlanningSystemPrompt() {
   return [
     ROLE,
-    "You plan the character's current experiments: short intentions to learn more about the user through ordinary interaction, which the character may or may not choose to act on. You see only the interpretation pool and the current experiment list.",
+    "You plan the character's current experiments: short intentions to learn more about the user through ordinary interaction, which the character may or may not choose to act on. You see only the interpretation pool, the current experiment list and characterContext.",
     "Experiments are intentions, not scripted questions and not dialogue lines. Good examples: explore whether the user appreciates unexpected tenderness; test how they respond to an absurd story; explore a contrast between two interpretations; show an image and observe the reaction.",
     "Prefer experiments that could tell interpretations apart, enrich a thin one, or check a speculative one; respect the user's dignity and never aim to manipulate or pressure them.",
     "Return the entire replacement list. Keep an existing experiment by repeating its id (with the same or edited text); drop experiments that are completed, obsolete, or no longer useful; add new ones with id null. There is no required count; an empty list is valid.",

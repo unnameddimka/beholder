@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { makeApp, closeApp, waitFor, reply, completion, jsonResponse, sleep } from "./helpers.js";
+import { makeApp, closeApp, waitFor, reply, completion, jsonResponse, sleep, configure, configOf } from "./helpers.js";
 import { poolOf } from "../src/db.js";
 
 const character = (overrides = {}) => ({ name: "Mira", description: "A sardonic lighthouse keeper.", ...overrides });
@@ -11,8 +11,7 @@ test("dialogue context: character prompt, pinned self-description first, experim
     contemplation_prefetch: () => ({ generation: false, maintenance: false })
   });
   try {
-    app.settings.setUserDescription("I am a night-shift nurse who likes puzzles.");
-    const mira = app.createCharacter(character());
+    const mira = app.createCharacter({ ...character(), userDescription: "I am a night-shift nurse who likes puzzles." });
     const pool = poolOf(mira);
     app.contemplation.addInterpretation(pool, "SECRET-INTERPRETATION: the user is testing the character.");
     app.contemplation.addExperiment(pool, "Explore whether the user enjoys an absurd story.");
@@ -40,7 +39,7 @@ test("contemplation disabled omits experiments from dialogue and schedules no pr
   try {
     const mira = app.createCharacter(character());
     app.contemplation.addExperiment(poolOf(mira), "Show unexpected tenderness.");
-    app.settings.update({ contemplationEnabled: false });
+    configure(app, mira.id, { contemplationEnabled: false });
     app.dialogue.send(mira.id, "hello");
     await waitFor(() => app.store.lastMessage(mira.id)?.role === "character");
     assert.doesNotMatch(JSON.stringify(mock.byPurpose("dialogue_reply")[0].body.messages), /tenderness/);
@@ -94,8 +93,7 @@ test("OpenRouter request asks supported providers for strict dialogue JSON schem
   });
   try {
     await app.llm.modelCatalog();
-    app.settings.update({ models: { ...app.settings.get().models, dialogue: "test/dialogue" } });
-    const mira = app.createCharacter(character());
+    const mira = app.createCharacter({ ...character(), config: { models: { dialogue: "test/dialogue" } } });
     app.dialogue.send(mira.id, "hi");
     await waitFor(() => app.store.lastMessage(mira.id)?.role === "character");
     const body = mock.byPurpose("dialogue_reply")[0].body;
@@ -118,8 +116,7 @@ test("unsupported selected dialogue model keeps prompt validation without forced
   });
   try {
     await app.llm.modelCatalog();
-    app.settings.update({ models: { ...app.settings.get().models, dialogue: "test/unsupported" } });
-    const mira = app.createCharacter(character());
+    const mira = app.createCharacter({ ...character(), config: { models: { dialogue: "test/unsupported" } } });
     app.dialogue.send(mira.id, "hi");
     await waitFor(() => app.store.lastMessage(mira.id)?.role === "character");
     const body = mock.byPurpose("dialogue_reply")[0].body;

@@ -1,4 +1,5 @@
-// Persisted global settings (everything except the OpenRouter key, which lives only in RuntimeKey below).
+// Character-owned AI configuration (Specification 0005 A2): each character stores its own copy of this contract.
+// Global state is infrastructure only; the OpenRouter key lives only in RuntimeKey below.
 import { coded, isObject } from "./utils.js";
 
 // Curated defaults follow Society src/models.js (SUPPORTED_WORLD_MODELS); any OpenRouter model id may be selected.
@@ -23,7 +24,8 @@ export const TEXT_ROLES = Object.freeze(["dialogue", "contemplation", "vision"])
 export const MODEL_ROLES = Object.freeze(["dialogue", "contemplation", "vision", "image"]);
 export const MAX_OUTPUT_TOKENS_LIMIT = 200_000;
 
-export function defaultSettings() {
+// Built-in defaults for a new character (never copied from another character).
+export function defaultConfig() {
   return {
     models: { dialogue: CURATED_TEXT_MODELS[0].id, contemplation: CURATED_TEXT_MODELS[0].id, vision: CURATED_VISION_MODELS[0].id, image: DEFAULT_IMAGE_MODEL },
     temperature: { dialogue: { enabled: false, value: 0.8 }, contemplation: { enabled: false, value: 0.8 }, vision: { enabled: false, value: 0.8 } },
@@ -35,10 +37,10 @@ export function defaultSettings() {
 
 const MODEL_ID = /^[A-Za-z0-9._\-]+\/[A-Za-z0-9._\-:]+$/;
 
-// Strict validation of a full settings object; unknown keys are rejected so the stored shape stays exact.
-export function validateSettings(value) {
+// Strict validation of a full configuration; unknown keys are rejected so the stored shape stays exact.
+export function validateConfig(value) {
   const errors = [];
-  if (!isObject(value)) throw coded("SETTINGS_INVALID", "Settings must be an object.");
+  if (!isObject(value)) throw coded("CONFIG_INVALID", "The AI configuration must be an object.", { status: 400 });
   const allowed = ["models", "temperature", "maxTokens", "imageEnabled", "contemplationEnabled"];
   for (const key of Object.keys(value)) if (!allowed.includes(key)) errors.push(`Unknown setting ${key}.`);
   for (const role of MODEL_ROLES) {
@@ -55,7 +57,7 @@ export function validateSettings(value) {
   }
   if (typeof value.imageEnabled !== "boolean") errors.push("imageEnabled must be boolean.");
   if (typeof value.contemplationEnabled !== "boolean") errors.push("contemplationEnabled must be boolean.");
-  if (errors.length) throw coded("SETTINGS_INVALID", errors.join(" "), { validationErrors: errors });
+  if (errors.length) throw coded("CONFIG_INVALID", errors.join(" "), { validationErrors: errors, status: 400 });
   return {
     models: Object.fromEntries(MODEL_ROLES.map((role) => [role, value.models[role].trim()])),
     temperature: Object.fromEntries(TEXT_ROLES.map((role) => [role, { enabled: value.temperature[role].enabled, value: value.temperature[role].value }])),
@@ -65,35 +67,29 @@ export function validateSettings(value) {
   };
 }
 
-export class SettingsStore {
-  constructor(store) {
-    this.store = store;
-    const saved = store.getMeta("settings", null);
-    let settings = defaultSettings();
-    if (saved) {
-      try { settings = validateSettings({ ...settings, ...saved, models: { ...settings.models, ...saved.models }, temperature: { ...settings.temperature, ...saved.temperature }, maxTokens: { ...settings.maxTokens, ...saved.maxTokens } }); }
-      catch { settings = defaultSettings(); }
-    }
-    this.current = settings;
-    store.setMeta("settings", settings);
-  }
+// A patch over a complete configuration: the nested per-role maps merge role by role, then the whole result is
+// validated strictly. The legacy global settings were merged onto the defaults the same way (Specification 0005 A4).
+export function mergeConfig(base, patch) {
+  if (!isObject(patch)) throw coded("CONFIG_INVALID", "The AI configuration must be an object.", { status: 400 });
+  const merged = { ...base, ...patch };
+  for (const key of ["models", "temperature", "maxTokens"]) if (isObject(base[key]) && isObject(patch[key])) merged[key] = { ...base[key], ...patch[key] };
+  return validateConfig(merged);
+}
 
-  get() { return structuredClone(this.current); }
+export const DESCRIPTION_MAX = 20_000;
+export const DESCRIPTION_FIELDS = Object.freeze(["description", "sceneDescription", "userDescription"]);
 
-  update(patch) {
-    const next = validateSettings({ ...this.current, ...patch });
-    this.store.setMeta("settings", next);
-    this.current = next;
-    return this.get();
-  }
+function deepFreeze(value) {
+  if (value && typeof value === "object") { for (const entry of Object.values(value)) deepFreeze(entry); Object.freeze(value); }
+  return value;
+}
 
-  userDescription() { return this.store.getMeta("userDescription", ""); }
-
-  setUserDescription(text) {
-    if (typeof text !== "string" || text.length > 20_000) throw coded("USER_DESCRIPTION_INVALID", "The user description must be text of at most 20000 characters.");
-    this.store.setMeta("userDescription", text);
-    return text;
-  }
+// The frozen snapshot one AI job uses for all of its calls (Specification 0005 A5): the character's identity, its
+// three descriptions and its complete role configuration as they were when the job started.
+export function profileOf(character) {
+  if (!character) throw coded("CHARACTER_NOT_FOUND", "Character not found.");
+  return deepFreeze(structuredClone({ characterId: character.id, name: character.name, description: character.description,
+    sceneDescription: character.sceneDescription, userDescription: character.userDescription, config: character.config }));
 }
 
 // The OpenRouter key exists only in this process's memory. It is never persisted, logged, or sent to the browser.

@@ -53,7 +53,7 @@ test("HTTP safety: static allowlist, no arbitrary file paths, payload limit, CSP
       for (const path of ["/../package.json", "/images/..%2F..%2Fpackage.json", "/images/0123.png", "/src/server.js", "/data/beholder.sqlite"]) {
         assert.equal((await fetch(base + path)).status, 404, path);
       }
-      const big = await fetch(`${base}/api/user-description`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: "x".repeat(300_000) }) });
+      const big = await fetch(`${base}/api/characters`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ text: "x".repeat(300_000) }) });
       assert.equal(big.status, 413);
     });
   } finally { closeApp(app); }

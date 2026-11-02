@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 import { BeholderApp } from "../src/app.js";
 import { OPENROUTER_ENDPOINT } from "../src/openrouter.js";
 import { IMAGE_ENDPOINT } from "../src/images.js";
+import { DatabaseSync } from "node:sqlite";
+import { MIGRATIONS } from "../src/db.js";
 
 export const TEST_KEY = "sk-or-v1-testkeyABCDEFGHIJKLMNOP0123456789";
 export const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -94,4 +96,21 @@ export function identityConsolidation(body) {
 export function closeApp(app) {
   app.stop();
   app.store.close();
+}
+
+// Specification 0005: the AI configuration and the three descriptions belong to each character. A config patch merges
+// role by role over the character's current configuration.
+export function configure(app, characterId, patch) { return app.updateCharacter(characterId, { config: patch }); }
+
+export function configOf(app, characterId) { return app.store.getCharacter(characterId).config; }
+
+// A database at schema 4 (before Specification 0005), built by the real earlier migrations; seed(db) adds legacy rows
+// such as the global meta.settings and meta.userDescription.
+export function schema4Database(dataDir, seed = () => {}) {
+  const db = new DatabaseSync(path.join(dataDir, "beholder.sqlite"));
+  db.exec("PRAGMA foreign_keys = OFF");
+  for (const migration of MIGRATIONS.slice(0, 4)) { if (typeof migration === "function") migration(db); else db.exec(migration); }
+  db.exec("PRAGMA user_version = 4");
+  seed(db);
+  db.close();
 }

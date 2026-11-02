@@ -1,7 +1,7 @@
 // Regression tests for docs/review/0000-beholder-review-9adf254.md findings P1-1, P1-2, P2-1 and P2-3.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { makeApp, closeApp, waitFor, reply, seedMessages, jsonResponse, identityConsolidation } from "./helpers.js";
+import { makeApp, closeApp, waitFor, reply, seedMessages, jsonResponse, identityConsolidation, configure, configOf } from "./helpers.js";
 import { poolOf } from "../src/db.js";
 import { validatePlanning } from "../src/contemplation.js";
 import { checkDownloadUrl, isBlockedAddress } from "../src/images.js";
@@ -36,7 +36,7 @@ test("P1-1: a stale maintenance completion never deletes an experiment edited du
   try {
     const mira = app.createCharacter(base);
     const pool = poolOf(mira);
-    app.settings.update({ contemplationEnabled: false });
+    configure(app, mira.id, { contemplationEnabled: false });
     app.contemplation.addInterpretation(pool, "Theory");
     const edited = app.contemplation.addExperiment(pool, "Original experiment");
     app.contemplation.addExperiment(pool, "Untouched experiment");
@@ -64,7 +64,7 @@ test("P1-1: completions from a superseded interpretation result are not applied"
   try {
     const mira = app.createCharacter(base);
     const pool = poolOf(mira);
-    app.settings.update({ contemplationEnabled: false });
+    configure(app, mira.id, { contemplationEnabled: false });
     const interpretation = app.contemplation.addInterpretation(pool, "Theory");
     app.contemplation.addExperiment(pool, "Probe");
     seedMessages(app, mira.id, 2);
@@ -93,7 +93,7 @@ test("P1-2: generation re-reviews against the current pool after a concurrent ed
   try {
     const mira = app.createCharacter(base);
     const pool = poolOf(mira);
-    app.settings.update({ contemplationEnabled: false });
+    configure(app, mira.id, { contemplationEnabled: false });
     app.contemplation.addInterpretation(pool, "Old theory");
     seedMessages(app, mira.id, 2);
     await forceAndWait(app, pool, "generation", mira.id, "generation");
@@ -115,7 +115,7 @@ test("P1-2: a candidate still commits after a pool change when the re-review acc
   try {
     const mira = app.createCharacter(base);
     const pool = poolOf(mira);
-    app.settings.update({ contemplationEnabled: false });
+    configure(app, mira.id, { contemplationEnabled: false });
     seedMessages(app, mira.id, 2);
     await forceAndWait(app, pool, "generation", mira.id, "generation");
     app.contemplation.addInterpretation(pool, "Manual idea");
@@ -147,8 +147,7 @@ test("P2-1: a download without Content-Length is aborted as soon as it exceeds t
   const { app } = await makeApp({ dialogue_reply: () => reply("look", { imageRequest: "x" }), contemplation_prefetch: () => ({ generation: false, maintenance: false }) },
     { images: urlImageApi(), extra });
   try {
-    app.settings.update({ imageEnabled: true });
-    const mira = app.createCharacter(base);
+    const mira = app.createCharacter({ ...base, config: { imageEnabled: true } });
     app.dialogue.send(mira.id, "a");
     await waitFor(() => app.store.allImages()[0]?.status === "failed", { timeout: 10_000, message: "image failure" });
     assert.equal(app.store.allImages()[0].errorCode, "IMAGE_TOO_LARGE");

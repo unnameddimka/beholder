@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { makeApp, closeApp, waitFor, seedMessages, tempDir, mockOpenRouter } from "./helpers.js";
+import { makeApp, closeApp, waitFor, seedMessages, tempDir, mockOpenRouter, configure, configOf } from "./helpers.js";
 import { characterPool } from "../src/db.js";
 import { validateStmDraft, validateLtmDraft } from "../src/memory.js";
 import { localDateString } from "../src/utils.js";
@@ -31,7 +31,7 @@ test("Verbatim -> STM: nothing below 100; at 100 the 20 oldest are consolidated 
     assert.equal(record.sources[0].characterName, "Mira");
     assert.deepEqual(record.sources[0].messageIds, ids.slice(0, 3));
     // Memory consolidation uses the Dialogue model.
-    assert.equal(mock.byPurpose("memory_stm_consolidation")[0].body.model, app.settings.get().models.dialogue);
+    assert.equal(mock.byPurpose("memory_stm_consolidation")[0].body.model, configOf(app, mira.id).models.dialogue);
   } finally { closeApp(app); }
 });
 
@@ -102,7 +102,7 @@ test("STM -> LTM runs once per server-local date per pool, catches up after a mi
       assert.deepEqual(ltm[0].sources.map((source) => source.characterName), [name], "no record crosses into another character's pool");
       assert.equal(app.store.memoryRecords(characterPool(character.id), "stm").length, 0);
     }
-    assert.equal(mock.byPurpose("memory_ltm_consolidation")[0].body.model, app.settings.get().models.dialogue);
+    assert.equal(mock.byPurpose("memory_ltm_consolidation")[0].body.model, configOf(app, other.id).models.dialogue);
     const callsAfter = mock.byPurpose("memory_ltm_consolidation").length;
     assert.equal((await app.memory.runDailyIfDue({ force: true })).status, "not_due");
     closeApp(app);

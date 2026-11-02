@@ -4,11 +4,17 @@ import { DatabaseSync } from "node:sqlite";
 import fs from "node:fs";
 import path from "node:path";
 import { nowIso } from "./utils.js";
+import { defaultConfig, mergeConfig, DESCRIPTION_MAX } from "./settings.js";
 
 // Specification 0004 P1: every character owns exactly one memory pool and one interpretation pool, both keyed by
 // this technical identity. There is no shared pool and no user-selectable scope.
 export function characterPool(characterId) { return `character:${characterId}`; }
 export function poolOf(character) { return characterPool(character.id); }
+// The one owner of a pool key, or null for a key that is not a character pool.
+export function poolOwnerId(pool) {
+  const match = /^character:(\d+)$/.exec(String(pool));
+  return match ? Number(match[1]) : null;
+}
 
 // The key of the retired shared pools (Specifications 0000-0003); it appears only in the 0004 migration.
 const LEGACY_SHARED_POOL = "shared";
@@ -105,6 +111,39 @@ function migrateToCharacterOwnedPools(db) {
     if (count(`SELECT COUNT(*) AS n FROM ${table} WHERE pool = ?`, shared)) throw migrationBlocked(`Rows of ${table} would remain in the legacy shared pool.`);
   }
   db.exec("ALTER TABLE characters DROP COLUMN use_shared_memory; ALTER TABLE characters DROP COLUMN use_shared_interpretations;");
+}
+
+// Specification 0005 A4: the previously effective global role configuration and the global user self-description
+// become every existing character's own copies, once; Scene Description starts empty. The legacy values are read
+// exactly as the old SettingsStore read them (the saved object merged onto the built-in defaults) and must
+// validate; an unreadable or invalid legacy value stops the migration instead of silently resetting it. The legacy
+// meta keys are then removed so they can no longer influence anything.
+function migrateToCharacterOwnedConfiguration(db) {
+  const blocked = (message) => Object.assign(new Error(`Specification 0005 migration stopped; the database was not changed. ${message} Restore a backup or repair the legacy value (see README).`), { code: "MIGRATION_BLOCKED" });
+  const meta = (key) => {
+    const row = db.prepare("SELECT value FROM meta WHERE key = ?").get(key);
+    if (!row) return { present: false };
+    try { return { present: true, value: JSON.parse(row.value) }; }
+    catch { throw blocked(`The legacy ${key} value is not readable JSON.`); }
+  };
+  const settings = meta("settings");
+  let config = defaultConfig();
+  if (settings.present) {
+    try { config = mergeConfig(config, settings.value); }
+    catch (error) { throw blocked(`The legacy global settings are invalid: ${error.message}`); }
+  }
+  const user = meta("userDescription");
+  const userDescription = user.present ? user.value : "";
+  if (typeof userDescription !== "string" || userDescription.length > DESCRIPTION_MAX) throw blocked(`The legacy user description must be text of at most ${DESCRIPTION_MAX} characters.`);
+  db.exec(`
+    ALTER TABLE characters ADD COLUMN scene_description TEXT NOT NULL DEFAULT '';
+    ALTER TABLE characters ADD COLUMN user_description TEXT NOT NULL DEFAULT '';
+    ALTER TABLE characters ADD COLUMN ai_config TEXT NOT NULL DEFAULT '';
+    ALTER TABLE images ADD COLUMN context TEXT;
+    ALTER TABLE interpretation_pools ADD COLUMN last_maintenance TEXT;
+  `);
+  db.prepare("UPDATE characters SET user_description = ?, ai_config = ?").run(userDescription, JSON.stringify(config));
+  db.prepare("DELETE FROM meta WHERE key IN ('settings', 'userDescription')").run();
 }
 
 export const MIGRATIONS = [
@@ -242,7 +281,9 @@ export const MIGRATIONS = [
   CREATE INDEX uploads_pending ON uploads (status, id);
   `,
   // Specification 0004: character-owned cognition; the shared pools and both scope flags are retired.
-  migrateToCharacterOwnedPools
+  migrateToCharacterOwnedPools,
+  // Specification 0005: character-owned AI configuration and three descriptions; Maintenance status; image context.
+  migrateToCharacterOwnedConfiguration
 ];
 
 // Message rows carry their upload (a user message) or their source message (an observation) for every consumer.
@@ -253,7 +294,8 @@ const MESSAGE_SELECT = `SELECT m.*, u.id AS upload_id, u.file AS upload_file, u.
   LEFT JOIN messages src ON src.id = m.source_message_id`;
 
 function characterRow(row) {
-  return row ? { id: row.id, name: row.name, description: row.description, createdAt: row.created_at, updatedAt: row.updated_at } : null;
+  return row ? { id: row.id, name: row.name, description: row.description, sceneDescription: row.scene_description, userDescription: row.user_description,
+    config: JSON.parse(row.ai_config), createdAt: row.created_at, updatedAt: row.updated_at } : null;
 }
 
 function messageRow(row) {
@@ -283,6 +325,7 @@ function memoryRow(row) {
 function imageRow(row) {
   return row ? {
     id: row.id, messageId: row.message_id, characterId: row.character_id, status: row.status, request: row.request, model: row.model,
+    context: row.context ? JSON.parse(row.context) : null,
     file: row.file, mime: row.mime, bytes: row.bytes, errorCode: row.error_code, errorMessage: row.error_message, createdAt: row.created_at, updatedAt: row.updated_at
   } : null;
 }
@@ -355,14 +398,16 @@ export class Store {
 
   getCharacter(id) { return characterRow(this.db.prepare("SELECT * FROM characters WHERE id = ?").get(id)); }
 
-  createCharacter({ name, description }) {
+  createCharacter({ name, description, sceneDescription, userDescription, config }) {
     const at = nowIso();
-    const result = this.db.prepare("INSERT INTO characters (name, description, created_at, updated_at) VALUES (?, ?, ?, ?)").run(name, description, at, at);
+    const result = this.db.prepare("INSERT INTO characters (name, description, scene_description, user_description, ai_config, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(name, description, sceneDescription, userDescription, JSON.stringify(config), at, at);
     return this.getCharacter(Number(result.lastInsertRowid));
   }
 
-  updateCharacter(id, { name, description }) {
-    this.db.prepare("UPDATE characters SET name = ?, description = ?, updated_at = ? WHERE id = ?").run(name, description, nowIso(), id);
+  updateCharacter(id, { name, description, sceneDescription, userDescription, config }) {
+    this.db.prepare("UPDATE characters SET name = ?, description = ?, scene_description = ?, user_description = ?, ai_config = ?, updated_at = ? WHERE id = ?")
+      .run(name, description, sceneDescription, userDescription, JSON.stringify(config), nowIso(), id);
     return this.getCharacter(id);
   }
 
@@ -445,9 +490,11 @@ export class Store {
   }
 
   // ---- images ----------------------------------------------------------------------------------------------
-  addImage({ messageId, characterId, request, model }) {
+  // context: the character's descriptions frozen at enqueue time (Specification 0005 A5/C5); null for legacy rows.
+  addImage({ messageId, characterId, request, model, context = null }) {
     const at = nowIso();
-    const result = this.db.prepare("INSERT INTO images (message_id, character_id, status, request, model, created_at, updated_at) VALUES (?, ?, 'pending', ?, ?, ?, ?)").run(messageId, characterId, request, model, at, at);
+    const result = this.db.prepare("INSERT INTO images (message_id, character_id, status, request, model, context, created_at, updated_at) VALUES (?, ?, 'pending', ?, ?, ?, ?, ?)")
+      .run(messageId, characterId, request, model, context === null ? null : JSON.stringify(context), at, at);
     return this.getImage(Number(result.lastInsertRowid));
   }
 
@@ -466,7 +513,7 @@ export class Store {
   }
 
   failImage(id, { code, message }) {
-    this.db.prepare("UPDATE images SET status = 'failed', error_code = ?, error_message = ?, updated_at = ? WHERE id = ? AND status = 'pending'").run(code, String(message || "").slice(0, 500), nowIso(), id);
+    this.db.prepare("UPDATE images SET status = 'failed', error_code = ?, error_message = ?, updated_at = ? WHERE id = ? AND status = 'pending'").run(code, String(message || "").slice(0, 800), nowIso(), id);
   }
 
   // ---- memory ----------------------------------------------------------------------------------------------
@@ -526,7 +573,14 @@ export class Store {
     this.db.prepare("INSERT INTO interpretation_pools (pool) VALUES (?) ON CONFLICT(pool) DO NOTHING").run(pool);
     const row = this.db.prepare("SELECT * FROM interpretation_pools WHERE pool = ?").get(pool);
     return { pool: row.pool, interpretationRevision: row.interpretation_revision, experimentRevision: row.experiment_revision, planningNeeded: row.planning_needed === 1,
-      gestalt: row.gestalt, gestaltRevision: row.gestalt_revision, gestaltUpdatedAt: row.gestalt_updated_at };
+      gestalt: row.gestalt, gestaltRevision: row.gestalt_revision, gestaltUpdatedAt: row.gestalt_updated_at,
+      lastMaintenance: row.last_maintenance ? JSON.parse(row.last_maintenance) : null };
+  }
+
+  // Specification 0005 F3: the latest Maintenance attempt of a pool (running while in flight), kept across restarts.
+  setLastMaintenance(pool, value) {
+    this.ensureInterpretationPool(pool);
+    this.db.prepare("UPDATE interpretation_pools SET last_maintenance = ? WHERE pool = ?").run(JSON.stringify(value), pool);
   }
 
   interpretationPools() { return this.db.prepare("SELECT pool FROM interpretation_pools ORDER BY pool").all().map((row) => this.ensureInterpretationPool(row.pool)); }

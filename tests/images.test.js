@@ -29,8 +29,7 @@ test("model-requested image is generated asynchronously after the text is commit
   const api = imageApi({ gate });
   const { app, dataDir } = await makeApp({ dialogue_reply: () => reply("*holds up a sketch*", { imageRequest: "a pencil sketch of a lighthouse" }), contemplation_prefetch: () => ({ generation: false, maintenance: false }) }, { images: api.handler });
   try {
-    app.settings.update({ imageEnabled: true });
-    const mira = app.createCharacter(base);
+    const mira = app.createCharacter({ ...base, config: { imageEnabled: true } });
     app.dialogue.send(mira.id, "draw?");
     await waitFor(() => app.store.lastMessage(mira.id).role === "character");
     const message = app.store.lastMessage(mira.id);
@@ -43,7 +42,10 @@ test("model-requested image is generated asynchronously after the text is commit
     assert.equal(image.mime, "image/png");
     assert.ok(!path.isAbsolute(image.file) && !image.file.includes("/"));
     assert.deepEqual(fs.readFileSync(path.join(dataDir, "images", image.file)), PNG);
-    assert.equal(api.seen[0].prompt, "a pencil sketch of a lighthouse");
+    // Specification 0005 C5: the Dialogue model's request first, then the character's descriptions as labeled background.
+    assert.ok(api.seen[0].prompt.startsWith("IMAGE REQUEST (what to depict):\na pencil sketch of a lighthouse\n\nBACKGROUND CONTEXT "));
+    assert.ok(api.seen[0].prompt.endsWith("The character showing this image (Mira): Keeper."));
+    assert.equal(image.request, "a pencil sketch of a lighthouse", "the stored request stays what the Dialogue model wrote");
     // Only advertised options are sent.
     assert.equal(api.seen[0].aspect_ratio, "1:1");
     assert.equal(api.seen[0].output_format, undefined);
@@ -59,8 +61,7 @@ test("a temporary https URL is downloaded and persisted; failures keep the text 
   };
   const { app } = await makeApp({ dialogue_reply: () => reply("look", { imageRequest: "x" }), contemplation_prefetch: () => ({ generation: false, maintenance: false }) }, { images: api.handler, extra });
   try {
-    app.settings.update({ imageEnabled: true });
-    const mira = app.createCharacter(base);
+    const mira = app.createCharacter({ ...base, config: { imageEnabled: true } });
     app.dialogue.send(mira.id, "a");
     await waitFor(() => app.store.allImages()[0]?.status === "ready");
     downloadOk = false;

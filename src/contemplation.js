@@ -6,9 +6,12 @@
 // experiment-planning pass against the final pool.
 // User messages arriving during a cycle are coalesced through a persisted per-(pool, chat) watermark. Writes are
 // atomic SQLite transactions guarded by revisions/snapshots, so stale results never overwrite newer state.
-import { coded, exactKeys, mapLimited } from "./utils.js";
-import { poolOf } from "./db.js";
+// Every job runs on the owner's configuration and descriptions frozen at its start (Specification 0005 A5).
+import { coded, exactKeys, mapLimited, nowIso } from "./utils.js";
+import { poolOf, poolOwnerId } from "./db.js";
 import { messageView } from "./memory.js";
+import { profileOf } from "./settings.js";
+import { characterContext } from "./prompts/context.js";
 import {
   INTERPRETATION_MAX_CHARS, EXPERIMENT_MAX_CHARS, GESTALT_MAX_CHARS,
   prefetchSystemPrompt, consolidationSystemPrompt, maintenanceSystemPrompt, generationSystemPrompt, generationReviewSystemPrompt, gestaltizationSystemPrompt, experimentPlanningSystemPrompt
@@ -137,22 +140,31 @@ export function validatePlanning(raw, experimentIds) {
 
 // ---- runtime ----------------------------------------------------------------------------------------------------
 
+// Specification 0005 F3: a capacity refusal is shown as a skipped Maintenance, any other error as failed.
+const MAINTENANCE_SKIP_CODES = new Set(["CONSOLIDATION_CONTEXT_EXCEEDED", "CONSOLIDATION_OUTPUT_EXCEEDED"]);
+
 function newPoolRuntime(pool) {
-  return { pool, running: false, stage: "idle", stageCharacterId: null, parallel: { total: 0, inFlight: 0 }, pendingCharacters: new Set(), forced: [],
+  return { pool, running: false, stage: "idle", stageCharacterId: null, parallel: { total: 0, inFlight: 0 }, pendingCharacters: new Set(), forced: [], currentForced: null,
     planningRequested: false, gestaltFailedRevision: null, lastError: null, lastCycle: null, cycles: 0, promise: null };
 }
 
 export class Contemplation {
-  constructor({ store, llm, memory, settings, diagnostics, maxParallel = 16, planningDebounceMs = MANUAL_PLANNING_DEBOUNCE_MS }) {
+  constructor({ store, llm, memory, diagnostics, maxParallel = 16, planningDebounceMs = MANUAL_PLANNING_DEBOUNCE_MS }) {
     this.store = store;
     this.llm = llm;
     this.memory = memory;
-    this.settings = settings;
     this.diagnostics = diagnostics;
     this.maxParallel = maxParallel;
     this.planningDebounceMs = planningDebounceMs;
     this.planningTimers = new Map();
     this.pools = new Map();
+    // A Maintenance attempt still marked running belongs to a previous process: it was interrupted, never applied.
+    for (const state of this.store.interpretationPools()) {
+      if (state.lastMaintenance?.status === "running") {
+        this.store.setLastMaintenance(state.pool, { ...state.lastMaintenance, status: "interrupted", finishedAt: null,
+          reason: "The server stopped while this Maintenance was running; nothing from it was applied." });
+      }
+    }
   }
 
   runtime(pool) {
@@ -160,25 +172,34 @@ export class Contemplation {
     return this.pools.get(pool);
   }
 
-  enabled() { return this.settings.get().contemplationEnabled; }
+  // Automatic Contemplation is a per-character flag (Specification 0005 A2); it never gates an explicit Force.
+  enabledFor(characterId) { return Boolean(this.store.getCharacter(characterId)?.config.contemplationEnabled); }
+
+  ownerProfile(pool) { return profileOf(this.store.getCharacter(poolOwnerId(pool))); }
 
   // ---- triggers -----------------------------------------------------------------------------------------------
 
   onUserMessage(characterId) {
-    if (!this.enabled()) return null;
     const character = this.store.getCharacter(characterId);
-    if (!character) return null;
+    if (!character?.config.contemplationEnabled) return null;
     const pool = poolOf(character);
     this.runtime(pool).pendingCharacters.add(characterId);
     return this.kick(pool);
   }
 
+  // Queues one explicit model-driven run of an existing stage. A kind that is already queued or running for this pool
+  // is not queued twice (Specification 0005 F2); the result says which happened, never that the run succeeded.
   force(pool, kind, characterId) {
     if (!["generation", "maintenance", "experimentation"].includes(kind)) throw coded("FORCE_KIND_INVALID", "Unknown contemplation action.");
-    if ((kind === "generation" || kind === "maintenance") && !this.store.getCharacter(characterId)) throw coded("CHARACTER_NOT_FOUND", "A character is required for this action.");
+    const ownerId = poolOwnerId(pool);
+    if (!this.store.getCharacter(ownerId) || (characterId != null && characterId !== ownerId)) throw coded("CHARACTER_NOT_FOUND", "A character is required for this action.");
     this.store.ensureInterpretationPool(pool);
-    this.runtime(pool).forced.push({ kind, characterId });
-    return this.kick(pool);
+    const rt = this.runtime(pool);
+    if (rt.currentForced?.kind === kind) return { queued: false, reason: "running" };
+    if (rt.forced.some((op) => op.kind === kind)) return { queued: false, reason: "already_queued" };
+    rt.forced.push({ kind, characterId: ownerId });
+    this.kick(pool);
+    return { queued: true };
   }
 
   requestPlanning(pool) {
@@ -188,15 +209,18 @@ export class Contemplation {
 
   // Restart recovery: re-evaluate unprocessed user messages, persisted pending experiment planning, and gestalts that
   // do not reflect the current interpretation revision (including pools upgraded from before Specification 0002).
-  recover() {
-    if (!this.enabled()) return;
+  // characterId limits recovery to one character (automatic Contemplation was just enabled for it).
+  recover(characterId = null) {
     for (const character of this.store.listCharacters()) {
+      if (!character.config.contemplationEnabled || (characterId !== null && character.id !== characterId)) continue;
       const pool = poolOf(character);
       // A chat whose image is still being perceived is triggered by Dialogue once the turn is complete.
       if (this.store.pendingUploadCount(character.id)) continue;
       if (this.store.lastUserMessageId(character.id) > this.store.watermark(pool, character.id)) this.runtime(pool).pendingCharacters.add(character.id);
     }
     for (const state of this.store.interpretationPools()) {
+      const owner = poolOwnerId(state.pool);
+      if (!this.enabledFor(owner) || (characterId !== null && owner !== characterId)) continue;
       if (state.planningNeeded) this.runtime(state.pool).planningRequested = true;
       if (gestaltDue(state, this.store.interpretations(state.pool).length)) this.runtime(state.pool).gestaltFailedRevision = null;
     }
@@ -231,13 +255,19 @@ export class Contemplation {
     for (;;) {
       if (rt.forced.length) {
         const op = rt.forced.shift();
+        rt.currentForced = op;
         try {
-          if (op.kind === "maintenance") await this.runMaintenance(rt, op.characterId);
-          else if (op.kind === "generation") await this.runGeneration(rt, op.characterId);
-          await this.gestaltizeIfDue(rt);
-          await this.planIfNeeded(rt, { force: op.kind === "experimentation" });
+          // An explicit run has the normal consequences of successful model work, gestaltization and experiment
+          // planning, even while automatic Contemplation is off (owner decision on Specification 0005 F2).
+          const profile = this.ownerProfile(pool);
+          if (op.kind === "maintenance") await this.runMaintenance(rt, profile, "forced");
+          else if (op.kind === "generation") await this.runGeneration(rt, profile);
+          await this.gestaltizeIfDue(rt, profile, { forced: true });
+          await this.planIfNeeded(rt, profile, { force: op.kind === "experimentation" });
         } catch (error) {
           rt.lastError = this.diagnostics.error(`contemplation_${op.kind}`, error, { pool, characterId: op.characterId });
+        } finally {
+          rt.currentForced = null;
         }
         continue;
       }
@@ -249,13 +279,14 @@ export class Contemplation {
       // A gestalt that already failed for this revision waits for the next opportunity (message, edit, restart,
       // re-enable) instead of retrying in a loop.
       const state = this.store.ensureInterpretationPool(pool);
-      if (this.enabled() && rt.gestaltFailedRevision !== state.interpretationRevision && gestaltDue(state, this.store.interpretations(pool).length)) {
-        await this.gestaltizeIfDue(rt);
+      const enabled = this.enabledFor(poolOwnerId(pool));
+      if (enabled && rt.gestaltFailedRevision !== state.interpretationRevision && gestaltDue(state, this.store.interpretations(pool).length)) {
+        await this.gestaltizeIfDue(rt, this.ownerProfile(pool));
         continue;
       }
-      if ((rt.planningRequested || state.planningNeeded) && this.enabled()) {
+      if ((rt.planningRequested || state.planningNeeded) && enabled) {
         rt.planningRequested = false;
-        try { await this.planIfNeeded(rt, {}); }
+        try { await this.planIfNeeded(rt, this.ownerProfile(pool), {}); }
         catch (error) {
           // Leave planning_needed persisted; the next pool change, message, restart, or Force retries it.
           rt.lastError = this.diagnostics.error("contemplation_experiment_planning", error, { pool });
@@ -272,7 +303,7 @@ export class Contemplation {
     for (const characterId of rt.pendingCharacters) {
       rt.pendingCharacters.delete(characterId);
       const character = this.store.getCharacter(characterId);
-      if (!character || poolOf(character) !== rt.pool || !this.enabled()) continue;
+      if (!character || poolOf(character) !== rt.pool || !character.config.contemplationEnabled) continue;
       if (this.store.lastUserMessageId(characterId) > this.store.watermark(rt.pool, characterId)) return characterId;
     }
     return null;
@@ -280,18 +311,16 @@ export class Contemplation {
 
   // ---- context ------------------------------------------------------------------------------------------------
 
-  conversation(characterId) {
-    const character = this.store.getCharacter(characterId);
-    return { character: character.name, messages: this.store.activeMessages(characterId, CONTEMPLATION_HISTORY).map((message) => messageView(message, character.name)) };
+  conversation(profile) {
+    return { character: profile.name, messages: this.store.activeMessages(profile.characterId, CONTEMPLATION_HISTORY).map((message) => messageView(message, profile.name)) };
   }
 
   interpretationViews(pool) { return this.store.interpretations(pool).map((entry) => ({ id: wireInterpretation(entry.id), text: entry.text })); }
 
   experimentViews(pool) { return this.store.experiments(pool).map((entry) => ({ id: wireExperiment(entry.id), text: entry.text })); }
 
-  async retrieveMemory(characterId, conversation) {
-    const character = this.store.getCharacter(characterId);
-    const result = await this.memory.retrieve({ pool: poolOf(character), purpose: "contemplation_memory_retrieval", currentCharacterId: characterId,
+  async retrieveMemory(profile, conversation) {
+    const result = await this.memory.retrieve({ pool: poolOf({ id: profile.characterId }), purpose: "contemplation_memory_retrieval", profile,
       situation: { conversation: { character: conversation.character, recentMessages: conversation.messages.slice(-RETRIEVAL_SITUATION_MESSAGES) } } });
     return { shortTermMemories: result.shortTermMemories, longTermMemories: result.longTermMemories };
   }
@@ -308,6 +337,7 @@ export class Contemplation {
   // failure leaves it so the next message (or a restart) re-evaluates all evidence since the last successful cycle.
   async runCycle(rt, characterId) {
     const pool = rt.pool;
+    const profile = profileOf(this.store.getCharacter(characterId));
     const targetMessageId = this.store.lastUserMessageId(characterId);
     const cycle = { characterId, targetMessageId, startedAt: new Date().toISOString(), flags: null, status: "running" };
     rt.lastCycle = cycle;
@@ -315,16 +345,16 @@ export class Contemplation {
       this.setStage(rt, "prefetch", characterId);
       // Prefetch sees exactly the whole interpretation pool, the latest verbatim messages and the active experiment
       // intentions; no consolidated memory.
-      const payload = { interpretations: this.interpretationViews(pool), activeExperiments: this.experimentViews(pool), conversation: this.conversation(characterId),
-        requiredResponseShape: { generation: false, maintenance: false } };
-      const { value: flags } = await this.llm.structured({ purpose: "contemplation_prefetch", messages: [{ role: "system", content: prefetchSystemPrompt() }, { role: "user", content: JSON.stringify(payload) }],
+      const payload = { characterContext: characterContext(profile), interpretations: this.interpretationViews(pool), activeExperiments: this.experimentViews(pool),
+        conversation: this.conversation(profile), requiredResponseShape: { generation: false, maintenance: false } };
+      const { value: flags } = await this.llm.structured({ purpose: "contemplation_prefetch", config: profile.config, messages: [{ role: "system", content: prefetchSystemPrompt() }, { role: "user", content: JSON.stringify(payload) }],
         validate: validatePrefetch, context: { characterId, pool } });
       cycle.flags = flags;
-      if (flags.maintenance && this.store.interpretations(pool).length) await this.runMaintenance(rt, characterId);
-      if (flags.generation) await this.runGeneration(rt, characterId);
+      if (flags.maintenance && this.store.interpretations(pool).length) await this.runMaintenance(rt, profile, "automatic");
+      if (flags.generation) await this.runGeneration(rt, profile);
       this.store.setWatermark(pool, characterId, targetMessageId);
-      await this.gestaltizeIfDue(rt);
-      await this.planIfNeeded(rt, {});
+      await this.gestaltizeIfDue(rt, profile);
+      await this.planIfNeeded(rt, profile, {});
       cycle.status = "succeeded";
       rt.cycles += 1;
     } catch (error) {
@@ -340,22 +370,31 @@ export class Contemplation {
   // Specification 0004 C1/C4: one consolidation of the whole pool, then the existing per-interpretation check of
   // every consolidated candidate, then one all-or-nothing commit. Consolidated text is never persisted unverified,
   // and a failure at any stage leaves the stored interpretations and experiments exactly as they were.
-  async runMaintenance(rt, characterId) {
+  // source is "automatic" (selected by prefetch) or "forced"; the attempt and its outcome persist for the
+  // Contemplation page (Specification 0005 F3).
+  async runMaintenance(rt, profile, source) {
     const pool = rt.pool;
+    const characterId = profile.characterId;
+    const startedAt = nowIso();
+    const record = (status, extra = {}) => this.store.setLastMaintenance(pool, { status, source, startedAt, finishedAt: status === "running" ? null : nowIso(), ...extra });
     const before = this.store.ensureInterpretationPool(pool);
     const snapshot = this.store.interpretations(pool);
-    if (!snapshot.length) return { status: "empty" };
-    const report = { type: "contemplation-maintenance", pool, characterId, considered: snapshot.length };
+    if (!snapshot.length) {
+      record("skipped", { reason: "There were no interpretations to maintain." });
+      return { status: "empty" };
+    }
+    record("running");
+    const report = { type: "contemplation-maintenance", pool, characterId, source, considered: snapshot.length };
     let stage = "consolidation";
     try {
       this.setStage(rt, "maintenance_consolidation", characterId);
-      const candidates = await this.consolidate(characterId, pool, snapshot);
+      const candidates = await this.consolidate(profile, pool, snapshot);
       report.candidates = candidates.length;
       report.merged = snapshot.length - candidates.length;
       stage = "verification";
       this.setStage(rt, "maintenance_retrieval", characterId);
-      const conversation = this.conversation(characterId);
-      const memory = await this.retrieveMemory(characterId, conversation);
+      const conversation = this.conversation(profile);
+      const memory = await this.retrieveMemory(profile, conversation);
       // The experiment state every verifier sees; the commit is guarded by it as well (review 0004 P2).
       const experimentRevision = this.store.ensureInterpretationPool(pool).experimentRevision;
       const experiments = this.experimentViews(pool);
@@ -365,9 +404,9 @@ export class Contemplation {
       const results = await mapLimited(candidates, this.maxParallel, async (candidate) => {
         rt.parallel.inFlight += 1;
         try {
-          const payload = { interpretation: { id: wireInterpretation(candidate.id), text: candidate.text }, conversation, memory, activeExperiments: experiments,
+          const payload = { characterContext: characterContext(profile), interpretation: { id: wireInterpretation(candidate.id), text: candidate.text }, conversation, memory, activeExperiments: experiments,
             requiredResponseShape: { action: "unchanged", text: null, completedExperimentIds: [] } };
-          const { value } = await this.llm.structured({ purpose: "contemplation_maintenance", messages: [{ role: "system", content: maintenanceSystemPrompt() }, { role: "user", content: JSON.stringify(payload) }],
+          const { value } = await this.llm.structured({ purpose: "contemplation_maintenance", config: profile.config, messages: [{ role: "system", content: maintenanceSystemPrompt() }, { role: "user", content: JSON.stringify(payload) }],
             validate: (raw) => validateMaintenance(raw, experimentIds), context: { characterId, pool, interpretationId: candidate.id } });
           return { candidate, ...value };
         } finally {
@@ -411,48 +450,54 @@ export class Contemplation {
         return { applied: true, stale: false, interpretationsChanged, experimentsRemoved };
       });
       this.diagnostics.event({ ...report, status: outcome.applied ? "applied" : "stale", ...outcome });
+      const counts = { considered: snapshot.length, candidates: candidates.length, interpretationsChanged: outcome.interpretationsChanged, experimentsRemoved: outcome.experimentsRemoved };
+      if (!outcome.applied) record("stale", { ...counts, reason: "The interpretations or experiments changed while Maintenance was running, so nothing was applied; a later run will retry." });
+      else record(outcome.interpretationsChanged || outcome.experimentsRemoved ? "applied" : "unchanged", counts);
       return { status: outcome.applied ? "applied" : "stale", ...outcome };
     } catch (error) {
       this.diagnostics.event({ ...report, status: "failed", stage, code: error.code || null });
+      record(MAINTENANCE_SKIP_CODES.has(error.code) ? "skipped" : "failed", { stage, code: error.code || null, reason: String(error.message || "Maintenance failed.").slice(0, 500) });
       throw error;
     }
   }
 
   // The consolidation request (Specification 0004 C2/C3) sees the complete pool at once. A pool that cannot fit the
   // Contemplation model's context, or whose unmerged rewrite cannot fit its output budget, is refused, never truncated.
-  async consolidate(characterId, pool, snapshot) {
+  async consolidate(profile, pool, snapshot) {
+    const characterId = profile.characterId;
     const interpretations = snapshot.map((entry) => ({ id: wireInterpretation(entry.id), text: entry.text }));
     const messages = [{ role: "system", content: consolidationSystemPrompt() },
-      { role: "user", content: JSON.stringify({ interpretations, requiredResponseShape: { interpretations: [{ id: "int_1", sourceIds: ["int_1"], text: "..." }] } }) }];
+      { role: "user", content: JSON.stringify({ characterContext: characterContext(profile), interpretations, requiredResponseShape: { interpretations: [{ id: "int_1", sourceIds: ["int_1"], text: "..." }] } }) }];
     try { await this.llm.modelCatalog(); } catch {}
-    const fit = this.llm.contextFit("contemplation", messages);
+    const fit = this.llm.contextFit("contemplation", messages, profile.config);
     if (fit && !fit.fits) {
       throw coded("CONSOLIDATION_CONTEXT_EXCEEDED", `The ${snapshot.length} interpretations do not fit the Contemplation model's context (estimated ${fit.estimatedTokens} of ${fit.contextLength} tokens including the system prompt and output budget); maintenance was skipped and nothing changed.`);
     }
-    const output = this.llm.outputFit("contemplation", JSON.stringify(interpretations).length);
+    const output = this.llm.outputFit("contemplation", JSON.stringify(interpretations).length, profile.config);
     if (!output.fits) {
       throw coded("CONSOLIDATION_OUTPUT_EXCEEDED", `Consolidating the ${snapshot.length} interpretations may need about ${output.estimatedTokens} output tokens, above the Contemplation max tokens setting (${output.maxTokens}); maintenance was skipped and nothing changed.`);
     }
-    const { value } = await this.llm.structured({ purpose: "contemplation_consolidation", messages, validate: (raw) => validateConsolidation(raw, interpretations.map((entry) => entry.id)),
+    const { value } = await this.llm.structured({ purpose: "contemplation_consolidation", config: profile.config, messages, validate: (raw) => validateConsolidation(raw, interpretations.map((entry) => entry.id)),
       context: { characterId, pool, interpretationCount: snapshot.length } });
     return value.map((entry) => ({ id: parseWire(entry.id, "int"), sourceIds: entry.sourceIds.map((id) => parseWire(id, "int")), text: entry.text }));
   }
 
-  async runGeneration(rt, characterId) {
+  async runGeneration(rt, profile) {
     const pool = rt.pool;
+    const characterId = profile.characterId;
     // The pool revision is captured with the snapshot before any model call, so a manual edit during retrieval,
     // generation, or review is detected at commit.
     let revision = this.store.ensureInterpretationPool(pool).interpretationRevision;
     let interpretations = this.interpretationViews(pool);
     this.setStage(rt, "generation_retrieval", characterId);
-    const conversation = this.conversation(characterId);
-    const memory = await this.retrieveMemory(characterId, conversation);
+    const conversation = this.conversation(profile);
+    const memory = await this.retrieveMemory(profile, conversation);
     this.setStage(rt, "generation", characterId);
-    const base = { interpretations, conversation, memory };
+    const base = { characterContext: characterContext(profile), interpretations, conversation, memory };
     const review = async (text) => {
       this.setStage(rt, "generation_review", characterId);
-      const { value } = await this.llm.structured({ purpose: "contemplation_generation_review",
-        messages: [{ role: "system", content: generationReviewSystemPrompt() }, { role: "user", content: JSON.stringify({ existingInterpretations: interpretations, candidate: text, conversation, memory, requiredResponseShape: { accept: true, problem: null } }) }],
+      const { value } = await this.llm.structured({ purpose: "contemplation_generation_review", config: profile.config,
+        messages: [{ role: "system", content: generationReviewSystemPrompt() }, { role: "user", content: JSON.stringify({ characterContext: characterContext(profile), existingInterpretations: interpretations, candidate: text, conversation, memory, requiredResponseShape: { accept: true, problem: null } }) }],
         validate: validateGenerationReview, context: { characterId, pool } });
       return value;
     };
@@ -460,7 +505,7 @@ export class Contemplation {
     let candidate = null;
     for (let attempt = 1; attempt <= 2 && !candidate; attempt += 1) {
       const payload = { ...base, ...(feedback ? { previousCandidateRejected: feedback } : {}), requiredResponseShape: { decision: "add", text: "..." } };
-      const { value } = await this.llm.structured({ purpose: "contemplation_generation", messages: [{ role: "system", content: generationSystemPrompt() }, { role: "user", content: JSON.stringify(payload) }],
+      const { value } = await this.llm.structured({ purpose: "contemplation_generation", config: profile.config, messages: [{ role: "system", content: generationSystemPrompt() }, { role: "user", content: JSON.stringify(payload) }],
         validate: validateGeneration, context: { characterId, pool } });
       if (value.decision === "decline") break;
       const verdict = await review(value.text);
@@ -471,13 +516,12 @@ export class Contemplation {
       this.diagnostics.event({ type: "contemplation-generation", pool, characterId, status: "declined", rejected: feedback });
       return { status: "declined" };
     }
-    const character = this.store.getCharacter(characterId);
     // Commit only against the revision the approval was made for. If the pool changed meanwhile, the candidate is
     // re-reviewed against the current pool (bounded); a rejection or repeated churn discards it.
     for (let rereview = 0; ; rereview += 1) {
       const id = this.store.tx(() => {
         if (this.store.ensureInterpretationPool(pool).interpretationRevision !== revision) return null;
-        const inserted = this.store.insertInterpretation(pool, candidate, { source: "generation", characterId, characterName: character.name });
+        const inserted = this.store.insertInterpretation(pool, candidate, { source: "generation", characterId, characterName: profile.name });
         this.store.bumpInterpretationRevision(pool);
         return inserted;
       });
@@ -502,13 +546,14 @@ export class Contemplation {
   // Gestaltization (Specification 0002 G2/G3): reinterprets the previous gestalt in the light of every current
   // interpretation. It never changes interpretations or experiments. A failure keeps the last valid gestalt, is
   // recorded, and never fails the surrounding cycle; the revision is remembered so the idle loop does not retry it.
-  async gestaltizeIfDue(rt) {
+  // forced: part of an explicit Force run, which gestaltizes even while automatic Contemplation is off.
+  async gestaltizeIfDue(rt, profile, { forced = false } = {}) {
     const pool = rt.pool;
-    if (!this.enabled()) return { status: "disabled" };
+    if (!forced && !profile.config.contemplationEnabled) return { status: "disabled" };
     const state = this.store.ensureInterpretationPool(pool);
     if (!gestaltDue(state, this.store.interpretations(pool).length)) return { status: "not_needed" };
     try {
-      const result = await this.runGestaltization(rt);
+      const result = await this.runGestaltization(rt, profile);
       rt.gestaltFailedRevision = null;
       return result;
     } catch (error) {
@@ -518,24 +563,24 @@ export class Contemplation {
     }
   }
 
-  async runGestaltization(rt) {
+  async runGestaltization(rt, profile) {
     const pool = rt.pool;
     for (let attempt = 1; attempt <= GESTALT_STALE_RETRIES; attempt += 1) {
       this.setStage(rt, "gestaltization");
       const state = this.store.ensureInterpretationPool(pool);
       const interpretations = this.interpretationViews(pool);
       if (!gestaltDue(state, interpretations.length)) return { status: "not_needed" };
-      const payload = { interpretationRevision: state.interpretationRevision, interpretations,
+      const payload = { characterContext: characterContext(profile), interpretationRevision: state.interpretationRevision, interpretations,
         previousGestalt: state.gestalt === null ? null : { text: state.gestalt, interpretationRevision: state.gestaltRevision, updatedAt: state.gestaltUpdatedAt },
         requiredResponseShape: { gestalt: "..." } };
       const messages = [{ role: "system", content: gestaltizationSystemPrompt() }, { role: "user", content: JSON.stringify(payload) }];
       // The whole interpretation set is always sent; a set that cannot fit is refused rather than truncated.
       try { await this.llm.modelCatalog(); } catch {}
-      const fit = this.llm.contextFit("contemplation", messages);
+      const fit = this.llm.contextFit("contemplation", messages, profile.config);
       if (fit && !fit.fits) {
         throw coded("GESTALT_CONTEXT_EXCEEDED", `The ${interpretations.length} interpretations do not fit the Contemplation model's context (estimated ${fit.estimatedTokens} of ${fit.contextLength} tokens including the output budget); the gestalt was not updated.`);
       }
-      const { value } = await this.llm.structured({ purpose: "contemplation_gestaltization", messages, validate: validateGestalt,
+      const { value } = await this.llm.structured({ purpose: "contemplation_gestaltization", config: profile.config, messages, validate: validateGestalt,
         context: { pool, interpretationRevision: state.interpretationRevision, interpretationCount: interpretations.length } });
       const committed = this.store.tx(() => {
         if (this.store.ensureInterpretationPool(pool).interpretationRevision !== state.interpretationRevision) return false;
@@ -551,7 +596,7 @@ export class Contemplation {
 
   // Experiment planning sees only the interpretation pool and the active experiments. It runs once against the
   // final committed pool after maintenance/generation; a result computed from an outdated revision is discarded.
-  async planIfNeeded(rt, { force = false }) {
+  async planIfNeeded(rt, profile, { force = false }) {
     const pool = rt.pool;
     if (!force && !this.store.ensureInterpretationPool(pool).planningNeeded) return { status: "not_needed" };
     for (let attempt = 1; attempt <= PLANNING_STALE_RETRIES; attempt += 1) {
@@ -560,8 +605,8 @@ export class Contemplation {
       const interpretations = this.interpretationViews(pool);
       const experiments = this.experimentViews(pool);
       const experimentIds = new Set(experiments.map((entry) => entry.id));
-      const { value } = await this.llm.structured({ purpose: "contemplation_experiment_planning",
-        messages: [{ role: "system", content: experimentPlanningSystemPrompt() }, { role: "user", content: JSON.stringify({ interpretations, activeExperiments: experiments, requiredResponseShape: { experiments: [{ id: null, text: "..." }] } }) }],
+      const { value } = await this.llm.structured({ purpose: "contemplation_experiment_planning", config: profile.config,
+        messages: [{ role: "system", content: experimentPlanningSystemPrompt() }, { role: "user", content: JSON.stringify({ characterContext: characterContext(profile), interpretations, activeExperiments: experiments, requiredResponseShape: { experiments: [{ id: null, text: "..." }] } }) }],
         validate: (raw) => validatePlanning(raw, experimentIds), context: { pool } });
       const committed = this.store.tx(() => {
         const now = this.store.ensureInterpretationPool(pool);
@@ -619,7 +664,7 @@ export class Contemplation {
   }
 
   afterManualInterpretationChange(pool) {
-    if (!this.enabled()) return;
+    if (!this.enabledFor(poolOwnerId(pool))) return;
     this.runtime(pool).gestaltFailedRevision = null;
     this.runtime(pool).planningRequested = true;
     clearTimeout(this.planningTimers.get(pool));
@@ -658,6 +703,10 @@ export class Contemplation {
   status(pool = null) {
     const view = (rt) => ({
       pool: rt.pool, running: rt.running, stage: rt.stage, stageCharacterId: rt.stageCharacterId, parallel: { ...rt.parallel },
+      // Specification 0005 F3: Maintenance's current state, distinct from the last persisted attempt.
+      maintenance: rt.currentForced?.kind === "maintenance" || rt.stage.startsWith("maintenance") ? "running" : rt.forced.some((op) => op.kind === "maintenance") ? "queued" : "idle",
+      lastMaintenance: this.store.ensureInterpretationPool(rt.pool).lastMaintenance,
+      forcedRunning: rt.currentForced?.kind ?? null,
       queued: { pendingCharacterIds: [...rt.pendingCharacters], forced: rt.forced.map((op) => op.kind), planningRequested: rt.planningRequested || this.store.ensureInterpretationPool(rt.pool).planningNeeded,
         gestaltDue: this.gestaltView(rt.pool).status === "pending" },
       lastError: rt.lastError ? { at: rt.lastError.at, stage: rt.lastError.stage, code: rt.lastError.code, message: rt.lastError.message } : null,

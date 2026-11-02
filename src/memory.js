@@ -8,7 +8,9 @@
 // Society's subjective temporal anchors, protected records, and reconsolidation are intentionally not ported; each
 // record keeps real source timestamps and conversation attribution instead.
 import { clone, coded, exactKeys, isObject, localDateString, stableFingerprint } from "./utils.js";
-import { poolOf } from "./db.js";
+import { poolOf, poolOwnerId } from "./db.js";
+import { profileOf } from "./settings.js";
+import { characterContext } from "./prompts/context.js";
 import {
   MEMORY_LIMITS, FORGET_REASONS, MEMORY_EPISTEMIC_RULES, stmSystemPrompt, ltmSelectionSystemPrompt, ltmSystemPrompt, retrievalSystemPrompt,
   DIALOGUE_RETRIEVAL_PURPOSE, CONTEMPLATION_RETRIEVAL_PURPOSE
@@ -357,8 +359,9 @@ export class MemoryEngine {
     return entry.promise;
   }
 
+  // One logical job: the owner's Dialogue configuration and descriptions are frozen here for every call of it.
   async consolidateStm(characterId, pool) {
-    const character = this.store.getCharacter(characterId);
+    const character = profileOf(this.store.getCharacter(characterId));
     const window = this.store.oldestActiveMessages(characterId, VERBATIM_WINDOW);
     if (window.length < VERBATIM_WINDOW) return { status: "skipped" };
     const consumed = window.slice(0, STM_BATCH);
@@ -367,6 +370,7 @@ export class MemoryEngine {
     const suppliedMap = new Map(supplied.map((record) => [wire.stm(record.id), record]));
     const frozen = { consumedIds: new Set(consumed.map((m) => wire.msg(m.id))), retainedIds: new Set(retained.map((m) => wire.msg(m.id))), suppliedStm: suppliedMap };
     const payload = {
+      characterContext: characterContext(character),
       conversation: { character: character.name },
       consumedMessageIds: consumed.map((m) => wire.msg(m.id)),
       retainedMessageIds: retained.map((m) => wire.msg(m.id)),
@@ -378,7 +382,7 @@ export class MemoryEngine {
     const messages = [{ role: "system", content: stmSystemPrompt(character.name) }, { role: "user", content: JSON.stringify(payload) }];
     if (serializedLength(messages) > MEMORY_LIMITS.REQUEST_CEILING_CHARS) throw coded("MEMORY_CAPACITY_EXCEEDED", "Verbatim->STM request exceeds the request ceiling; nothing was consumed.");
     const fingerprint = stableFingerprint({ consumed: consumed.map((m) => m.id), supplied });
-    const { value: draft } = await this.llm.structured({ purpose: "memory_stm_consolidation", messages, validate: (raw) => validateStmDraft(raw, frozen), context: { characterId, pool } });
+    const { value: draft } = await this.llm.structured({ purpose: "memory_stm_consolidation", config: character.config, messages, validate: (raw) => validateStmDraft(raw, frozen), context: { characterId, pool } });
     const messageById = new Map(consumed.map((m) => [wire.msg(m.id), m]));
     const provenanceFor = (record, prior = []) => mergeProvenance([
       ...prior.map((p) => ({ sources: p.sources, from: p.sourceFrom, to: p.sourceTo })),
@@ -468,17 +472,21 @@ export class MemoryEngine {
   async consolidatePoolLtm(pool) {
     const stm = this.store.memoryRecords(pool, "stm");
     if (!stm.length) return { jobs: 0 };
+    // The pool's owner, frozen for the whole day's consolidation of this pool (Specification 0005 A5).
+    const owner = this.store.getCharacter(poolOwnerId(pool));
+    if (!owner) throw coded("CHARACTER_NOT_FOUND", `Memory pool ${pool} has no owning character.`);
+    const profile = profileOf(owner);
     const dayViews = stm.map((record) => memoryView(record));
     const jobs = partitionBySize(dayViews);
     let committed = 0;
     for (const [jobIndex, job] of jobs.entries()) {
-      await this.runLtmJob(pool, job, dayViews, jobIndex, jobs.length);
+      await this.runLtmJob(pool, profile, job, dayViews, jobIndex, jobs.length);
       committed += 1;
     }
     return { jobs: committed, stmCount: stm.length };
   }
 
-  async runLtmJob(pool, job, dayViews, jobIndex, jobCount) {
+  async runLtmJob(pool, profile, job, dayViews, jobIndex, jobCount) {
     const jobIds = new Set(job.map((view) => view.id));
     const stmRecords = new Map(this.store.memoryRecords(pool, "stm").map((record) => [wire.stm(record.id), record]));
     const ltmRecords = this.store.memoryRecords(pool, "ltm");
@@ -489,11 +497,11 @@ export class MemoryEngine {
       const frozenSelection = { ltmIds: new Set(ltmById.keys()), stmIds: new Set(otherViews.map((view) => view.id)) };
       const messages = [
         { role: "system", content: ltmSelectionSystemPrompt() },
-        { role: "user", content: JSON.stringify({ jobSources: job, existingLongTermMemoryCatalog: ltmRecords.map((record) => catalogEntry(record)),
+        { role: "user", content: JSON.stringify({ characterContext: characterContext(profile), jobSources: job, existingLongTermMemoryCatalog: ltmRecords.map((record) => catalogEntry(record)),
           otherShortTermMemoryCatalog: otherViews.map((view) => catalogEntry(stmRecords.get(view.id))), requiredResponseShape: { relevantLtmIds: [], contextStmIds: [] } }) }
       ];
       try {
-        const { value } = await this.llm.structured({ purpose: "memory_ltm_selection", messages, validate: (raw) => validateLtmSelection(raw, frozenSelection), context: { pool } });
+        const { value } = await this.llm.structured({ purpose: "memory_ltm_selection", config: profile.config, messages, validate: (raw) => validateLtmSelection(raw, frozenSelection), context: { pool } });
         selection = { mode: "semantic", ...value };
       } catch (error) {
         // Society fallback: a failed selector supplies every catalog record (high recall), never an arbitrary subset.
@@ -504,6 +512,7 @@ export class MemoryEngine {
     const contextStm = new Map(selection.contextStmIds.map((id) => [id, stmRecords.get(id)]));
     const selectedLtm = new Map(selection.relevantLtmIds.map((id) => [id, ltmById.get(id)]));
     const payload = {
+      characterContext: characterContext(profile),
       job: { index: jobIndex + 1, count: jobCount },
       consumableShortTermMemories: [...consumable.values()].map((record) => memoryView(record)),
       readOnlyContextShortTermMemories: [...contextStm.values()].map((record) => memoryView(record)),
@@ -514,7 +523,7 @@ export class MemoryEngine {
     const messages = [{ role: "system", content: ltmSystemPrompt() }, { role: "user", content: JSON.stringify(payload) }];
     if (serializedLength(messages) > MEMORY_LIMITS.REQUEST_CEILING_CHARS) throw coded("MEMORY_CAPACITY_EXCEEDED", "Daily memory request exceeds the request ceiling; no source was dropped.");
     const fingerprint = stableFingerprint([...consumable.values()]);
-    const { value: draft } = await this.llm.structured({ purpose: "memory_ltm_consolidation", messages, validate: (raw) => validateLtmDraft(raw, { consumable, contextStm, selectedLtm }), context: { pool } });
+    const { value: draft } = await this.llm.structured({ purpose: "memory_ltm_consolidation", config: profile.config, messages, validate: (raw) => validateLtmDraft(raw, { consumable, contextStm, selectedLtm }), context: { pool } });
     const sourceRecords = (record) => [...record.sourceStmIds.map((id) => consumable.get(id) || contextStm.get(id)), ...record.sourceLtmIds.map((id) => selectedLtm.get(id))];
     const provenance = (records) => mergeProvenance(records.map((r) => ({ sources: r.sources, from: r.sourceFrom, to: r.sourceTo })));
     this.store.tx(() => {
@@ -537,8 +546,10 @@ export class MemoryEngine {
 
   // Society-style semantic retrieval: always the selector over a nonempty catalog (no request for an empty one). A
   // failed selector falls back to deterministic importance ranking so a reply is never blocked; the fallback is
-  // recorded in diagnostics.
-  async retrieve({ pool, purpose, currentCharacterId, situation }) {
+  // recorded in diagnostics. profile is the calling job's snapshot: its configuration for the purpose's role and the
+  // character's descriptions.
+  async retrieve({ pool, purpose, profile, situation }) {
+    const currentCharacterId = profile.characterId;
     const stm = this.store.memoryRecords(pool, "stm");
     const ltm = this.store.memoryRecords(pool, "ltm");
     if (!stm.length && !ltm.length) return { shortTermMemories: [], longTermMemories: [], selection: "empty_catalog" };
@@ -546,7 +557,7 @@ export class MemoryEngine {
     const ltmById = new Map(ltm.map((record) => [wire.ltm(record.id), record]));
     const messages = [
       { role: "system", content: retrievalSystemPrompt(purpose === "dialogue_memory_retrieval" ? DIALOGUE_RETRIEVAL_PURPOSE : CONTEMPLATION_RETRIEVAL_PURPOSE) },
-      { role: "user", content: JSON.stringify({ situation, limits: { stm: MEMORY_LIMITS.CONTEXT_STM_LIMIT, ltm: MEMORY_LIMITS.CONTEXT_LTM_LIMIT },
+      { role: "user", content: JSON.stringify({ characterContext: characterContext(profile), situation, limits: { stm: MEMORY_LIMITS.CONTEXT_STM_LIMIT, ltm: MEMORY_LIMITS.CONTEXT_LTM_LIMIT },
         catalog: { shortTermMemories: stm.map((record) => catalogEntry(record, currentCharacterId)), longTermMemories: ltm.map((record) => catalogEntry(record, currentCharacterId)) },
         requiredResponseShape: { stmIds: [], ltmIds: [] } }) }
     ];
@@ -560,7 +571,7 @@ export class MemoryEngine {
     let chosen;
     let mode = "semantic";
     try {
-      const { value } = await this.llm.structured({ purpose, messages, validate, context: { characterId: currentCharacterId, pool } });
+      const { value } = await this.llm.structured({ purpose, config: profile.config, messages, validate, context: { characterId: currentCharacterId, pool } });
       chosen = { stm: value.stmIds.map((id) => stmById.get(id)), ltm: value.ltmIds.map((id) => ltmById.get(id)) };
     } catch (error) {
       if (error.code === "API_KEY_MISSING" || error.code === "AI_REQUEST_ABORTED") throw error;

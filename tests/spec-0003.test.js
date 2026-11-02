@@ -4,10 +4,10 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { makeApp, closeApp, waitFor, reply, tempDir, seedMessages, jsonResponse, TEST_KEY } from "./helpers.js";
+import { makeApp, closeApp, waitFor, reply, tempDir, seedMessages, jsonResponse, TEST_KEY, configure, configOf, schema4Database } from "./helpers.js";
 import { createServer } from "../src/server.js";
 import { poolOf, MIGRATIONS } from "../src/db.js";
-import { defaultSettings } from "../src/settings.js";
+import { defaultConfig } from "../src/settings.js";
 import { messageView } from "../src/memory.js";
 import { stmSystemPrompt } from "../src/prompts/memory.js";
 import { visionSystemPrompt } from "../src/prompts/vision.js";
@@ -49,20 +49,23 @@ async function imageTurn(app, characterId, { text = "Вот моё селфи", 
   return { user, upload, observation };
 }
 
+// Since Specification 0005 the legacy global settings are merged onto the defaults once, by migration 5, into the
+// character's own configuration.
 test("settings migrate: an older saved settings object keeps every role and gains the Gemini 3 Flash Vision default", async () => {
   const dataDir = tempDir();
-  const first = await makeApp({}, { dataDir, key: false });
-  const old = defaultSettings();
+  const old = defaultConfig();
   delete old.models.vision; delete old.temperature.vision; delete old.maxTokens.vision;
   Object.assign(old, { imageEnabled: true, contemplationEnabled: false });
   old.models.dialogue = "vendor/dialogue-x";
   old.models.contemplation = "vendor/contemplation-y";
   old.maxTokens.dialogue = 2048;
-  first.app.store.setMeta("settings", old);
-  closeApp(first.app);
+  schema4Database(dataDir, (db) => {
+    db.prepare("INSERT INTO characters (name, description, created_at, updated_at) VALUES ('Mira', 'Keeper.', '2026-10-01T10:00:00.000Z', '2026-10-01T10:00:00.000Z')").run();
+    db.prepare("INSERT INTO meta (key, value) VALUES ('settings', ?)").run(JSON.stringify(old));
+  });
   const { app } = await makeApp({}, { dataDir, key: false });
   try {
-    const settings = app.settings.get();
+    const settings = configOf(app, 1);
     assert.equal(settings.models.vision, "google/gemini-3-flash-preview");
     assert.equal(settings.models.dialogue, "vendor/dialogue-x");
     assert.equal(settings.models.contemplation, "vendor/contemplation-y");
@@ -76,9 +79,9 @@ test("settings migrate: an older saved settings object keeps every role and gain
       assert.deepEqual(status.curatedVisionModels.map((model) => model.id), ["google/gemini-3-flash-preview", "qwen/qwen3-vl-235b-a22b-instruct", "google/gemini-3.1-flash-lite"]);
       assert.equal(status.uploadMaxBytes, UPLOAD_MAX_BYTES);
     } finally { server.close(); }
-    app.settings.update({ models: { ...settings.models, vision: "qwen/qwen3-vl-235b-a22b-instruct" } });
-    assert.equal(app.settings.get().models.vision, "qwen/qwen3-vl-235b-a22b-instruct");
-    assert.equal(app.settings.get().models.dialogue, "vendor/dialogue-x");
+    configure(app, 1, { models: { vision: "qwen/qwen3-vl-235b-a22b-instruct" } });
+    assert.equal(configOf(app, 1).models.vision, "qwen/qwen3-vl-235b-a22b-instruct");
+    assert.equal(configOf(app, 1).models.dialogue, "vendor/dialogue-x");
   } finally { closeApp(app); }
 });
 
@@ -115,19 +118,18 @@ test("selfie: upload, one observation before the reply, exact Vision inputs, typ
   });
   const { server, url } = await listen(app);
   try {
-    app.settings.setUserDescription("SELF-DESCRIPTION-TEXT");
-    const mira = app.createCharacter(base);
+    const mira = app.createCharacter({ ...base, userDescription: "SELF-DESCRIPTION-TEXT" });
     const pool = poolOf(mira);
-    app.settings.update({ contemplationEnabled: false });
+    configure(app, mira.id, { contemplationEnabled: false });
     app.contemplation.addInterpretation(pool, "INTERPRETATION-TEXT");
     app.contemplation.addExperiment(pool, "EXPERIMENT-TEXT");
     app.store.setPlanningNeeded(pool, false);
     app.store.setGestalt(pool, "GESTALT-TEXT", app.store.ensureInterpretationPool(pool).interpretationRevision);
-    app.settings.update({ contemplationEnabled: true });
+    configure(app, mira.id, { contemplationEnabled: true });
     app.store.insertMemory({ pool: `character:${mira.id}`, tier: "stm", topic: "STM-TOPIC", summary: "STM-SUMMARY", retrievalBrief: "x", importance: 0.5, sources: [], scopeCharacterId: mira.id });
     app.store.insertMemory({ pool: `character:${mira.id}`, tier: "ltm", topic: "LTM-TOPIC", summary: "LTM-SUMMARY", retrievalBrief: "x", importance: 0.5, sources: [] });
     seedMessages(app, mira.id, 4);
-    assert.equal(app.settings.get().imageEnabled, false, "image generation is off");
+    assert.equal(configOf(app, mira.id).imageEnabled, false, "image generation is off");
 
     const response = await postImage(url, mira.id, { text: "Вот моё селфи" });
     assert.equal(response.status, 200);
@@ -153,7 +155,10 @@ test("selfie: upload, one observation before the reply, exact Vision inputs, typ
     assert.equal(context.conversation.messages.at(-1).text, "Вот моё селфи");
     assert.match(context.conversation.messages.at(-1).attachedImage, /not been viewed yet/);
     assert.equal(context.gestalt.text, "GESTALT-TEXT");
-    assert.doesNotMatch(JSON.stringify(visionCall.body), /INTERPRETATION-TEXT|EXPERIMENT-TEXT|STM-TOPIC|STM-SUMMARY|LTM-TOPIC|LTM-SUMMARY|SELF-DESCRIPTION-TEXT/);
+    assert.doesNotMatch(JSON.stringify(visionCall.body), /INTERPRETATION-TEXT|EXPERIMENT-TEXT|STM-TOPIC|STM-SUMMARY|LTM-TOPIC|LTM-SUMMARY/);
+    // Specification 0005 C4: the User Description now reaches Vision, as labeled characterContext framing only.
+    assert.equal(context.characterContext.userDescription, "SELF-DESCRIPTION-TEXT");
+    assert.equal(JSON.stringify(visionCall.body).split("SELF-DESCRIPTION-TEXT").length, 2, "exactly once, inside characterContext");
 
     // Perception precedes the reply and the single Contemplation trigger.
     assert.deepEqual(order.filter((step) => step !== "prefetch").slice(0, 2), ["vision", "reply"]);
@@ -285,7 +290,7 @@ test("an incompatible Vision model or an oversized context fails without a call 
   const { app, mock } = await makeApp({ vision_observation: () => OBSERVATION, dialogue_reply: () => reply("ok"), contemplation_prefetch: quietPrefetch });
   try {
     await app.llm.modelCatalog();
-    const model = app.settings.get().models.vision;
+    const model = defaultConfig().models.vision;
     app.llm.catalog.byId.set(model, { id: model, inputModalities: ["text"], outputModalities: ["text"], contextLength: 100_000, supportedParameters: null, maxCompletionTokens: null });
     const mira = app.createCharacter(base);
     const first = await app.dialogue.sendImage(mira.id, "", { image: PNG });
@@ -297,7 +302,7 @@ test("an incompatible Vision model or an oversized context fails without a call 
     await waitFor(() => app.store.uploadForMessage(second.id).status !== "pending" && app.store.lastTurn(mira.id).role === "character");
     assert.equal(app.store.uploadForMessage(second.id).errorCode, "VISION_CONTEXT_EXCEEDED");
     assert.equal(mock.byPurpose("vision_observation").length, 0);
-    assert.equal(app.settings.get().models.vision, model);
+    assert.equal(configOf(app, mira.id).models.vision, model);
   } finally { closeApp(app); }
 });
 
@@ -308,11 +313,11 @@ test("disabled Contemplation: Vision runs with image and verbatim only; enabled,
     const shared = app.createCharacter({ ...base, useSharedInterpretations: true });
     app.store.setGestalt(`character:${other.id}`, "OTHER-GESTALT", 0);
     app.store.setGestalt(`character:${shared.id}`, "OWN-GESTALT", 0);
-    app.settings.update({ contemplationEnabled: false });
+    configure(app, shared.id, { contemplationEnabled: false });
     await app.dialogue.sendImage(shared.id, "", { image: PNG });
     await waitFor(() => app.store.lastTurn(shared.id).role === "character");
     assert.equal(visionText(mock.byPurpose("vision_observation")[0]).gestalt, null);
-    app.settings.update({ contemplationEnabled: true });
+    configure(app, shared.id, { contemplationEnabled: true });
     app.contemplation.onUserMessage = () => null;
     await app.dialogue.sendImage(shared.id, "", { image: PNG });
     await waitFor(() => mock.byPurpose("dialogue_reply").length === 2);

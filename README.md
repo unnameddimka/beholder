@@ -10,8 +10,9 @@ context of the chat, and the character reacts to that observation.
 Full requirements: [docs/specs/0000-beholder-poc.md](docs/specs/0000-beholder-poc.md), amended by
 [0001](docs/specs/0001-dialogue-response-reliability-and-time-awareness.md),
 [0002](docs/specs/0002-gestaltization-readonly-contemplation-baidu.md),
-[0003](docs/specs/0003-contextual-vision-image-observations.md), and
-[0004](docs/specs/0004-interpretation-consolidation-personal-cognition-mobile-composer.md).
+[0003](docs/specs/0003-contextual-vision-image-observations.md),
+[0004](docs/specs/0004-interpretation-consolidation-personal-cognition-mobile-composer.md), and
+[0005](docs/specs/0005-character-ai-config-three-descriptions-force-and-ctrl-enter.md).
 
 > **Trusted LAN only.** Plain HTTP, no authentication, no HTTPS. Never expose the port to the internet.
 
@@ -39,37 +40,65 @@ SQLite (`data/beholder.sqlite`), generated images (`data/images/`), and images y
 1. Open `http://<host>:3000` from a desktop or Android browser on the LAN.
 2. **Enter the OpenRouter API key.** The server keeps it only in memory. It is never written to disk, SQLite, the
    browser, logs, or dumps. After a server restart you enter it again.
-3. **Settings** (gear icon): pick the **Dialogue**, **Contemplation**, **Vision**, and **Image** models. The text fields
-   suggest models from OpenRouter's catalogue; Vision suggests exactly Google Gemini 3 Flash Preview (the default),
-   Qwen3-VL-235B-A22B Instruct, and Google Gemini 3.1 Flash Lite. Every field also accepts a typed model id. Optionally
-   enable a temperature override and set the maximum output tokens (defaults: 8,192 for Dialogue, 16,384 for
-   Contemplation, 4,096 for Vision). Image generation is off by default; it does not affect attaching your own images.
-   Contemplation is on by default. Save.
-4. On the home page, optionally fill in **About you**. It is pinned as the first user message for every character.
-5. **Add Character**: a display name and an AI-facing description. Each character owns its cognition (spec 0004):
-   its own short- and long-term memory, interpretations, gestalt, experiments, and Contemplation progress. A new
-   character starts with all of them empty; nothing is shared or copied between characters. (Older versions had
-   *Use shared memory* / *Use shared interpretations* flags; they are gone, and the API ignores them if sent.)
+3. **Add Character** (or **Edit** an existing one). Everything about a character lives in its own editor (spec 0005):
+   - **Descriptions**, all optional and up to 20,000 characters each:
+     - *Character Description*: who the character is.
+     - *Scene Description*: where and in what circumstances the conversation takes place.
+     - *User Description*: how you describe yourself to this character. It is pinned as your self-description, not
+       sent as a chat message.
+
+     Every AI role of the character receives all three as labeled context.
+   - **AI Models**: one card each for **Dialogue**, **Contemplation**, **Vision**, and **Image Generation**.
+     - The fields suggest the curated models and OpenRouter's catalogue (**Refresh model list** reloads it). Vision
+       suggests exactly Google Gemini 3 Flash Preview (the default), Qwen3-VL-235B-A22B Instruct, and Google Gemini
+       3.1 Flash Lite.
+     - Every field also accepts a typed model id. A configured id stays shown even when the catalogue is unavailable.
+     - The three text roles each have a temperature override and a maximum output tokens setting (defaults: 8,192
+       Dialogue, 16,384 Contemplation, 4,096 Vision).
+     - Image generation is off by default. It does not affect attaching your own images.
+     - Automatic Contemplation is on by default.
+
+   A new character starts from the built-in defaults, never from another character's settings, and with empty Scene
+   and User descriptions. Saving changes only this character. Its chat, memory, interpretations, gestalt,
+   experiments, and images stay as they are, and work already running finishes with the values it started with.
+   There is no global Settings page or shared "About you" any more.
+
+   Each character also owns its cognition (spec 0004): its own short- and long-term memory, interpretations, gestalt,
+   experiments, and Contemplation progress. A new character starts with all of them empty; nothing is shared or
+   copied between characters. (Older versions had *Use shared memory* / *Use shared interpretations* flags; they are
+   gone, and the API ignores them if sent.)
 
 ## Testing Contemplation by hand
 
 1. Create a character and chat for a few messages. After each user message the header shows activity, and the
-   Contemplation model runs a cheap prefetch. It sees the interpretations, the last 100 messages and the active
-   experiments (never consolidated memory), and requests maintenance when an interpretation needs revisiting or an
+   Contemplation model runs a cheap prefetch. It sees the interpretations, the last 100 messages, the active
+   experiments and the character's three descriptions (never consolidated memory), and requests maintenance when an interpretation needs revisiting or an
    experiment appears to have produced a result.
    Maintenance first consolidates the whole interpretation set in one request (duplicates merge, distinct and
    conflicting hypotheses stay separate), then checks each consolidated interpretation against the conversation,
    and saves the result only if every step succeeded.
    When the prefetch sees a genuinely new angle, generation adds an interpretation.
-2. Open **Contemplation** (from the chat header). The page is read-only. It shows the gestalt (with "Not formed yet" or
-   "Update pending" when that applies), the interpretations, the active experiments, the current stage, the number of
-   parallel maintenance requests, queued work, the last cycle's flags, and errors. It has no edit or Force controls.
+2. Open **Contemplation** (from the chat header). It shows:
+   - the gestalt (with "Not formed yet" or "Update pending" when that applies), the interpretations, and the active
+     experiments;
+   - the current stage, parallel maintenance requests, queued work, the last cycle's flags, and errors;
+   - **Maintenance now** (queued, running, or idle);
+   - **Last Maintenance**: when it ran, its outcome (succeeded, nothing needed changing, discarded as stale, skipped,
+     failed, or interrupted by a restart), whether it was automatic or forced, and the reason when it did not
+     succeed. It shows "Never" until the first attempt, and it survives restarts.
+
+   **Run now** offers **Force Maintenance**, **Force Generation**, and **Force Experimentation**. Each one queues the
+   normal model-driven stage, and the result appears in the status once it has run. A button is disabled while its
+   run is queued or running, so it cannot be queued twice. Force works even while automatic Contemplation is off. A
+   forced Maintenance or Generation is then followed by the usual gestalt update and experiment review. No control
+   edits interpretation, experiment, or gestalt text.
 3. Every interpretation change leads to one gestalt update and then one experiment review, so the gestalt and active
    experiments appear shortly after the first interpretation.
 4. Keep chatting. The dialogue model receives the gestalt as its own tentative impression of the user and the active
    experiments as private, optional intentions.
-5. To compare behavior, untick **Enable Contemplation** in Settings. Automatic contemplation (including gestalt
-   updates) stops, and neither the gestalt nor the experiments are sent to dialogue. Stored state stays visible.
+5. To compare behavior, untick **Automatic Contemplation** in the character's editor. For that character only,
+   nothing runs on its own (including gestalt updates), and neither the gestalt nor the experiments are sent to its
+   dialogue. Stored state stays visible, and Force still works.
 
 ## Attaching an image
 
@@ -79,9 +108,12 @@ your message with a small note: "Viewing..." while the Vision model looks at it,
 with the observation, or "Could not be viewed". The character's reply waits for the observation. If Vision fails, the
 reply knows only that an image could not be viewed and never pretends to have seen it.
 
-The message field grows with its lines up to about a third of the screen, then scrolls. **Enter always inserts a
-new line** (with or without Shift, Ctrl, or an input method); only the Send button (the paper plane, right of the
-field) sends.
+The message field grows with its lines up to about a third of the screen, then scrolls.
+- **Enter** and **Shift+Enter** insert a new line.
+- The Send button (the paper plane, right of the field) sends.
+- On a desktop keyboard, **Ctrl+Enter** in the message field sends too, through the same action as the button. It is
+  ignored while an input method is still composing, while a reply is pending, and for an empty message without an
+  image. Command/Meta+Enter is not a shortcut.
 
 **Emergency Dump** (the red **Dump** button, always in the header) downloads a sanitized ZIP of state and diagnostics.
 It works while the server is busy and never changes state.
@@ -109,21 +141,38 @@ boundary, and no image data in diagnostics or dumps); and the spec 0004 scenario
 pool before verification, the verifier seeing consolidated text, the ID-mapping validator, all-or-nothing and stale
 commits, no revision bump for an unchanged set, the context and output-budget refusal, empty cognition for a new
 character, the shared-pool migration with its revisions, gestalt and watermarks, restart idempotence, refusal of
-ambiguous legacy states, and a source scan of the composer contract). Whether a live model writes a good gestalt or an accurate,
+ambiguous legacy states, and a source scan of the composer contract); and the spec 0005 scenarios:
+- descriptions and AI configuration per character: validation without partial saves, built-in defaults for new
+  characters, and no global settings in the API, status, or dump;
+- the settings migration on a schema-4 database: exact values for one or several characters, independence
+  afterwards, refusal of invalid legacy values, and idempotence;
+- routing: each character's own models across overlapping jobs, a frozen snapshot through repairs and through every
+  stage of a Maintenance run, and queued images keeping their model and context across an edit and a restart;
+- the three descriptions in Dialogue (one pinned User Description), every Contemplation stage, STM, LTM, retrieval,
+  Vision and image prompts, with empty fields;
+- Force dedupe and separation per character, Force with automatic Contemplation off, and persisted Maintenance
+  status including interruption;
+- a source scan of the editor and the Ctrl+Enter handler.
+
+Whether a live model writes a good gestalt or an accurate,
 non-interpretive observation is a manual judgment, not something the tests can certify.
 
 ### Manual smoke procedure (Android / LAN)
 
 1. Start with Compose and open `http://<lan-ip>:3000` in Chrome on Android. Enter the key.
 2. Create a character. Send a message containing `*waves*`: it shows in italics without asterisks. While the reply
-   is pending, keep typing: Send stays disabled, and the draft is kept. Enter inserts new lines and never sends.
+   is pending, keep typing: Send stays disabled, and the draft is kept. Enter inserts new lines and never sends. On a
+   desktop browser, Ctrl+Enter sends once; Enter and Shift+Enter still insert new lines.
    In portrait (320-400 px wide), with the keyboard open, the field spans the width between the two icon buttons,
    grows to its limit, then scrolls; the composer stays visible above the keyboard.
 3. Open an empty chat and wait 60 s without typing: one opener arrives. Start typing in another case: nothing arrives.
-4. Enable images, then ask a character to show you something: the text appears first, the picture later.
-5. Restart the container (`docker compose restart`): the key is required again, and chats and images are still there.
-6. Download an Emergency Dump while a reply is pending, then search it for your key: it is not there.
-7. Attach a real selfie with the text "Вот моё селфи": the reply arrives after the observation, and **What <name> saw**
+4. Enable image generation in the character's editor, then ask it to show you something: the text appears first,
+   the picture later.
+5. Give two characters different Dialogue models and Scene descriptions, and chat with both. In an Emergency Dump,
+   each `dialogue_reply` exchange uses its own character's model and scene.
+6. Restart the container (`docker compose restart`): the key is required again, and chats and images are still there.
+7. Download an Emergency Dump while a reply is pending, then search it for your key: it is not there.
+8. Attach a real selfie with the text "Вот моё селфи": the reply arrives after the observation, and **What <name> saw**
    describes only what is visible (no identity, personality, or intentions).
 
 ## Implementation choices (simple defaults, per spec section 12)
@@ -181,6 +230,47 @@ non-interpretive observation is a manual judgment, not something the tests can c
 - **STM→LTM:** checked at startup, every minute, and at local midnight. Each pool records its own last successful
   date. The global date advances only when every pool succeeds. Each LTM job commits atomically, so a later failure
   keeps the remaining STM for the retry (15-minute backoff). Every STM present when the boundary runs is consolidated.
+- **Character-owned AI configuration (spec 0005):**
+  - *What a character stores.* Each character row holds its three descriptions and a complete configuration: the
+    four models, the temperature override and output budget of each text role, `imageEnabled`, and
+    `contemplationEnabled`. It is validated strictly as a whole, so a partial update merges role by role and an
+    invalid one saves nothing. Global state is only infrastructure: the in-memory key, the model catalogue, network
+    and retry policy, and diagnostics.
+  - *Frozen per job.* Every AI job takes a frozen snapshot of its character when it starts and uses it for every
+    call, retry, repair, fit check, and catalogue clamp. That holds for a reply, follow-up or opener with its memory
+    retrieval, an STM batch, one pool's daily LTM run, a Contemplation cycle or forced run, a Vision perception, and
+    a queued image. The LLM client has no global model at all: a request without a configuration is refused.
+  - *Queued images.* A queued image stores its model and the descriptions with its row, so an edit or a restart
+    never changes it. Images queued before this version have no stored context and are sent as queued.
+  - *Migration 5.* It copies the previously effective global settings (the saved object merged onto the defaults,
+    exactly as the old code read it) and the global user description into every existing character once, keeps each
+    Character Description, and leaves Scene empty. It then deletes the legacy `settings` and `userDescription` meta
+    keys. An unreadable or invalid legacy value stops it without changing anything, so the server does not start
+    until a backup is restored or the value is repaired.
+  - *Turning Contemplation on.* Switching a character's automatic Contemplation on through the editor catches up on
+    its unprocessed messages.
+- **Descriptions in every role (spec 0005):**
+  - *Dialogue.* The system prompt carries the Character Description and the Scene Description (labeled as the
+    current setting, not a chat event). The User Description is the one pinned, untimestamped self-description.
+  - *Memory and Contemplation.* Memory, retrieval, and every Contemplation stage receive a JSON `characterContext`
+    with the three fields, and their prompts state that it is framing, never evidence, a source, an observation, a
+    completed experiment, or an instruction.
+  - *Vision.* Vision receives `characterContext` too, and may use it only to decide what to notice, never to claim
+    anything that is not visible.
+  - *Image generation.* The prompt sent to the image model is the Dialogue model's request followed by a labeled
+    background block of the non-empty descriptions. The block says not to add those people, places, or objects
+    unless the request asks for them. Nothing is shortened: a provider that refuses a long prompt fails the image
+    with a message naming the descriptions (shorten them or choose another image model).
+  - *Empty fields.* Empty fields are shown as not given and are never invented.
+- **Force and Maintenance status (spec 0005):**
+  - *Force.* The Force route queues an existing stage on the pool's serial pipeline. It returns whether it queued
+    (or that the kind is already queued or running), never an outcome. A forced Maintenance or Generation is followed
+    by the normal gestaltization and experiment review even while automatic Contemplation is off (owner decision).
+    Dialogue still gets no gestalt or experiments while it is off.
+  - *Status record.* Each Maintenance attempt is recorded on its pool: running at the start, then applied,
+    unchanged, stale, skipped (no interpretations, or the context or output budget would be exceeded), or failed,
+    with its source (automatic or forced), times, counts, and reason. A record still marked running at startup
+    becomes "interrupted".
 - **Character-owned cognition (spec 0004):** every character has exactly one memory pool and one interpretation pool,
   keyed internally as `character:<id>`. Every subsystem (dialogue retrieval, prefetch, maintenance, generation,
   gestaltization, experiment planning, Vision's gestalt, STM and daily LTM consolidation, watermarks, recovery, the
@@ -215,8 +305,8 @@ non-interpretive observation is a manual judgment, not something the tests can c
   cycle: prefetch, maintenance, generation, gestaltization, experiment review. Gestaltization runs only when the
   interpretation revision changed (generation, maintenance, or an edit through the API), once per cycle against the
   final interpretations. Experiment changes and messages that change no interpretation cost no gestalt call. The
-  Contemplation model receives every current interpretation and the previous gestalt (as continuity, not evidence),
-  and nothing else: no chat, memory, or experiments. A result commits only if the interpretation revision is unchanged
+  Contemplation model receives every current interpretation, the previous gestalt (as continuity, not evidence) and
+  the character's three descriptions as framing (spec 0005), and nothing else: no chat, memory, or experiments. A result commits only if the interpretation revision is unchanged
   (otherwise it reruns, up to 3 times). An empty pool with no gestalt gets none; a pool that becomes empty has its old
   gestalt reconsidered. If the interpretations would not fit the model's context (estimated at 3 characters per token
   plus the output budget, using the catalogue's context length), the call is skipped and recorded instead of sending
@@ -227,8 +317,9 @@ non-interpretive observation is a manual judgment, not something the tests can c
 - **Vision (spec 0003):** a fourth model role with its own output budget and temperature setting, called through the
   same OpenRouter Chat Completions transport (provider ignore list included) with one image content part. Its input is
   only the attached image, the chat's whole active verbatim window (up to 100 entries, including earlier observations),
-  and the current gestalt of the character's interpretation pool when Contemplation is enabled. It never receives
-  memory records, interpretations, experiments, or the pinned self-description. The output is one prose observation
+  the current gestalt of the character's interpretation pool when Contemplation is enabled, and the character's three
+  descriptions as framing (spec 0005, which added the User Description). It never receives memory records,
+  interpretations, or experiments. The output is one prose observation
   (at most 6,000 characters). Empty, oversized, JSON-shaped, or instruction-shaped output (such as "ignore previous
   instructions" or a chat-role prefix, checked outside quoted text so quoted writing seen in the image stays) is
   rejected rather than repaired, because a repair would need the image again. A model the catalogue lists without
@@ -289,8 +380,17 @@ non-interpretive observation is a manual judgment, not something the tests can c
   viewport height instead.
 - The gestalt's context check is an estimate. A model whose tokenizer is less efficient than 3 characters per token can
   still reject an oversized request; that also fails visibly and keeps the previous gestalt.
-- The interpretation and experiment edit routes and the Force route remain on the server for compatibility (spec 0002
-  U2), but no page uses them.
+- The interpretation and experiment edit routes remain on the server for compatibility (spec 0002 U2), but no page
+  uses them. The Contemplation page calls only the Force route (spec 0005).
+- Dialogue, memory, and retrieval requests have no pre-flight context check, so three long descriptions can make one
+  of them exceed a small model's context. The provider then rejects it and the job fails visibly; nothing is
+  truncated or dropped. Consolidation, gestaltization, and Vision keep their estimated pre-flight checks, which now
+  include the descriptions.
+- Image prompts carry the descriptions, and many image models accept only a few thousand characters of prompt.
+  There is no pre-flight length check, because the Images API does not report a limit. The provider's refusal is
+  shown on the image.
+- The character editor, the Force buttons, the Maintenance status, and Ctrl+Enter are checked by source scans only;
+  there are no browser tests.
 - That OpenRouter no longer routes text to Baidu can only be confirmed from a live Emergency Dump after deployment.
 - The Emergency Dump ZIP is uncompressed (Society's stored-ZIP writer) and does not include image bytes, generated or
   uploaded; it includes upload metadata, perception states, and observation texts. Inline image data is redacted from
@@ -315,5 +415,5 @@ The Society checkout at `../society/society` (commit `a9e3c2a`) was the donor. I
 | `src/diagnostics.js` | `src/diagnostics.js` (`beginLlmExchange`, `finalizeLlmExchange`, `runtimeActivityView`) |
 | `src/dump.js` | `src/dump.js` (independent sanitized sections, manifest) |
 | `src/images.js` | `src/world-illustration.js` (Images API request, capability lookup, descriptor matching, response parsing, raster signatures) |
-| `src/settings.js` | `src/models.js` (curated model list) |
+| `src/settings.js` | `src/models.js` (curated model list; the per-character configuration contract is Beholder's own) |
 | `Dockerfile`, `docker-compose.yml` | `Dockerfile` (`SOURCE_COMMIT_SHA` build info), `docker-compose.yml` (`./data:/app/data`) |

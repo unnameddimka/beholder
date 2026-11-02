@@ -3,6 +3,7 @@
 // src/memory-stm.js (stmSystemPrompt, STM_DRAFT_TEMPLATE), src/memory-ltm.js (selectionSystemPrompt, ltmSystemPrompt,
 // LTM_DRAFT_TEMPLATE), and src/mind-runtime.js (selectMindContext). Society's fictional-calendar temporal anchors are
 // replaced by real message timestamps; the engine keeps each record's source period itself.
+import { CHARACTER_CONTEXT_RULES } from "./context.js";
 
 export const MEMORY_LIMITS = Object.freeze({
   TOPIC_MAX: 240,
@@ -23,7 +24,9 @@ export const MEMORY_EPISTEMIC_RULES = [
   "Preserve meaningful names, quantities, preferences, boundaries, conditions, deadlines, explicit corrections and retractions, and unresolved contradictions.",
   "Interpret relative time words (today, tomorrow, next week) against the timestamp of the message that contains them and write the resolved date or the explicit relation to it. Unknown dates stay unknown.",
   "Do not invent connective events, motives, diagnoses, or interpretations of the user's personality; memory records what happened and what was said, not hypotheses about the user.",
-  "retrievalBrief is a concise thematic search index, not a second summary."
+  "retrievalBrief is a concise thematic search index, not a second summary.",
+  CHARACTER_CONTEXT_RULES,
+  "characterContext is never a memory source: do not record it, and record only what the supplied messages or memories show."
 ].join(" ");
 
 export const MEMORY_TEXT_RULES = `topic: non-empty, at most ${MEMORY_LIMITS.TOPIC_MAX} characters. summary: non-empty, at most ${MEMORY_LIMITS.SUMMARY_MAX} characters. retrievalBrief: at most ${MEMORY_LIMITS.RETRIEVAL_BRIEF_MAX} characters. importance: a number from 0 to 1.`;
@@ -59,6 +62,7 @@ export const LTM_DRAFT_TEMPLATE = Object.freeze({
 export function ltmSelectionSystemPrompt() {
   return [
     "You are a read-only memory selector for one memory pool's daily consolidation.",
+    CHARACTER_CONTEXT_RULES,
     "Select with high recall: relevantLtmIds are existing long-term memories that the job's source memories continue, correct, duplicate, overlap, or are already represented by; contextStmIds are other short-term memories of this consolidation whose complete content is needed to interpret references or corrections in the job's sources. Selected context is read-only.",
     "Choose only IDs from the supplied catalogs. Do not write prose, scores, explanations, or new IDs, and change nothing. Empty arrays are valid.",
     "Return exactly {\"relevantLtmIds\":[],\"contextStmIds\":[]}."
@@ -80,6 +84,7 @@ export function ltmSystemPrompt() {
 export function retrievalSystemPrompt(purposeText) {
   return [
     `You are a semantic memory-retrieval selector. ${purposeText}`,
+    CHARACTER_CONTEXT_RULES,
     "Select only existing record IDs from the catalog that may materially help with the current situation. Do not roleplay, write prose, infer new facts, fill capacity, or invent IDs.",
     `Maximums: STM ${MEMORY_LIMITS.CONTEXT_STM_LIMIT}, LTM ${MEMORY_LIMITS.CONTEXT_LTM_LIMIT}. Return one JSON object only with exactly stmIds and ltmIds.`
   ].join(" ");

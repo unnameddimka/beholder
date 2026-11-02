@@ -10,6 +10,7 @@ import net from "node:net";
 import dns from "node:dns/promises";
 import { coded, nowIso, sleep } from "./utils.js";
 import { sanitize } from "./sanitize.js";
+import { imageContext, imagePrompt } from "./prompts/image.js";
 
 export const IMAGE_ENDPOINT = "https://openrouter.ai/api/v1/images";
 export const IMAGE_MODELS_ENDPOINT = "https://openrouter.ai/api/v1/images/models";
@@ -175,9 +176,8 @@ async function downloadImage(fetchImpl, url, lookupImpl) {
 }
 
 export class ImageService {
-  constructor({ store, settings, key, diagnostics, fetchImpl = fetch, imagesDir, backoffMs = 2000, lookupImpl = dns.lookup }) {
+  constructor({ store, key, diagnostics, fetchImpl = fetch, imagesDir, backoffMs = 2000, lookupImpl = dns.lookup }) {
     this.store = store;
-    this.settings = settings;
     this.key = key;
     this.diagnostics = diagnostics;
     this.fetchImpl = fetchImpl;
@@ -189,8 +189,11 @@ export class ImageService {
     this.generations = [];
   }
 
-  request({ message, prompt }) {
-    const image = this.store.addImage({ messageId: message.id, characterId: message.characterId, request: prompt, model: this.settings.get().models.image });
+  // profile: the generating job's snapshot. The image model and the descriptions are persisted with the row, so a
+  // later edit of the character, or a restart, never changes what a queued image is generated with (Specification
+  // 0005 A5).
+  request({ message, prompt, profile }) {
+    const image = this.store.addImage({ messageId: message.id, characterId: message.characterId, request: prompt, model: profile.config.models.image, context: imageContext(profile) });
     this.start(image);
     return image;
   }
@@ -241,7 +244,8 @@ export class ImageService {
     if (!apiKey) throw coded("API_KEY_MISSING", "Enter the OpenRouter API key first.");
     const startedMs = Date.now();
     const options = await this.options(image.model);
-    const requestBody = { model: image.model, prompt: image.request, ...options };
+    const prompt = imagePrompt(image.request, image.context);
+    const requestBody = { model: image.model, prompt, ...options };
     const exchangeId = this.diagnostics.beginExchange({ purpose: "image_generation", modelRole: "image", model: image.model, imageId: image.id, characterId: image.characterId, request: requestBody });
     let lastError = null;
     for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
@@ -252,7 +256,11 @@ export class ImageService {
         try { body = raw ? JSON.parse(raw) : null; } catch {}
         if (!response.ok) {
           const retryable = response.status === 429 || response.status >= 500;
-          throw coded(response.status === 401 ? "AUTHENTICATION_FAILED" : retryable ? "IMAGE_PROVIDER_RETRYABLE" : "IMAGE_PROVIDER_ERROR", `Image provider HTTP ${response.status}: ${String(body?.error?.message || "").slice(0, 300)}`, { retryable });
+          // Owner decision on Specification 0005 C5: a prompt the provider refuses (often for length) is never
+          // shortened; the failure names the character's descriptions so the user can shorten them or switch model.
+          const hint = !retryable && response.status !== 401 && prompt !== image.request
+            ? ` The prompt included this character's descriptions (${prompt.length} characters in total); if it is too long for this image model, shorten the descriptions or choose another image model.` : "";
+          throw coded(response.status === 401 ? "AUTHENTICATION_FAILED" : retryable ? "IMAGE_PROVIDER_RETRYABLE" : "IMAGE_PROVIDER_ERROR", `Image provider HTTP ${response.status}: ${String(body?.error?.message || "").slice(0, 300)}${hint}`, { retryable });
         }
         const candidate = parseImageResponse(body);
         const fetched = candidate.url ? await downloadImage(this.fetchImpl, candidate.url, this.lookupImpl) : { bytes: decodeCanonicalBase64(candidate.base64), declared: candidate.declared };

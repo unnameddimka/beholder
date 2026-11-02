@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { callOpenRouter } from "../src/openrouter.js";
 import { Diagnostics } from "../src/diagnostics.js";
-import { completion, jsonResponse, makeApp, closeApp, waitFor, reply } from "./helpers.js";
+import { completion, jsonResponse, makeApp, closeApp, waitFor, reply, configure, configOf } from "./helpers.js";
 
 const KEY = "sk-or-v1-transporttestkey000000000000";
 
@@ -44,7 +44,7 @@ test("temperature is sent only when enabled; max_tokens follows the per-role bud
     await waitFor(() => app.store.lastMessage(mira.id).role === "character");
     assert.equal("temperature" in mock.byPurpose("dialogue_reply")[0].body, false);
     assert.equal(mock.byPurpose("dialogue_reply")[0].body.max_tokens, 8192);
-    app.settings.update({ models: { ...app.settings.get().models, dialogue: "test/dialogue" }, temperature: { ...app.settings.get().temperature, dialogue: { enabled: true, value: 1.1 } } });
+    configure(app, mira.id, { models: { ...configOf(app, mira.id).models, dialogue: "test/dialogue" }, temperature: { ...configOf(app, mira.id).temperature, dialogue: { enabled: true, value: 1.1 } } });
     app.dialogue.send(mira.id, "b");
     await waitFor(() => mock.byPurpose("dialogue_reply").length === 2 && app.store.lastMessage(mira.id).role === "character");
     assert.equal(mock.byPurpose("dialogue_reply")[1].body.temperature, 1.1);

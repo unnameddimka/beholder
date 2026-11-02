@@ -25,8 +25,7 @@ export function buildEmergencyDump(app) {
     uptimeSeconds: Math.round(process.uptime()), processStartedAt: app.diagnostics.startedAt, schemaVersion: store.schemaVersion(),
     apiKeyConfigured: app.key.configured(), serverLocalDate: new Date().toString(), lastLtmDate: store.getMeta("lastLtmDate", null)
   }));
-  section("settings.json", () => app.settings.get());
-  section("user-description.json", () => ({ text: app.settings.userDescription() }));
+  // Specification 0005: each character record carries its own AI configuration and three descriptions.
   section("characters.json", () => store.listCharacters());
   section("messages.json", () => store.allMessages());
   section("images.json", () => store.allImages());

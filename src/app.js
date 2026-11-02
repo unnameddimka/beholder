@@ -3,7 +3,7 @@
 import path from "node:path";
 import fs from "node:fs";
 import { Store, poolOf } from "./db.js";
-import { SettingsStore, RuntimeKey, MODEL_ROLES } from "./settings.js";
+import { RuntimeKey, MODEL_ROLES, DESCRIPTION_MAX, DESCRIPTION_FIELDS, defaultConfig, mergeConfig } from "./settings.js";
 import { Diagnostics } from "./diagnostics.js";
 import { LlmClient } from "./llm.js";
 import { MemoryEngine } from "./memory.js";
@@ -16,7 +16,7 @@ import { verifyApiKey } from "./openrouter.js";
 import { KeyedMutex, coded, msUntilNextLocalMidnight } from "./utils.js";
 
 const NAME_MAX = 100;
-const DESCRIPTION_MAX = 20_000;
+const DESCRIPTION_LABELS = Object.freeze({ description: "Character Description", sceneDescription: "Scene Description", userDescription: "User Description" });
 const DAILY_CHECK_INTERVAL_MS = 60_000;
 
 function readJson(file, fallback) {
@@ -37,18 +37,17 @@ export class BeholderApp {
     this.buildInfo = { sourceCommitSha: typeof sha === "string" && /^[0-9a-f]{40}$/.test(sha) ? sha : "" };
     this.store = new Store(path.join(dataDir, "beholder.sqlite"));
     this.key = new RuntimeKey();
-    this.settings = new SettingsStore(this.store);
     this.diagnostics = new Diagnostics({ secrets: () => [this.key.get()] });
     this.locks = new KeyedMutex();
-    this.llm = new LlmClient({ settings: this.settings, key: this.key, diagnostics: this.diagnostics, fetchImpl, backoffMs, timeouts: llmTimeouts });
+    this.llm = new LlmClient({ key: this.key, diagnostics: this.diagnostics, fetchImpl, backoffMs, timeouts: llmTimeouts });
     this.memory = new MemoryEngine({ store: this.store, llm: this.llm, diagnostics: this.diagnostics, mutex: this.locks, now,
       ...(stmRetryBackoffMs !== undefined ? { stmRetryBackoffMs } : {}), ...(ltmRetryBackoffMs !== undefined ? { ltmRetryBackoffMs } : {}) });
-    this.contemplation = new Contemplation({ store: this.store, llm: this.llm, memory: this.memory, settings: this.settings, diagnostics: this.diagnostics, maxParallel });
+    this.contemplation = new Contemplation({ store: this.store, llm: this.llm, memory: this.memory, diagnostics: this.diagnostics, maxParallel });
     this.uploads = new UploadFiles(this.uploadsDir);
     this.uploads.reconcile(this.store, this.diagnostics);
-    this.vision = new Vision({ store: this.store, llm: this.llm, settings: this.settings, diagnostics: this.diagnostics, uploads: this.uploads });
-    this.images = new ImageService({ store: this.store, settings: this.settings, key: this.key, diagnostics: this.diagnostics, fetchImpl, imagesDir: this.imagesDir, backoffMs: backoffMs * 2, ...(dnsLookup ? { lookupImpl: dnsLookup } : {}) });
-    this.dialogue = new Dialogue({ store: this.store, llm: this.llm, memory: this.memory, contemplation: this.contemplation, images: this.images, vision: this.vision, uploads: this.uploads, settings: this.settings,
+    this.vision = new Vision({ store: this.store, llm: this.llm, diagnostics: this.diagnostics, uploads: this.uploads });
+    this.images = new ImageService({ store: this.store, key: this.key, diagnostics: this.diagnostics, fetchImpl, imagesDir: this.imagesDir, backoffMs: backoffMs * 2, ...(dnsLookup ? { lookupImpl: dnsLookup } : {}) });
+    this.dialogue = new Dialogue({ store: this.store, llm: this.llm, memory: this.memory, contemplation: this.contemplation, images: this.images, vision: this.vision, uploads: this.uploads,
       diagnostics: this.diagnostics, now, timeScaleMs, ...(openerDelaySeconds !== undefined ? { openerDelaySeconds } : {}), ...(presenceTtlMs !== undefined ? { presenceTtlMs } : {}) });
     this.timers = [];
   }
@@ -98,24 +97,39 @@ export class BeholderApp {
 
   // ---- characters --------------------------------------------------------------------------------------------
 
-  validateCharacter(input) {
-    const name = typeof input?.name === "string" ? input.name.trim() : "";
-    const description = typeof input?.description === "string" ? input.description : "";
+  // The complete record to store (Specification 0005 A1-A3): the name, the three descriptions and the AI
+  // configuration. A field left out keeps its current value (built-in defaults and empty text for a new character);
+  // config may be a partial patch over the current configuration. Everything is validated before anything is
+  // written, so an invalid submission changes nothing. Legacy scope fields (Specification 0004) are ignored.
+  validateCharacter(input, existing = null) {
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw coded("CHARACTER_INVALID", "The character must be an object.", { status: 400 });
+    const name = typeof input.name === "string" ? input.name.trim() : input.name === undefined && existing ? existing.name : "";
     if (!name || name.length > NAME_MAX) throw coded("CHARACTER_INVALID", `Name must be 1 to ${NAME_MAX} characters.`, { status: 400 });
-    if (description.length > DESCRIPTION_MAX) throw coded("CHARACTER_INVALID", `Description must be at most ${DESCRIPTION_MAX} characters.`, { status: 400 });
-    // Specification 0004: cognition is always character-owned; legacy scope fields are ignored and select nothing.
-    return { name, description };
+    const record = { name };
+    for (const field of DESCRIPTION_FIELDS) {
+      const value = input[field] === undefined ? existing?.[field] ?? "" : input[field];
+      if (typeof value !== "string") throw coded("CHARACTER_INVALID", `${DESCRIPTION_LABELS[field]} must be text.`, { status: 400 });
+      if (value.length > DESCRIPTION_MAX) throw coded("CHARACTER_INVALID", `${DESCRIPTION_LABELS[field]} must be at most ${DESCRIPTION_MAX} characters.`, { status: 400 });
+      record[field] = value;
+    }
+    const base = existing?.config ?? defaultConfig();
+    record.config = input.config === undefined ? base : mergeConfig(base, input.config);
+    return record;
   }
 
   createCharacter(input) {
-    const character = this.store.createCharacter(this.validateCharacter(input));
-    this.ensurePools(character);
-    return character;
+    return this.store.tx(() => {
+      const created = this.store.createCharacter(this.validateCharacter(input));
+      this.ensurePools(created);
+      return created;
+    });
   }
 
+  // Changes only this character's record; its transcript, memory, cognition, images and watermarks stay as they are.
   updateCharacter(id, input) {
-    if (!this.store.getCharacter(id)) throw coded("CHARACTER_NOT_FOUND", "Character not found.", { status: 404 });
-    const character = this.store.updateCharacter(id, this.validateCharacter(input));
+    const existing = this.store.getCharacter(id);
+    if (!existing) throw coded("CHARACTER_NOT_FOUND", "Character not found.", { status: 404 });
+    const character = this.store.updateCharacter(id, this.validateCharacter(input, existing));
     this.ensurePools(character);
     return character;
   }

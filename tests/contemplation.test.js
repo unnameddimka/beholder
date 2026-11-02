@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { makeApp, closeApp, waitFor, reply, seedMessages, sleep, identityConsolidation } from "./helpers.js";
+import { makeApp, closeApp, waitFor, reply, seedMessages, sleep, identityConsolidation, configure, configOf } from "./helpers.js";
 import { poolOf } from "../src/db.js";
 import { validatePrefetch, validatePlanning } from "../src/contemplation.js";
 
@@ -16,19 +16,19 @@ test("prefetch receives exactly the whole interpretation pool, the last 100 verb
   try {
     const mira = app.createCharacter(base);
     const pool = poolOf(mira);
-    app.settings.update({ contemplationEnabled: false });
+    configure(app, mira.id, { contemplationEnabled: false });
     app.contemplation.addInterpretation(pool, "Interpretation A");
     app.contemplation.addInterpretation(pool, "Interpretation B");
     app.contemplation.addExperiment(pool, "Experiment X");
     app.store.setPlanningNeeded(pool, false);
     app.store.insertMemory({ pool: `character:${mira.id}`, tier: "ltm", topic: "MEMORY-TOPIC", summary: "MEMORY-SUMMARY", retrievalBrief: "x", importance: 0.5, sources: [] });
     seedMessages(app, mira.id, 120);
-    app.settings.update({ contemplationEnabled: true });
+    configure(app, mira.id, { contemplationEnabled: true });
     app.dialogue.send(mira.id, "newest user message");
     await waitFor(() => mock.byPurpose("contemplation_prefetch").length === 1);
     await app.contemplation.idle(pool);
     const payload = JSON.parse(mock.byPurpose("contemplation_prefetch")[0].body.messages[1].content);
-    assert.deepEqual(Object.keys(payload).sort(), ["activeExperiments", "conversation", "interpretations", "requiredResponseShape"]);
+    assert.deepEqual(Object.keys(payload).sort(), ["activeExperiments", "characterContext", "conversation", "interpretations", "requiredResponseShape"]);
     assert.deepEqual(payload.interpretations.map((entry) => entry.text), ["Interpretation A", "Interpretation B"]);
     assert.deepEqual(payload.activeExperiments.map((entry) => entry.text), ["Experiment X"]);
     assert.equal(payload.conversation.messages.length, 100);
@@ -57,11 +57,11 @@ test("prefetch chooses maintenance from an experiment the latest message bears o
   try {
     const mira = app.createCharacter(base);
     const pool = poolOf(mira);
-    app.settings.update({ contemplationEnabled: false });
+    configure(app, mira.id, { contemplationEnabled: false });
     app.contemplation.addInterpretation(pool, "Fears the dark.");
     app.contemplation.addExperiment(pool, "Mention the old lighthouse and watch how the user reacts.");
     app.store.setPlanningNeeded(pool, false);
-    app.settings.update({ contemplationEnabled: true });
+    configure(app, mira.id, { contemplationEnabled: true });
     app.dialogue.send(mira.id, "Oh, the lighthouse! I used to climb it every summer.");
     await waitFor(() => app.contemplation.status(pool).lastCycle?.status === "succeeded");
     await app.contemplation.idle(pool);
@@ -125,7 +125,7 @@ test("both flags: parallel maintenance per interpretation, generation sees the p
     contemplation_experiment_planning: (body) => {
       order.push("planning");
       const payload = JSON.parse(body.messages[1].content);
-      assert.deepEqual(Object.keys(payload).sort(), ["activeExperiments", "interpretations", "requiredResponseShape"]);
+      assert.deepEqual(Object.keys(payload).sort(), ["activeExperiments", "characterContext", "interpretations", "requiredResponseShape"]);
       assert.deepEqual(payload.interpretations.map((entry) => entry.text).sort(), ["A brand new angle", "Old C", "Revised A"]);
       assert.deepEqual(payload.activeExperiments.map((entry) => entry.text), ["Keep me"]);
       return { experiments: [{ id: payload.activeExperiments[0].id, text: "Keep me (edited)" }, { id: null, text: "Contrast A with the new angle" }] };
@@ -135,12 +135,12 @@ test("both flags: parallel maintenance per interpretation, generation sees the p
   try {
     const mira = app.createCharacter(base);
     const pool = poolOf(mira);
-    app.settings.update({ contemplationEnabled: false });
+    configure(app, mira.id, { contemplationEnabled: false });
     for (const text of ["Old A", "Old B", "Old C"]) app.contemplation.addInterpretation(pool, text);
     app.contemplation.addExperiment(pool, "Finished probe");
     app.contemplation.addExperiment(pool, "Keep me");
     app.store.setPlanningNeeded(pool, false);
-    app.settings.update({ contemplationEnabled: true });
+    configure(app, mira.id, { contemplationEnabled: true });
     app.dialogue.send(mira.id, "evidence");
     await waitFor(() => order.includes("planning"));
     await app.contemplation.idle(pool);
@@ -164,10 +164,10 @@ test("a failed maintenance request applies nothing from the batch", async () => 
   try {
     const mira = app.createCharacter(base);
     const pool = poolOf(mira);
-    app.settings.update({ contemplationEnabled: false });
+    configure(app, mira.id, { contemplationEnabled: false });
     app.contemplation.addInterpretation(pool, "One");
     app.contemplation.addInterpretation(pool, "Two");
-    app.settings.update({ contemplationEnabled: true });
+    configure(app, mira.id, { contemplationEnabled: true });
     app.dialogue.send(mira.id, "evidence");
     await waitFor(() => app.contemplation.status(pool).lastCycle?.status === "failed");
     assert.deepEqual(app.store.interpretations(pool).map((entry) => entry.text), ["One", "Two"]);
