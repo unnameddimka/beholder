@@ -227,12 +227,13 @@ test("C3: the consolidation result must account for every id exactly once by sup
 
 test("C2/C3: the consolidation prompt separates deduplication from verification and sets no count target", () => {
   const prompt = consolidationSystemPrompt();
-  assert.match(prompt, /deduplication, NOT verification/);
-  assert.match(prompt, /Never drop, weaken, or merge an interpretation because it is unusual, implausible, speculative, unproven, or in conflict/);
-  assert.match(prompt, /Keep genuinely different explanations separate, including different explanations of the same events and openly conflicting/);
+  // Wording revised by Specification 0006 S4 (equivalence of possible people, not of explanations); same strictness.
+  assert.match(prompt, /recognition of equivalence, NOT verification and NOT generation/);
+  assert.match(prompt, /Never drop, weaken, or merge an interpretation because it is unusual, implausible, speculative, unproven, richly invented, or in conflict/);
+  assert.match(prompt, /Keep materially different possible people separate: .*explain the same observed events, and including openly conflicting/);
   assert.match(prompt, /narrower version/);
-  assert.match(prompt, /strip excessive retelling/);
-  assert.match(prompt, /Do not invent new hypotheses/);
+  assert.match(prompt, /strip chronicles, retold dialogue, evidence bookkeeping/);
+  assert.match(prompt, /Do not invent new possible people/);
   assert.match(prompt, /no target, minimum, or maximum number/);
   assert.match(prompt, /Account for every supplied id exactly once/);
 });

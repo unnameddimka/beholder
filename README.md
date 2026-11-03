@@ -322,6 +322,23 @@ non-interpretive observation is a manual judgment, not something the tests can c
   Interpretation edits through the API are debounced by 200 ms so quick edits produce one review.
   A per-(pool, chat) watermark of the last processed user message is persisted. It advances only after a successful
   cycle, so restarts and failures re-evaluate unprocessed evidence.
+- **Interpretations as possible people (spec 0006 S):** each interpretation is one pregnant, coherent image of who
+  the user could be: motives, relationships, history and circumstances that explain one another. It may invent
+  unverified concrete detail; unverified is not disproved, and only a direct conflict with what was observed counts.
+  The stored text is the image itself, never a chronicle, quotes, evidence lists, experiment ids or outcomes, or
+  maintenance notes. Generation asks for a genuinely different possible person, and its review checks only
+  distinctness and direct contradiction, never evidential support. Consolidation merges images of the same person
+  and explanatory logic and keeps different people apart even when they explain the same events. Maintenance asks
+  whether the imagined person could still be the user: compatible invention stays, a contradiction is repaired
+  inside the image without a log, and `delete` remains for an image whose defining logic is destroyed. An experiment
+  completion is recorded only in `completedExperimentIds`, never in the text. The gestalt carries invented details
+  only as possibilities, and Dialogue is told never to state them to the user as facts. The Prefetch, Experiment
+  Planning, memory, Vision and repair prompts are unchanged, as are the 4,000-character limit, every response shape
+  and the pipeline. Stored interpretations are not migrated; they follow the new semantics the next time
+  Maintenance, Consolidation or Generation touches them. Where this narrows earlier wording, spec 0006 takes
+  precedence: spec 0000 §5.2 (meaningful conclusions go into the image, not as a record), the gestalt bullet of spec
+  0002 (imagined biography may appear as a possibility, never as fact) and the consolidation strip rule of spec 0004
+  (no retelling at all instead of a minimal one).
 - **Code boundaries (spec 0006):** every LLM purpose has one contract in `src/contracts/`. It names the model role,
   the system prompt (still in `src/prompts/`), the required response shape, the validator, the snapshot-scoped checks
   and limits, the failure policy, and which transport policy applies. `LlmClient` reads the role and the Dialogue
@@ -405,6 +422,13 @@ non-interpretive observation is a manual judgment, not something the tests can c
 - Consolidation quality (merging true duplicates while keeping distinct and conflicting hypotheses) needs real-model
   inspection; the tests check the prompt, inputs, ID mapping and commit rules, not semantic judgment. Its size checks
   are estimates like the gestalt's.
+- Whether a real model (GLM included) writes pregnant possible-person images, keeps invented detail through
+  Maintenance, keeps materially different people apart, and leaves chronicles and bookkeeping out of the stored text
+  is a qualitative, owner-run evaluation (spec 0006). The tests check the prompt wording, the unchanged contracts and
+  pipeline, and mocked outcomes, not model judgment. Nothing in this patch makes Generation or Maintenance run more
+  often, and existing interpretations keep their old style until a stage rewrites them.
+- The golden request traces cover five fixed scenarios. Requests outside them (follow-ups, openers, the LTM selector
+  with existing LTM, generation re-review after a pool change) are covered by the ordinary suites, not byte for byte.
 - The mobile composer is checked by a source scan only. Behavior with real software keyboards (Android and iOS) needs a
   manual check on devices; iOS Safari does not resize the layout for the keyboard, so the page follows the visual
   viewport height instead.

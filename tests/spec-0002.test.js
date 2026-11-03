@@ -64,7 +64,10 @@ test("migration: a schema-1 database keeps its data, gains an empty gestalt, and
 test("prompt carries the section 1 semantics; input is every interpretation plus the previous gestalt, nothing else", async () => {
   const prompt = gestaltizationSystemPrompt();
   for (const phrase of [/one whole, ultimately unknown and inexhaustible person/, /key points of every current interpretation/, /coexist/, /choose a winner/,
-    /historical perspective, not evidence/, /diagnosis/, /not a plan to influence the user/, /Do not invent biographical facts/, /If interpretations is empty/]) {
+    // Specification 0006 S6 replaced "Do not invent biographical facts": interpretations' imagined biography may be
+    // carried as possibility, never promoted to fact, and the gestalt invents none of its own.
+    /historical perspective, not evidence/, /diagnosis/, /not a plan to influence the user/, /never promote them to established biography or present them as observed truth/,
+    /do not invent new biographical details of your own/, /If interpretations is empty/]) {
     assert.match(prompt, phrase);
   }
   const { app, mock } = await makeApp({ contemplation_prefetch: quietPrefetch, contemplation_gestaltization: (body, { count }) => ({ gestalt: `Gestalt ${count}` }),

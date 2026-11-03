@@ -1,8 +1,10 @@
 // Specification 0006 section 5 / acceptance 17-23: golden request traces. Each scenario drives the real app against a
 // deterministic mocked OpenRouter and records every outgoing Chat Completions request (purpose, model, parameters,
 // message bytes and order) plus the resulting persisted cognitive state. The fixture was recorded at baseline 4ff65df
-// before the Contemplation refactoring; a difference is either a regression or an S-authorized prompt change, which
-// must be re-recorded deliberately with BEHOLDER_RECORD_GOLDEN=1 and justified by its S clause.
+// before the Contemplation refactoring, which matched it byte for byte. It was re-recorded once for Specification 0006
+// S, where the only differences are the system messages of consolidation, maintenance, generation, its review and
+// gestaltization (S1-S6) and the gestalt section of the Dialogue system prompt (S6). Any other difference is a
+// regression; an intended change is re-recorded with BEHOLDER_RECORD_GOLDEN=1 and justified by its spec clause.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";

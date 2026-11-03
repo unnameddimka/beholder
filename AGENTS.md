@@ -70,6 +70,11 @@ folder's file describes a different project (a SugarCube RPG) and does not apply
 - Explicit Force runs even while automatic Contemplation is off and keeps the normal gestaltization and planning
   consequences. Each Maintenance attempt's outcome is persisted on its pool; one still running at startup becomes
   interrupted.
+- An interpretation is one pregnant image of a possible person (spec 0006 S). Unverified invention is allowed and
+  never a reason to reject or delete; only a direct conflict with observations is. Stored text never holds
+  chronicles, quotes, evidence lists, experiment ids or outcomes, or maintenance notes. The gestalt carries invented
+  details only as possibilities, and Dialogue never states them as facts. Prefetch and Experiment Planning prompts
+  are outside this semantic change.
 - Structured model output is validated, then repaired by the LLM within bounds, and never committed when invalid.
 - All multi-row writes run in one SQLite transaction (`Store.tx`).
 - Model and user text is rendered as text nodes only (`public/text-render.js`). Never use `innerHTML` with content.

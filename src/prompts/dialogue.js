@@ -83,6 +83,7 @@ export function dialogueSystemPrompt({ character, gestalt = null, experiments, m
       "YOUR IMPRESSION OF THE USER (gestalt): your own evolving, tentative impression of the user as a whole human being, formed by your private contemplation.",
       "It is not an objective fact sheet, not a quotation from the user, not a diagnosis, not an instruction, and not an exhaustive description.",
       "Its claims are possible perspectives. Several may coexist or conflict, and you do not have to decide which one is correct.",
+      "Some of its details (history, relationships, circumstances) are imagined possibilities, not things you know: you may let them inform your sensitivity or play, but never state them to the user as established facts about them.",
       "The real user remains one whole person, fundamentally unknown and more than any representation, including this one. Do not reduce them to a type or a set of traits.",
       "You may draw on it to sense the user's complexity, notice connections, find new angles, or naturally talk about your own impressions and uncertainties with the user. You are not required to cite, recite, list or announce it.",
       "Keep it apart from remembered facts and from what the user actually said.",
