@@ -276,6 +276,14 @@ export function validateLtmDraft(raw, frozen) {
 }
 
 // Deterministic chronological partition by serialized size; never splits a record (Society partitionDailySources).
+// Society sanitizeRetrievalSelection: unknown ids are dropped, duplicates ignored, and limits enforced. frozen holds the
+// catalogue ids of the request (anything with has()).
+export function validateRetrieval(raw, frozen) {
+  if (!exactKeys(raw, ["stmIds", "ltmIds"]) || !Array.isArray(raw.stmIds) || !Array.isArray(raw.ltmIds)) return { ok: false, errors: ["response must contain exactly the arrays stmIds and ltmIds."] };
+  const pick = (ids, known, limit) => [...new Set(ids.filter((id) => typeof id === "string" && known.has(id)))].slice(0, limit);
+  return { ok: true, value: { stmIds: pick(raw.stmIds, frozen.stmIds, MEMORY_LIMITS.CONTEXT_STM_LIMIT), ltmIds: pick(raw.ltmIds, frozen.ltmIds, MEMORY_LIMITS.CONTEXT_LTM_LIMIT) } };
+}
+
 export function partitionBySize(views, budget = MEMORY_LIMITS.DAILY_SOURCE_BATCH_CHARS) {
   const jobs = [];
   let current = [];
@@ -561,12 +569,7 @@ export class MemoryEngine {
         catalog: { shortTermMemories: stm.map((record) => catalogEntry(record, currentCharacterId)), longTermMemories: ltm.map((record) => catalogEntry(record, currentCharacterId)) },
         requiredResponseShape: { stmIds: [], ltmIds: [] } }) }
     ];
-    // Society sanitizeRetrievalSelection: unknown ids are dropped, duplicates ignored, and limits enforced.
-    const validate = (raw) => {
-      if (!exactKeys(raw, ["stmIds", "ltmIds"]) || !Array.isArray(raw.stmIds) || !Array.isArray(raw.ltmIds)) return { ok: false, errors: ["response must contain exactly the arrays stmIds and ltmIds."] };
-      const pick = (ids, map, limit) => [...new Set(ids.filter((id) => typeof id === "string" && map.has(id)))].slice(0, limit);
-      return { ok: true, value: { stmIds: pick(raw.stmIds, stmById, MEMORY_LIMITS.CONTEXT_STM_LIMIT), ltmIds: pick(raw.ltmIds, ltmById, MEMORY_LIMITS.CONTEXT_LTM_LIMIT) } };
-    };
+    const validate = (raw) => validateRetrieval(raw, { stmIds: stmById, ltmIds: ltmById });
     this.retrievals += 1;
     let chosen;
     let mode = "semantic";

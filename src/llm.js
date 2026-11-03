@@ -1,5 +1,6 @@
-// Named-purpose LLM calls on top of the OpenRouter transport. Each purpose maps to one model role (Dialogue,
-// Contemplation, or Vision); memory purposes use the Dialogue model as Specification 0000 section 4.1 requires.
+// Named-purpose LLM calls on top of the OpenRouter transport. Each purpose's contract (src/contracts/) names its model
+// role (Dialogue, Contemplation, or Vision; memory purposes use the Dialogue model as Specification 0000 section 4.1
+// requires) and which transport policy below applies to it.
 // There is no global role selection (Specification 0005 A5): every call names the character configuration snapshot
 // of its job, and the fit checks use that same snapshot. Structured
 // outputs are parsed and validated; malformed output gets bounded LLM repair (pattern from Society
@@ -8,28 +9,11 @@ import { callOpenRouter, fetchModelCatalog } from "./openrouter.js";
 import { coded, parseModelJson } from "./utils.js";
 import { REPAIR_INSTRUCTION, TRUNCATION_RECOVERY_INSTRUCTION, DIALOGUE_REPAIR_INSTRUCTION } from "./prompts/repair.js";
 import { DIALOGUE_RESPONSE_FORMAT } from "./prompts/dialogue.js";
+import { PURPOSE_ROLES, contractOf } from "./contracts/index.js";
 
-export const PURPOSE_ROLES = Object.freeze({
-  dialogue_reply: "dialogue",
-  dialogue_followup: "dialogue",
-  dialogue_opener: "dialogue",
-  dialogue_memory_retrieval: "dialogue",
-  memory_stm_consolidation: "dialogue",
-  memory_ltm_selection: "dialogue",
-  memory_ltm_consolidation: "dialogue",
-  contemplation_prefetch: "contemplation",
-  contemplation_memory_retrieval: "contemplation",
-  contemplation_consolidation: "contemplation",
-  contemplation_maintenance: "contemplation",
-  contemplation_generation: "contemplation",
-  contemplation_generation_review: "contemplation",
-  contemplation_gestaltization: "contemplation",
-  contemplation_experiment_planning: "contemplation",
-  vision_observation: "vision"
-});
+export { PURPOSE_ROLES };
 
 export const REPAIR_ATTEMPTS = 2;
-const DIALOGUE_ENVELOPE_PURPOSES = new Set(["dialogue_reply", "dialogue_followup", "dialogue_opener"]);
 export const DIALOGUE_FORMAT_MODES = Object.freeze(["json_schema", "json_object", "prompt"]);
 const TIMEOUTS = { dialogue: 150_000, contemplation: 240_000, vision: 120_000 };
 const CATALOG_TTL_MS = 6 * 60 * 60 * 1000;
@@ -129,7 +113,8 @@ export class LlmClient {
   // Structured call: technical truncation retry once, then JSON parse + validate with up to REPAIR_ATTEMPTS repairs.
   // validate(raw) returns { ok: true, value } or { ok: false, errors: [...] }.
   async structured({ purpose, config, messages, validate, context = {}, signal = null }) {
-    const dialogue = DIALOGUE_ENVELOPE_PURPOSES.has(purpose);
+    // The provider-enforced envelope format, isolated repair and plain-text fallback apply only to Dialogue envelopes.
+    const dialogue = contractOf(purpose)?.transport.responseFormat === "dialogue_envelope";
     // Fails before any request when the job did not supply its configuration snapshot.
     this.requestParameters(PURPOSE_ROLES[purpose] || "dialogue", config);
     let formatMode = dialogue ? await this.dialogueFormatMode(config) : null;

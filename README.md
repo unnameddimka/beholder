@@ -11,8 +11,9 @@ Full requirements: [docs/specs/0000-beholder-poc.md](docs/specs/0000-beholder-po
 [0001](docs/specs/0001-dialogue-response-reliability-and-time-awareness.md),
 [0002](docs/specs/0002-gestaltization-readonly-contemplation-baidu.md),
 [0003](docs/specs/0003-contextual-vision-image-observations.md),
-[0004](docs/specs/0004-interpretation-consolidation-personal-cognition-mobile-composer.md), and
-[0005](docs/specs/0005-character-ai-config-three-descriptions-force-and-ctrl-enter.md).
+[0004](docs/specs/0004-interpretation-consolidation-personal-cognition-mobile-composer.md),
+[0005](docs/specs/0005-character-ai-config-three-descriptions-force-and-ctrl-enter.md), and
+[0006](docs/specs/0006-pregnant-interpretations-llm-contracts-contemplation-refactoring.md).
 
 > **Trusted LAN only.** Plain HTTP, no authentication, no HTTPS. Never expose the port to the internet.
 
@@ -155,6 +156,20 @@ ambiguous legacy states, and a source scan of the composer contract); and the sp
 - Force dedupe and separation per character, Force with automatic Contemplation off, and persisted Maintenance
   status including interruption;
 - a source scan of the editor and the Ctrl+Enter handler.
+
+And the spec 0006 scenarios:
+- golden request traces (`tests/golden-traces.test.js`, fixture `tests/fixtures/golden-traces.json`): five fixed
+  scenarios (an automatic cycle with every Contemplation stage and a repair, the three Force kinds, a stale
+  Maintenance, Verbatim→STM→LTM, and an image turn with Vision and a Dialogue repair). The test compares every
+  outgoing request (purpose, model, parameters, message bytes and order within the Dialogue and Contemplation lanes)
+  and the resulting cognitive state with the recording. Wall-clock values are normalized. The fixture was recorded
+  before the refactoring. A deliberate prompt change is re-recorded with `BEHOLDER_RECORD_GOLDEN=1 node --test
+  tests/golden-traces.test.js` and must be justified by its spec clause;
+- the contract registry: one contract per purpose, prompts from `src/prompts/`, unchanged model roles,
+  `response_format` and isolated repair only for the Dialogue envelopes, request shapes equal to the contracts, and
+  snapshot-scoped validation beyond shape;
+- the Contemplation split: stage execution writes nothing, and every application guard runs inside its
+  transaction.
 
 Whether a live model writes a good gestalt or an accurate,
 non-interpretive observation is a manual judgment, not something the tests can certify.
@@ -307,6 +322,15 @@ non-interpretive observation is a manual judgment, not something the tests can c
   Interpretation edits through the API are debounced by 200 ms so quick edits produce one review.
   A per-(pool, chat) watermark of the last processed user message is persisted. It advances only after a successful
   cycle, so restarts and failures re-evaluate unprocessed evidence.
+- **Code boundaries (spec 0006):** every LLM purpose has one contract in `src/contracts/`. It names the model role,
+  the system prompt (still in `src/prompts/`), the required response shape, the validator, the snapshot-scoped checks
+  and limits, the failure policy, and which transport policy applies. `LlmClient` reads the role and the Dialogue
+  envelope policy from it; transport, format step-down, repair and truncation recovery stay in `src/llm.js`.
+  Contemplation is split into orchestration (`src/contemplation.js`: triggers, Force, queues, the per-pool loop,
+  recovery, status), stage execution (`src/contemplation-stages.js`: reads inputs and calls the model, returns
+  uncommitted results, writes nothing) and atomic application (`src/contemplation-apply.js`: every write, with its
+  revision/snapshot guard inside the same transaction). Requests, timing, state and endpoints are unchanged by the
+  split.
 - **Gestalt (spec 0002):** one gestalt per interpretation pool, so one per character. It is stored in SQLite with the interpretation revision it reflects and its update time. Order in a
   cycle: prefetch, maintenance, generation, gestaltization, experiment review. Gestaltization runs only when the
   interpretation revision changed (generation, maintenance, or an edit through the API), once per cycle against the

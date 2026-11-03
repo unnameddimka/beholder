@@ -6,7 +6,7 @@ folder's file describes a different project (a SugarCube RPG) and does not apply
 ## Scope
 
 - The authoritative requirements are `docs/specs/0000-beholder-poc.md`, amended by specs 0001, 0002, 0003, 0004,
-  and 0005 in `docs/specs/`. Implement only what an approved spec says. Scope expansion needs a new, explicitly approved spec.
+  0005, and 0006 in `docs/specs/`. Implement only what an approved spec says. Scope expansion needs a new, explicitly approved spec.
 - Society (`../society/society`) is a read-only implementation donor. Never modify it.
 
 ## Invariants
@@ -81,10 +81,17 @@ folder's file describes a different project (a SugarCube RPG) and does not apply
   store. `src/settings.js`: the per-character configuration contract, `profileOf`, and `RuntimeKey`.
 - `src/dialogue.js`, `src/contemplation.js`, `src/memory.js`, `src/images.js`, `src/vision.js`: subsystems.
   `src/uploads.js`: upload transport, validation, and files.
+- Contemplation (spec 0006 R2): `src/contemplation.js` is the facade and orchestration (triggers, Force, queues,
+  the per-pool loop, recovery, status); `src/contemplation-stages.js` executes stages and never writes;
+  `src/contemplation-apply.js` performs every write, with its revision/snapshot guard inside the same `Store.tx`.
+- `src/contracts/`: one contract per LLM purpose (role, prompt from `src/prompts/`, response shape, validator,
+  snapshot checks, failure and transport policy). A new or changed purpose updates its contract.
 - `src/openrouter.js`, `src/llm.js`: transport and named purposes. `src/dump.js`, `src/diagnostics.js`.
 - `public/`: browser UI. `tests/`: `node:test` suites with a mocked OpenRouter.
 
 ## Before completion
 
 1. `npm test` (syntax check of every `.js` file, then all tests). Live provider calls are not required.
+   `tests/golden-traces.test.js` compares outgoing requests with a recorded fixture; re-record it
+   (`BEHOLDER_RECORD_GOLDEN=1`) only for an intended, spec-justified prompt or request change.
 2. Update `README.md` when behavior, defaults, or limitations change.
