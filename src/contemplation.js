@@ -299,6 +299,7 @@ export class Contemplation {
     const pool = rt.pool;
     const characterId = profile.characterId;
     const progress = this.progress(rt, characterId);
+    this.store.ensureInterpretationPool(pool);
     const context = await this.stages.generationContext(profile, pool, progress);
     const { candidate, feedback } = await this.stages.generate(profile, pool, context, progress);
     if (!candidate) {
@@ -363,7 +364,8 @@ export class Contemplation {
   // from an outdated revision is discarded.
   async planIfNeeded(rt, profile, { force = false }) {
     const pool = rt.pool;
-    if (!force && !this.store.ensureInterpretationPool(pool).planningNeeded) return { status: "not_needed" };
+    // The pool is ensured here, before the stage reads it, also for a forced run.
+    if (!this.store.ensureInterpretationPool(pool).planningNeeded && !force) return { status: "not_needed" };
     for (let attempt = 1; attempt <= PLANNING_STALE_RETRIES; attempt += 1) {
       const plan = await this.stages.plan(profile, pool, this.progress(rt));
       const committed = this.apply.applyPlanning(pool, plan);

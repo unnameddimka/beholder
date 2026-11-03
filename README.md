@@ -345,7 +345,8 @@ non-interpretive observation is a manual judgment, not something the tests can c
   envelope policy from it; transport, format step-down, repair and truncation recovery stay in `src/llm.js`.
   Contemplation is split into orchestration (`src/contemplation.js`: triggers, Force, queues, the per-pool loop,
   recovery, status), stage execution (`src/contemplation-stages.js`: reads inputs and calls the model, returns
-  uncommitted results, writes nothing) and atomic application (`src/contemplation-apply.js`: every write, with its
+  uncommitted results, and issues no SQL write, not even creating a pool row, which the orchestration does first) and
+  atomic application (`src/contemplation-apply.js`: every write, with its
   revision/snapshot guard inside the same transaction). Requests, timing, state and endpoints are unchanged by the
   split.
 - **Gestalt (spec 0002):** one gestalt per interpretation pool, so one per character. It is stored in SQLite with the interpretation revision it reflects and its update time. Order in a

@@ -571,7 +571,13 @@ export class Store {
   // ---- interpretations / experiments -----------------------------------------------------------------------
   ensureInterpretationPool(pool) {
     this.db.prepare("INSERT INTO interpretation_pools (pool) VALUES (?) ON CONFLICT(pool) DO NOTHING").run(pool);
+    return this.interpretationPool(pool);
+  }
+
+  // Read-only pool state (no SQL write, review 0006 P2); null when the pool row does not exist.
+  interpretationPool(pool) {
     const row = this.db.prepare("SELECT * FROM interpretation_pools WHERE pool = ?").get(pool);
+    if (!row) return null;
     return { pool: row.pool, interpretationRevision: row.interpretation_revision, experimentRevision: row.experiment_revision, planningNeeded: row.planning_needed === 1,
       gestalt: row.gestalt, gestaltRevision: row.gestalt_revision, gestaltUpdatedAt: row.gestalt_updated_at,
       lastMaintenance: row.last_maintenance ? JSON.parse(row.last_maintenance) : null };

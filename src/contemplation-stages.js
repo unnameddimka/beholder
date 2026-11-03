@@ -1,7 +1,8 @@
 // Contemplation stage execution (Specification 0006 R2.2): each stage reads its own inputs at the moment it always
 // has, builds its LLM messages from the purpose's contract (src/contracts/contemplation.js), calls the model with the
 // job's frozen configuration, validates, and returns an uncommitted candidate together with the source-state metadata
-// the application must guard on. Nothing here writes to the store; src/contemplation-apply.js commits.
+// the application must guard on. Nothing here writes to the store, not even pool creation; src/contemplation-apply.js
+// commits and src/contemplation.js ensures the pool exists first.
 // progress.stage(name) reports the running stage; progress.parallel(counter) exposes the verification counter.
 import { coded, mapLimited } from "./utils.js";
 import { poolOf } from "./db.js";
@@ -46,6 +47,14 @@ export class ContemplationStages {
     const result = await this.memory.retrieve({ pool: poolOf({ id: profile.characterId }), purpose: "contemplation_memory_retrieval", profile,
       situation: { conversation: { character: conversation.character, recentMessages: conversation.messages.slice(-RETRIEVAL_SITUATION_MESSAGES) } } });
     return { shortTermMemories: result.shortTermMemories, longTermMemories: result.longTermMemories };
+  }
+
+  // Read-only pool state; stages never create a pool (review 0006 P2). The orchestration ensures the pool exists before
+  // a stage runs, and pool rows are never deleted at runtime.
+  poolState(pool) {
+    const state = this.store.interpretationPool(pool);
+    if (!state) throw coded("INTERPRETATION_POOL_MISSING", "The interpretation pool does not exist.");
+    return state;
   }
 
   request(purpose, profile, messages, validate, context) {
@@ -93,7 +102,7 @@ export class ContemplationStages {
     progress.stage("maintenance_retrieval");
     const conversation = this.conversation(profile);
     const memory = await this.retrieveMemory(profile, conversation);
-    const experimentRevision = this.store.ensureInterpretationPool(pool).experimentRevision;
+    const experimentRevision = this.poolState(pool).experimentRevision;
     const experiments = this.experimentViews(pool);
     const experimentIds = new Set(experiments.map((entry) => entry.id));
     progress.stage("maintenance");
@@ -119,7 +128,7 @@ export class ContemplationStages {
   // The pool revision is captured with the snapshot before any model call, so a manual edit during retrieval,
   // generation, or review is detected at commit.
   async generationContext(profile, pool, progress) {
-    const revision = this.store.ensureInterpretationPool(pool).interpretationRevision;
+    const revision = this.poolState(pool).interpretationRevision;
     const interpretations = this.interpretationViews(pool);
     progress.stage("generation_retrieval");
     const conversation = this.conversation(profile);
@@ -129,7 +138,7 @@ export class ContemplationStages {
 
   // Re-reads the pool a stale candidate must now be reviewed against.
   refreshGenerationContext(pool, context) {
-    context.revision = this.store.ensureInterpretationPool(pool).interpretationRevision;
+    context.revision = this.poolState(pool).interpretationRevision;
     context.interpretations = this.interpretationViews(pool);
   }
 
@@ -163,7 +172,7 @@ export class ContemplationStages {
   // One gestalt over every current interpretation and the previous gestalt, or null when none is due.
   async gestalt(profile, pool, progress) {
     progress.stage("gestaltization");
-    const state = this.store.ensureInterpretationPool(pool);
+    const state = this.poolState(pool);
     const interpretations = this.interpretationViews(pool);
     if (!gestaltDue(state, interpretations.length)) return null;
     const messages = requestMessages("contemplation_gestaltization", { characterContext: characterContext(profile), interpretationRevision: state.interpretationRevision, interpretations,
@@ -185,7 +194,7 @@ export class ContemplationStages {
   // replacement array is returned with both revisions it was computed from.
   async plan(profile, pool, progress) {
     progress.stage("experiment_planning");
-    const state = this.store.ensureInterpretationPool(pool);
+    const state = this.poolState(pool);
     const interpretations = this.interpretationViews(pool);
     const experiments = this.experimentViews(pool);
     const experimentIds = new Set(experiments.map((entry) => entry.id));

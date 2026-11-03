@@ -5,13 +5,14 @@ import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { ROOT, makeApp, closeApp, configure, tempDir } from "./helpers.js";
+import { ROOT, makeApp, closeApp, configure, tempDir, waitFor } from "./helpers.js";
 import { CONTRACTS, PURPOSE_ROLES as CONTRACT_ROLES, contractOf } from "../src/contracts/index.js";
 import { PURPOSE_ROLES } from "../src/llm.js";
 import { validateMaintenance, validateConsolidation, validatePlanning, validateGeneration } from "../src/contracts/contemplation.js";
 import { validateRetrieval } from "../src/memory.js";
 import { ContemplationApply } from "../src/contemplation-apply.js";
 import { poolOf } from "../src/db.js";
+import { profileOf } from "../src/settings.js";
 import * as contemplationPrompts from "../src/prompts/contemplation.js";
 import * as memoryPrompts from "../src/prompts/memory.js";
 import * as dialoguePrompts from "../src/prompts/dialogue.js";
@@ -101,11 +102,110 @@ test("R1/15: snapshot-scoped ids, coverage and membership are enforced beyond JS
 
 // ---- R2 ---------------------------------------------------------------------------------------------------------
 
-test("R2/14: stage execution never writes; orchestration writes only through the application layer", () => {
+test("R2/14: orchestration and stages call no write method by name; the application layer owns the transactions", () => {
   const writes = /\.store\.(insert|update|delete|set|bump|add|complete|fail|tx)[A-Za-z]*\(/;
   assert.doesNotMatch(source("src/contemplation-stages.js"), writes);
+  assert.doesNotMatch(source("src/contemplation-stages.js"), /ensureInterpretationPool/);
   assert.doesNotMatch(source("src/contemplation.js"), writes);
   assert.match(source("src/contemplation-apply.js"), /this\.store\.tx\(/);
+});
+
+// Records every SQL statement that is not a plain SELECT, at the SQLite boundary, so writes made through helper
+// methods are observed too (review 0006 P2).
+function recordWrites(store) {
+  const writes = [];
+  const prepare = store.db.prepare.bind(store.db);
+  const exec = store.db.exec.bind(store.db);
+  const isWrite = (sql) => !/^\s*SELECT\b/i.test(sql);
+  store.db.prepare = (sql) => {
+    const statement = prepare(sql);
+    if (!isWrite(sql)) return statement;
+    return new Proxy(statement, { get: (target, key) => {
+      const value = Reflect.get(target, key);
+      return typeof value === "function" ? (...args) => { writes.push(sql); return value.apply(target, args); } : value;
+    } });
+  };
+  store.db.exec = (sql) => { if (isWrite(sql)) writes.push(sql); return exec(sql); };
+  return { writes, restore: () => { store.db.prepare = prepare; store.db.exec = exec; } };
+}
+
+test("review 0006 P2: stage execution issues no SQL write, through helpers included, on an existing or an absent pool", async () => {
+  const { app } = await makeApp({
+    contemplation_prefetch: () => ({ generation: true, maintenance: true }),
+    contemplation_memory_retrieval: () => ({ stmIds: [], ltmIds: [] }),
+    contemplation_consolidation: (body) => ({ interpretations: JSON.parse(body.messages[1].content).interpretations.map((entry) => ({ id: entry.id, sourceIds: [entry.id], text: entry.text })) }),
+    contemplation_maintenance: () => ({ action: "unchanged", text: null, completedExperimentIds: [] }),
+    contemplation_generation: () => ({ decision: "add", text: "A ferry pilot." }),
+    contemplation_generation_review: () => ({ accept: true, problem: null }),
+    contemplation_gestaltization: () => ({ gestalt: "One person." }),
+    contemplation_experiment_planning: () => ({ experiments: [] })
+  });
+  try {
+    const mira = app.createCharacter(base);
+    const pool = poolOf(mira);
+    configure(app, mira.id, { contemplationEnabled: false });
+    app.contemplation.addInterpretation(pool, "A beekeeper.");
+    app.contemplation.addExperiment(pool, "Mention honey.");
+    const profile = profileOf(app.store.getCharacter(mira.id));
+    const stages = app.contemplation.stages;
+    const progress = { stage: () => {}, parallel: () => {} };
+    const recorder = recordWrites(app.store);
+    try {
+      // An existing pool: every stage computes its candidate without a write.
+      await stages.prefetch(profile, pool);
+      const candidates = await stages.consolidate(profile, pool, app.store.interpretations(pool));
+      await stages.verify(profile, pool, candidates, progress);
+      const context = await stages.generationContext(profile, pool, progress);
+      await stages.generate(profile, pool, context, progress);
+      stages.refreshGenerationContext(pool, context);
+      assert.ok(await stages.gestalt(profile, pool, progress));
+      await stages.plan(profile, pool, progress);
+      assert.deepEqual(recorder.writes, []);
+      // An absent pool: the stage refuses and does not create it.
+      const absent = "character:4242";
+      for (const run of [() => stages.generationContext(profile, absent, progress), () => stages.gestalt(profile, absent, progress), () => stages.plan(profile, absent, progress),
+        () => stages.verify(profile, absent, [], progress)]) {
+        await assert.rejects(run, { code: "INTERPRETATION_POOL_MISSING" });
+      }
+      assert.deepEqual(recorder.writes, []);
+      assert.equal(app.store.interpretationPool(absent), null);
+    } finally { recorder.restore(); }
+  } finally { closeApp(app); }
+});
+
+test("review 0006 P2: an absent pool is still created by its owner path; automatic and forced runs keep working", async () => {
+  const { app, mock } = await makeApp({
+    dialogue_reply: () => ({ message: "ok", followUpDelaySeconds: null, imageRequest: null }),
+    contemplation_prefetch: () => ({ generation: true, maintenance: false }),
+    contemplation_memory_retrieval: () => ({ stmIds: [], ltmIds: [] }),
+    contemplation_generation: () => ({ decision: "add", text: "A ferry pilot." }),
+    contemplation_generation_review: () => ({ accept: true, problem: null }),
+    contemplation_gestaltization: () => ({ gestalt: "One person." }),
+    contemplation_experiment_planning: () => ({ experiments: [{ id: null, text: "Ask about boats." }] })
+  });
+  try {
+    for (const route of ["automatic", "forced"]) {
+      const mira = app.createCharacter({ ...base, name: `Mira ${route}` });
+      const pool = poolOf(mira);
+      // Simulate a pool row that was never initialized.
+      app.store.db.prepare("DELETE FROM interpretation_pools WHERE pool = ?").run(pool);
+      assert.equal(app.store.interpretationPool(pool), null);
+      if (route === "automatic") {
+        app.dialogue.send(mira.id, "I sailed today.");
+        await waitFor(() => app.contemplation.status(pool).lastCycle?.status === "succeeded", { message: "cycle" });
+      } else {
+        configure(app, mira.id, { contemplationEnabled: false });
+        app.store.db.prepare("DELETE FROM interpretation_pools WHERE pool = ?").run(pool);
+        app.contemplation.force(pool, "experimentation", mira.id);
+      }
+      await app.contemplation.idle(pool);
+      assert.ok(app.store.interpretationPool(pool), `${route}: the pool exists again`);
+      if (route === "automatic") assert.deepEqual(app.store.interpretations(pool).map((entry) => entry.text), ["A ferry pilot."]);
+      else assert.equal(app.contemplation.status(pool).force.experimentation.last.status, "completed");
+      assert.deepEqual(app.store.experiments(pool).map((entry) => entry.text), ["Ask about boats."]);
+    }
+    assert.ok(mock.byPurpose("contemplation_generation").length >= 1);
+  } finally { closeApp(app); }
 });
 
 test("R2/22: every application guard runs inside its transaction and rejects a result computed from older state", async () => {
